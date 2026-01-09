@@ -19,8 +19,7 @@ import kotlin.math.abs
 class AudioEngine(context: Context) {
     private val tag = "AudioEngine"
 
-    // 16kHz is "Wideband HD Voice" (Same as VoLTE/4G Calls)
-    // 44.1kHz is "Music Quality" (Too heavy for raw streaming)
+    // 16kHz is "Wideband HD Voice"
     private val sampleRate = 16000
 
     // --- AUDIO HARDWARE ---
@@ -38,7 +37,7 @@ class AudioEngine(context: Context) {
     private val isRecording = AtomicBoolean(false)
     private val isPlaying = AtomicBoolean(false)
 
-    // --- JITTER BUFFER (Crucial for smooth 4G audio) ---
+    // --- JITTER BUFFER ---
     private data class AudioPacket(val seq: Int, val data: ByteArray) : Comparable<AudioPacket> {
         override fun compareTo(other: AudioPacket) = this.seq - other.seq
         override fun equals(other: Any?): Boolean {
@@ -55,16 +54,10 @@ class AudioEngine(context: Context) {
     }
     private val jitterBuffer = PriorityQueue<AudioPacket>()
     private var lastPlayedSeq = -1
-    // Buffer ~120ms of audio (3 packets) to smooth out network bumps
     private val BUFFER_THRESHOLD = 3
 
     // --- CONFIG ---
-    // CHANGED: 960 -> 640
-    // 640 samples * 2 bytes = 1280 bytes.
-    // This is SAFE for the internet (MTU is 1500).
     private val FRAME_SIZE = 640
-
-    // Lowered threshold to pick up whispers, clearer voice
     private val NOISE_GATE_THRESHOLD = 50
     private val GAIN_LIMIT_THRESHOLD = 30000
 
@@ -100,14 +93,11 @@ class AudioEngine(context: Context) {
 
         playbackThread = Thread({
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-
             try {
                 while (isPlaying.get()) {
                     var packetToPlay: AudioPacket? = null
-
                     synchronized(jitterBuffer) {
                         if (jitterBuffer.isNotEmpty()) {
-                            // Smart Buffering: Play if we have flow, or wait for buffer to fill
                             if (lastPlayedSeq != -1 || jitterBuffer.size >= BUFFER_THRESHOLD) {
                                 packetToPlay = jitterBuffer.poll()
                             }
@@ -115,7 +105,6 @@ class AudioEngine(context: Context) {
                     }
 
                     if (packetToPlay != null) {
-                        // Handle sequence resets (e.g. new PTT press)
                         if (lastPlayedSeq != -1 && (packetToPlay.seq < lastPlayedSeq || packetToPlay.seq > lastPlayedSeq + 500)) {
                             lastPlayedSeq = packetToPlay.seq - 1
                         }
@@ -126,14 +115,11 @@ class AudioEngine(context: Context) {
                             lastPlayedSeq = packetToPlay.seq
                         }
                     } else {
-                        // Tiny sleep prevents CPU burn, but low enough (< 40ms) to not cause lag
                         Thread.sleep(2)
                     }
                 }
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
             } catch (e: Exception) {
-                Log.e(tag, "Exception in playback thread", e)
+                // Ignore interruption
             }
         }, "AudioPlaybackThread").apply { start() }
     }
@@ -141,7 +127,7 @@ class AudioEngine(context: Context) {
     fun writeAudio(seq: Int, data: ByteArray) {
         if (!isPlaying.get()) return
         synchronized(jitterBuffer) {
-            if (jitterBuffer.size > 50) jitterBuffer.clear() // Prevent latency buildup
+            if (jitterBuffer.size > 50) jitterBuffer.clear()
             jitterBuffer.offer(AudioPacket(seq, data))
         }
     }
@@ -159,6 +145,11 @@ class AudioEngine(context: Context) {
             @SuppressLint("MissingPermission")
             audioRecord = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBufSize * 2)
 
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                Log.e(tag, "AudioRecord failed to initialize")
+                return
+            }
+
             setupAudioEffects()
             audioRecord?.startRecording()
 
@@ -166,6 +157,7 @@ class AudioEngine(context: Context) {
             Log.d(tag, "Recording started.")
         } catch (e: Exception) {
             Log.e(tag, "Recording initialization failed", e)
+            stopRecording()
         }
     }
 
@@ -177,16 +169,21 @@ class AudioEngine(context: Context) {
 
             try {
                 while (isRecording.get()) {
-                    // Read exactly FRAME_SIZE samples
+                    val recorder = audioRecord ?: break
+
                     var readSize = 0
                     while (readSize < frameSizeShorts && isRecording.get()) {
-                        val result = audioRecord?.read(pcmBuffer, readSize, frameSizeShorts - readSize) ?: 0
-                        if (result > 0) readSize += result else break
+                        // FIX: This read is blocking. Releasing hardware forces this to exit.
+                        val result = recorder.read(pcmBuffer, readSize, frameSizeShorts - readSize)
+                        if (result > 0) {
+                            readSize += result
+                        } else {
+                            break // Error or stopped
+                        }
                     }
 
                     if (readSize == frameSizeShorts) {
                         var maxAmplitude = 0
-                        // 1. Limiter (Prevent Distortion)
                         for (i in 0 until readSize) {
                             val absValue = abs(pcmBuffer[i].toInt())
                             if (absValue > maxAmplitude) maxAmplitude = absValue
@@ -195,7 +192,6 @@ class AudioEngine(context: Context) {
                             }
                         }
 
-                        // 2. Noise Gate (Silence suppression)
                         if (maxAmplitude > NOISE_GATE_THRESHOLD) {
                             val bytes = ShortToByte(pcmBuffer, readSize)
                             onDataReady(bytes)
@@ -203,9 +199,43 @@ class AudioEngine(context: Context) {
                     }
                 }
             } catch (e: Exception) {
-                Log.e(tag, "Exception in recording thread", e)
+                Log.e(tag, "Recording thread stopped: ${e.message}")
             }
         }, "AudioRecordingThread").apply { start() }
+    }
+
+    fun stopRecording() {
+        if (!isRecording.compareAndSet(true, false)) return
+
+        try {
+            Log.d(tag, "Releasing Microphone Hardware...")
+
+            // --- CRITICAL FIX: RELEASE HARDWARE FIRST ---
+            // Releasing the object forces the thread's read() to fail immediately.
+            val recorder = audioRecord
+            audioRecord = null // Nullify global reference first
+
+            try {
+                recorder?.stop()
+            } catch (e: IllegalStateException) {
+                // Ignore if not initialized
+            }
+            recorder?.release() // <--- THIS FREES THE MIC FOR WHATSAPP
+
+            // Release effects
+            aec?.release(); aec = null
+            ns?.release(); ns = null
+            agc?.release(); agc = null
+
+            // Now the thread is unblocked and can be stopped
+            recordingThread?.interrupt()
+            recordingThread?.join(100)
+            recordingThread = null
+
+        } catch (e: Exception) {
+            Log.e(tag, "Error freeing microphone", e)
+        }
+        Log.d(tag, "Microphone released.")
     }
 
     private fun ShortToByte(shorts: ShortArray, readSize: Int): ByteArray {
@@ -217,53 +247,28 @@ class AudioEngine(context: Context) {
     private fun setupAudioEffects() {
         val sessionId = audioRecord?.audioSessionId ?: 0
         if (sessionId == 0) return
-
-        // These built-in Android effects are KEY for call quality
         if (AcousticEchoCanceler.isAvailable()) aec = AcousticEchoCanceler.create(sessionId)?.apply { enabled = true }
         if (NoiseSuppressor.isAvailable()) ns = NoiseSuppressor.create(sessionId)?.apply { enabled = true }
         if (AutomaticGainControl.isAvailable()) agc = AutomaticGainControl.create(sessionId)?.apply { enabled = true }
-    }
-
-    fun stopRecording() {
-        if (!isRecording.compareAndSet(true, false)) return
-        try {
-            recordingThread?.interrupt()
-            recordingThread?.join(100)
-
-            audioRecord?.stop()
-            audioRecord?.release()
-            audioRecord = null
-
-            aec?.release()
-            ns?.release()
-            agc?.release()
-            aec = null
-            ns = null
-            agc = null
-
-        } catch (e: Exception) {
-            Log.e(tag, "Error stopping recording", e)
-        }
-        recordingThread = null
-        Log.d(tag, "Recording stopped.")
     }
 
     fun stopPlayback() {
         if (!isPlaying.compareAndSet(true, false)) return
         try {
             synchronized(jitterBuffer) { jitterBuffer.clear() }
+
             playbackThread?.interrupt()
             playbackThread?.join(100)
+            playbackThread = null
 
             audioTrack?.pause()
             audioTrack?.flush()
             audioTrack?.release()
             audioTrack = null
-            
+
         } catch (e: Exception) {
             Log.e(tag, "Error stopping playback", e)
         }
-        playbackThread = null
         Log.d(tag, "Playback stopped.")
     }
 

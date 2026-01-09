@@ -27,7 +27,6 @@ import `in`.chinmoydas.signal.utils.NetworkEngine
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.collect
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
@@ -63,7 +62,7 @@ class VoiceService : Service() {
     @Volatile private var myUsername: String = "User"
     @Volatile private var myLocalIp: String = ""
 
-    // --- FIX 1: ADDED KEY VARIABLE ---
+    // --- KEY VARIABLES ---
     @Volatile private var currentChannel: String? = null
     @Volatile private var currentChannelKey: String? = null
 
@@ -78,7 +77,10 @@ class VoiceService : Service() {
     @Volatile private var lastPort: Int = UDP_PORT
 
     private val audioManager by lazy { getSystemService(Context.AUDIO_SERVICE) as AudioManager }
+
+    @Suppress("DEPRECATION")
     private val vibrator by lazy { getSystemService(Context.VIBRATOR_SERVICE) as Vibrator }
+
     private var activeFocusRequest: AudioFocusRequest? = null
 
     private val wakeLock by lazy { (getSystemService(Context.POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CDSignal:VoiceLock") }
@@ -119,24 +121,17 @@ class VoiceService : Service() {
     private fun observeRepositoryFlows() {
         scope.launch { repository.myUsername.collect { myUsername = it; localLinkManager?.startAdvertising(it, UDP_PORT) } }
 
-        // --- FIX 2: PARSE CHANNEL NAME AND KEY ---
         scope.launch {
             repository.targetUser.collect { target ->
                 if (target.startsWith("group:", ignoreCase = true)) {
                     val raw = target.substringAfter(":")
-                    // We only care about the NAME here.
-                    // The KEY is now handled by the separate repository.channelKey collector.
                     if (raw.contains(":")) {
                         val parts = raw.split(":", limit = 2)
                         currentChannel = parts[0]
-                        // Optional: specific override if needed, otherwise trust the repo flow
                     } else {
                         currentChannel = raw
-                        // DO NOT set currentChannelKey = null here!
-                        // Let the other collector handle the key.
                     }
                 } else {
-                    // User switched to P2P mode, so we clear channel params
                     currentChannel = null
                     currentChannelKey = null
                 }
@@ -154,8 +149,8 @@ class VoiceService : Service() {
 
         scope.launch {
             repository.channelKey.collect { key ->
-                currentChannelKey = key // Update the variable you created earlier
-                triggerHeartbeat()      // Force an immediate update to server
+                currentChannelKey = key
+                triggerHeartbeat()
             }
         }
     }
@@ -182,7 +177,7 @@ class VoiceService : Service() {
         if (localLinkManager == null) localLinkManager = LocalLinkManager(this, { _, _, _ -> }, { _ -> })
         localLinkManager?.startAdvertising(myUsername, UDP_PORT)
 
-        toggleSpeaker(true)
+        // REMOVED: toggleSpeaker(true) -> This was the bug causing WhatsApp to fail
         startHeartbeatLoop()
         return START_STICKY
     }
@@ -221,11 +216,10 @@ class VoiceService : Service() {
                 sequenceMap[senderName] = -1
             }
             sequenceMap[senderName] = seqNum
-            lastIncomingIp = senderIp // SAVE THIS IP
+            lastIncomingIp = senderIp
             handleIncomingSignal(senderName)
 
             if (payloadLen > 0 && !isSilenced) {
-                // NO ENCRYPTION: Play raw audio directly to avoid static noise errors
                 val rawAudio = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
                 audioEngine.writeAudio(seqNum, rawAudio)
             }
@@ -270,9 +264,7 @@ class VoiceService : Service() {
         val headerLen = 1 + nameBytes.size + 4
 
         audioEngine.startRecording { opusBuffer ->
-            // NO ENCRYPTION: Send raw buffer
             val payload = opusBuffer
-
             val sendBuf = ByteArray(headerLen + payload.size)
             sendBuf[0] = nameBytes.size.toByte()
             System.arraycopy(nameBytes, 0, sendBuf, 1, nameBytes.size)
@@ -316,21 +308,28 @@ class VoiceService : Service() {
         scope.launch { delay(IGNORE_SENDER_DELAY); ignoredSender = null }
     }
 
+    @Suppress("DEPRECATION")
     fun toggleSpeaker(on: Boolean) {
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        audioManager.isSpeakerphoneOn = on
-        if (!on) {
-            try {
-                audioManager.startBluetoothSco()
-                audioManager.isBluetoothScoOn = true
-            } catch (e: Exception) {
-                Log.w(tag, "Could not start Bluetooth SCO", e)
+        // Only modify if we are actively in a call
+        if (activeCalls.get() > 0) {
+            audioManager.isSpeakerphoneOn = on
+            if (!on) {
+                try {
+                    audioManager.startBluetoothSco()
+                    audioManager.isBluetoothScoOn = true
+                } catch (e: Exception) {
+                    Log.w(tag, "Could not start Bluetooth SCO", e)
+                }
             }
         }
     }
 
     private fun acquireResources() {
         if (activeCalls.getAndIncrement() == 0) {
+            // --- FIX: Switch to Call Mode HERE, not in onStart ---
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            audioManager.isSpeakerphoneOn = true // Default to speaker for PTT
+
             if (!wakeLock.isHeld) wakeLock.acquire(10 * 60 * 1000L)
             requestFocus()
         }
@@ -338,6 +337,10 @@ class VoiceService : Service() {
 
     private fun releaseResourcesIfNeeded() {
         if (activeCalls.decrementAndGet() == 0) {
+            // --- FIX: Release Call Mode immediately ---
+            audioManager.mode = AudioManager.MODE_NORMAL
+            audioManager.isSpeakerphoneOn = false
+
             if (wakeLock.isHeld) wakeLock.release()
             abandonFocus()
         }
@@ -361,6 +364,7 @@ class VoiceService : Service() {
         activeFocusRequest = null
     }
 
+    @Suppress("DEPRECATION")
     private fun vibrate() {
         try {
             val effect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE) else null
@@ -398,7 +402,6 @@ class VoiceService : Service() {
             val token = repository.getToken()
             if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
                 try {
-                    // --- FIX 3: PASSING THE ACTUAL KEY INSTEAD OF NULL ---
                     RetrofitClient.api.sendHeartbeat("Bearer $token", UDP_PORT, getLocalIpAddress(), currentChannel, currentChannelKey, status)
                 } catch (e: Exception) {
                     Log.e(tag, "Heartbeat failed", e)
