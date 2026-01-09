@@ -63,8 +63,9 @@ class VoiceService : Service() {
     @Volatile private var myUsername: String = "User"
     @Volatile private var myLocalIp: String = ""
 
-    // Routing variables (kept for logic, even without encryption)
+    // --- FIX 1: ADDED KEY VARIABLE ---
     @Volatile private var currentChannel: String? = null
+    @Volatile private var currentChannelKey: String? = null
 
     @Volatile var isSilenced = false
     private val sequenceMap = ConcurrentHashMap<String, Int>()
@@ -118,12 +119,26 @@ class VoiceService : Service() {
     private fun observeRepositoryFlows() {
         scope.launch { repository.myUsername.collect { myUsername = it; localLinkManager?.startAdvertising(it, UDP_PORT) } }
 
+        // --- FIX 2: PARSE CHANNEL NAME AND KEY ---
         scope.launch {
             repository.targetUser.collect { target ->
                 if (target.startsWith("group:", ignoreCase = true)) {
-                    currentChannel = target.substringAfter(":")
+                    val raw = target.substringAfter(":")
+                    // We only care about the NAME here.
+                    // The KEY is now handled by the separate repository.channelKey collector.
+                    if (raw.contains(":")) {
+                        val parts = raw.split(":", limit = 2)
+                        currentChannel = parts[0]
+                        // Optional: specific override if needed, otherwise trust the repo flow
+                    } else {
+                        currentChannel = raw
+                        // DO NOT set currentChannelKey = null here!
+                        // Let the other collector handle the key.
+                    }
                 } else {
+                    // User switched to P2P mode, so we clear channel params
                     currentChannel = null
+                    currentChannelKey = null
                 }
                 triggerHeartbeat()
             }
@@ -134,6 +149,13 @@ class VoiceService : Service() {
                 val blocked = repository.getBlockedContacts()
                 blockedCache.clear()
                 blockedCache.addAll(blocked.map { it.name })
+            }
+        }
+
+        scope.launch {
+            repository.channelKey.collect { key ->
+                currentChannelKey = key // Update the variable you created earlier
+                triggerHeartbeat()      // Force an immediate update to server
             }
         }
     }
@@ -376,8 +398,8 @@ class VoiceService : Service() {
             val token = repository.getToken()
             if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
                 try {
-                    // Send status to keep peer discovery alive
-                    RetrofitClient.api.sendHeartbeat("Bearer $token", UDP_PORT, getLocalIpAddress(), currentChannel, null, status)
+                    // --- FIX 3: PASSING THE ACTUAL KEY INSTEAD OF NULL ---
+                    RetrofitClient.api.sendHeartbeat("Bearer $token", UDP_PORT, getLocalIpAddress(), currentChannel, currentChannelKey, status)
                 } catch (e: Exception) {
                     Log.e(tag, "Heartbeat failed", e)
                 }

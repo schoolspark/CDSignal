@@ -16,7 +16,8 @@ class MainRepository(context: Context) {
     // --- Reactive Preferences ---
     private val _targetUser = MutableStateFlow(prefs.getString("current_target", "") ?: "")
     val targetUser: StateFlow<String> = _targetUser.asStateFlow()
-
+    private val _channelKey = MutableStateFlow(prefs.getString("channel_key", "") ?: "")
+    val channelKey: StateFlow<String> = _channelKey.asStateFlow()
     private val _myUsername = MutableStateFlow(prefs.getString("username", "User") ?: "User")
     val myUsername: StateFlow<String> = _myUsername.asStateFlow()
 
@@ -32,7 +33,7 @@ class MainRepository(context: Context) {
             "current_target" -> _targetUser.value = prefs.getString("current_target", "") ?: ""
             "username" -> _myUsername.value = prefs.getString("username", "User") ?: "User"
             "my_pairing_code" -> _myPairingCode.value = prefs.getString("my_pairing_code", "----") ?: "----"
-            // We listen to this key to sync processes
+            "channel_key" -> _channelKey.value = prefs.getString("channel_key", "") ?: ""
             "config_refresh_trigger" -> _configTrigger.value = prefs.getInt("config_refresh_trigger", 0)
         }
     }
@@ -77,6 +78,9 @@ class MainRepository(context: Context) {
     fun getTargetUser(): String = targetUser.value
     fun setTargetUser(name: String) {
         prefs.edit().putString("current_target", name).apply()
+    }
+    fun saveChannelKey(key: String) {
+        prefs.edit().putString("channel_key", key).apply()
     }
 
     fun getMyPairingCode(): String = myPairingCode.value

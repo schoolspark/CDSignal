@@ -77,6 +77,14 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
     fun setTarget(name: String) {
         repository.setTargetUser(name)
+
+        // FIX: If the contact has a saved code, use it.
+        // IF NOT, we must explicitly clear the key by saving "" (empty string).
+        val contact = savedContacts.find { it.name == name }
+        val key = contact?.savedCode ?: ""
+
+        // This ensures if I switch from "Secure" to "Public", the key is wiped.
+        repository.saveChannelKey(key)
     }
 
     fun addContact(name: String, ip: String, code: String) {
@@ -134,18 +142,29 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                 return@launch
             }
             try {
+                // --- LOGIC FOR GROUPS/CHANNELS ---
                 if (name.startsWith("group:", true)) {
                     repository.saveContact(name, "SERVER_LINK", code)
+
+                    // --- FIX: Force save the Key and Target immediately ---
+                    repository.saveChannelKey(code)
+                    repository.setTargetUser(name)
+
                     loadData()
-                    setTarget(name)
                     _uiState.value = UiState.Connected(name)
                     onSuccess()
-                } else {
+                }
+                // --- LOGIC FOR INDIVIDUALS ---
+                else {
                     val response = repository.findPeer(token, name, code)
                     if (response.ip != null) {
                         repository.saveContact(name, response.ip, code)
+
+                        // --- FIX: Force save the Key and Target immediately ---
+                        repository.saveChannelKey(code)
+                        repository.setTargetUser(name)
+
                         loadData()
-                        setTarget(name)
                         _uiState.value = UiState.Connected(name)
                         onSuccess()
                     } else {
