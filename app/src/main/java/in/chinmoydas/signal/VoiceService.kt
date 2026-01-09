@@ -25,15 +25,26 @@ import `in`.chinmoydas.signal.utils.AudioEngine
 import `in`.chinmoydas.signal.utils.LocalLinkManager
 import `in`.chinmoydas.signal.utils.NetworkEngine
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
+data class VoiceServiceState(
+    val incomingCall: String? = null,
+    val incomingIp: String? = null,
+    val networkStatus: String = "Listening..."
+)
+
 class VoiceService : Service() {
     private val tag = "VoiceService"
     private val binder = LocalBinder()
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    private val _voiceServiceState = MutableStateFlow(VoiceServiceState())
+    val voiceServiceState = _voiceServiceState.asStateFlow()
 
     private lateinit var audioEngine: AudioEngine
     private lateinit var networkEngine: NetworkEngine
@@ -41,6 +52,7 @@ class VoiceService : Service() {
 
     private val END_STREAM_SIGNAL = "__END_TX__"
     private val UDP_PORT = 50005
+    private val IGNORE_SENDER_DELAY = 5000L
 
     @Volatile private var isReceiving = false
     @Volatile private var isSending = false
@@ -138,7 +150,12 @@ class VoiceService : Service() {
         if (!multicastLock.isHeld) multicastLock.acquire()
 
         audioEngine.startPlayback()
-        networkEngine.start { packet -> handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "") }
+        val networkStarted = networkEngine.start { packet -> handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "") }
+        if (!networkStarted) {
+            _voiceServiceState.value = VoiceServiceState(networkStatus = "Error: Network failed to start")
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         if (localLinkManager == null) localLinkManager = LocalLinkManager(this, { _, _, _ -> }, { _ -> })
         localLinkManager?.startAdvertising(myUsername, UDP_PORT)
@@ -160,7 +177,7 @@ class VoiceService : Service() {
             if (isReceiving) {
                 isReceiving = false
                 resetJob?.cancel()
-                notifyUI("")
+                _voiceServiceState.value = VoiceServiceState(networkStatus = "Listening...")
                 updateNotification("Listening...", null)
                 releaseResourcesIfNeeded()
             }
@@ -198,9 +215,10 @@ class VoiceService : Service() {
         if (!isReceiving || (currentTime - lastReceiveTime > 3000)) {
             acquireResources()
             isReceiving = true
-            updateNotification(if(isSilenced) "Missed: $callerName" else "Incoming: $callerName", callerName)
+            val status = if(isSilenced) "Missed: $callerName" else "Incoming: $callerName"
+            updateNotification(status, callerName)
+            _voiceServiceState.value = VoiceServiceState(incomingCall = callerName, incomingIp = lastIncomingIp, networkStatus = status)
             vibrate()
-            notifyUI(callerName)
         }
         lastReceiveTime = currentTime
         resetJob?.cancel()
@@ -210,18 +228,9 @@ class VoiceService : Service() {
                 isReceiving = false
                 releaseResourcesIfNeeded()
                 updateNotification("Listening...", null)
-                notifyUI("")
+                _voiceServiceState.value = VoiceServiceState(networkStatus = "Listening...")
             }
         }
-    }
-
-    private fun notifyUI(name: String) {
-        val intent = Intent("in.chinmoydas.signal.INCOMING_TALK").apply {
-            putExtra("channel_name", name)
-            putExtra("sender_ip", lastIncomingIp) // SEND IP TO UI
-            setPackage(packageName)
-        }
-        sendBroadcast(intent)
     }
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
@@ -279,10 +288,10 @@ class VoiceService : Service() {
         ignoredSender = lastIncomingIp
         isReceiving = false
         resetJob?.cancel()
-        notifyUI("")
+        _voiceServiceState.value = VoiceServiceState(networkStatus = "Listening...")
         updateNotification("Listening...", null)
         releaseResourcesIfNeeded()
-        scope.launch { delay(5000); ignoredSender = null }
+        scope.launch { delay(IGNORE_SENDER_DELAY); ignoredSender = null }
     }
 
     fun toggleSpeaker(on: Boolean) {
@@ -404,7 +413,7 @@ class VoiceService : Service() {
     }
 
     override fun onDestroy() {
-        runBlocking { launch { triggerHeartbeat("offline") }.join() }
+        scope.launch { triggerHeartbeat("offline") }
 
         audioEngine.shutdown()
         networkEngine.stop()

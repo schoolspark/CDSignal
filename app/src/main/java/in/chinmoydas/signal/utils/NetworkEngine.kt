@@ -26,8 +26,8 @@ class NetworkEngine(private val port: Int) {
     private var senderThread: Thread? = null
     private var receiverThread: Thread? = null
 
-    fun start(onPacketReceived: (DatagramPacket) -> Unit) {
-        if (isRunning.getAndSet(true)) return
+    fun start(onPacketReceived: (DatagramPacket) -> Unit): Boolean {
+        if (isRunning.getAndSet(true)) return true
 
         try {
             socket = DatagramSocket(port).apply {
@@ -39,13 +39,13 @@ class NetworkEngine(private val port: Int) {
         } catch (e: SocketException) {
             Log.e(tag, "Could not start socket: ${e.message}")
             isRunning.set(false)
-            return
+            return false
         }
 
         senderThread = Thread({
             try {
                 while (isRunning.get()) {
-                    val packet = sendQueue.poll(500, TimeUnit.MILLISECONDS)
+                    val packet = sendQueue.take()
                     if (packet != null) {
                         try {
                             socket?.send(packet)
@@ -79,6 +79,7 @@ class NetworkEngine(private val port: Int) {
                 if (isRunning.get()) Log.e(tag, "Receiver thread crashed: ${e.message}")
             }
         }, "NetworkReceiver").apply { start() }
+        return true
     }
 
     fun send(data: ByteArray, targets: List<String>, targetPort: Int) {

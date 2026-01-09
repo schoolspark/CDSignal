@@ -138,6 +138,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                     repository.saveContact(name, "SERVER_LINK", code)
                     loadData()
                     setTarget(name)
+                    _uiState.value = UiState.Connected(name)
                     onSuccess()
                 } else {
                     val response = repository.findPeer(token, name, code)
@@ -145,6 +146,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                         repository.saveContact(name, response.ip, code)
                         loadData()
                         setTarget(name)
+                        _uiState.value = UiState.Connected(name)
                         onSuccess()
                     } else {
                         _uiState.value = UiState.Error("Access Denied")

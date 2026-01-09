@@ -104,7 +104,8 @@ fun HomeScreen(
             )
             2 -> ConnectTab(
                 modifier = contentModifier,
-                viewModel = viewModel
+                viewModel = viewModel,
+                onConnected = { selectedTab = 0 }
             )
             3 -> ProfileTab(
                 modifier = contentModifier,

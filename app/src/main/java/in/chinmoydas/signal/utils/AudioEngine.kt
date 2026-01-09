@@ -65,7 +65,7 @@ class AudioEngine(context: Context) {
     private val FRAME_SIZE = 640
 
     // Lowered threshold to pick up whispers, clearer voice
-    private val NOISE_GATE_THRESHOLD = 30
+    private val NOISE_GATE_THRESHOLD = 50
     private val GAIN_LIMIT_THRESHOLD = 30000
 
     // =========================================================================

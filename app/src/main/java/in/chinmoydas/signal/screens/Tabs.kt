@@ -33,6 +33,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
@@ -77,9 +78,18 @@ fun TalkTab(
 
         val (statusText, statusColor) = when (val state = uiState) {
             is UiState.Ready -> "Ready" to MaterialTheme.colorScheme.primary
-            is UiState.Connected -> "Connected to ${state.target}" to MaterialTheme.colorScheme.primary
-            is UiState.Transmitting -> state.target to MaterialTheme.colorScheme.error
-            is UiState.Receiving -> "Receiving from ${state.from}" to MaterialTheme.colorScheme.secondary
+            is UiState.Connected -> {
+                val targetName = if (state.target.startsWith("group:")) state.target.substringAfter(":") else state.target
+                "Connected to $targetName" to MaterialTheme.colorScheme.primary
+            }
+            is UiState.Transmitting -> {
+                val targetName = if (state.target.startsWith("group:")) state.target.substringAfter(":") else state.target
+                targetName to MaterialTheme.colorScheme.error
+            }
+            is UiState.Receiving -> {
+                val fromName = if (state.from.startsWith("group:")) state.from.substringAfter(":") else state.from
+                "Receiving from $fromName" to MaterialTheme.colorScheme.secondary
+            }
             is UiState.Error -> state.message to Color.Gray
         }
 
@@ -104,7 +114,14 @@ fun TalkTab(
         Spacer(Modifier.height(10.dp))
 
         // --- Status Text ---
-        Text(statusText, fontSize = 24.sp, fontWeight = FontWeight.Bold, color = statusColor)
+        Text(
+            statusText, 
+            fontSize = 24.sp, 
+            fontWeight = FontWeight.Bold, 
+            color = statusColor,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis
+        )
 
         Spacer(Modifier.height(40.dp))
 
@@ -218,7 +235,11 @@ fun HistoryTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
+fun ConnectTab(
+    modifier: Modifier = Modifier, 
+    viewModel: WalkieViewModel, 
+    onConnected: () -> Unit
+) {
     val context = LocalContext.current
     var codeInput by remember { mutableStateOf("") }
     var inputName by remember { mutableStateOf("") }
@@ -230,14 +251,19 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
             if (result.contents.startsWith("CHANNEL:")) {
                 val data = result.contents.removePrefix("CHANNEL:")
                 val parts = data.split("|")
-                if (parts.size > 1) viewModel.saveInternetContact("group:${parts[0]}", parts[1], { Toast.makeText(context, "Channel Joined!", Toast.LENGTH_SHORT).show() }, {})
+                if (parts.size > 1) {
+                    viewModel.saveInternetContact("group:${parts[0]}", parts[1], {
+                        Toast.makeText(context, "Channel Joined!", Toast.LENGTH_SHORT).show()
+                        onConnected()
+                    }, {})
+                }
             } else {
                 val parts = result.contents.split("|")
                 if (parts.size > 1) {
                     viewModel.setTarget(parts[0])
                     codeInput = parts[1]
                     isGroupMode = false
-                    viewModel.saveInternetContact(parts[0], parts[1], {}, {})
+                    viewModel.saveInternetContact(parts[0], parts[1], { onConnected() }, {})
                 }
             }
         }
@@ -281,7 +307,7 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
                     Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
                         Row(Modifier.padding(8.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                             Column { Text(user.name, fontWeight = FontWeight.Bold); Text(user.ip, style = MaterialTheme.typography.bodySmall) }
-                            Button(onClick = { viewModel.addContact(user.name, user.ip, "") }) { Text("Connect") }
+                            Button(onClick = { viewModel.addContact(user.name, user.ip, ""); onConnected() }) { Text("Connect") }
                         }
                     }
                 }
@@ -297,7 +323,7 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
                 var showMenu by remember { mutableStateOf(false) }
 
                 Box {
-                    InputChip(selected = viewModel.targetUser == contact.name, onClick = { viewModel.setTarget(contact.name) }, label = { Text(displayName) }, avatar = { Icon(if (isGroup) Icons.Default.Groups else Icons.Default.Person, null) }, trailingIcon = { IconButton(onClick = { showMenu = true }, modifier = Modifier.size(18.dp)) { Icon(Icons.Default.ArrowDropDown, null) } })
+                    InputChip(selected = viewModel.targetUser == contact.name, onClick = { viewModel.setTarget(contact.name); onConnected() }, label = { Text(displayName) }, avatar = { Icon(if (isGroup) Icons.Default.Groups else Icons.Default.Person, null) }, trailingIcon = { IconButton(onClick = { showMenu = true }, modifier = Modifier.size(18.dp)) { Icon(Icons.Default.ArrowDropDown, null) } })
                     DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
                         DropdownMenuItem(text = { Text("Delete") }, onClick = { viewModel.deleteContact(contact.name); showMenu = false }, leadingIcon = { Icon(Icons.Default.Delete, null) })
                         if (isGroup) {

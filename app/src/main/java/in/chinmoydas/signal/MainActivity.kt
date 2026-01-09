@@ -1,10 +1,8 @@
 package `in`.chinmoydas.signal
 
-import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.net.Uri
 import android.os.Build
@@ -17,8 +15,14 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.runtime.*
-import androidx.core.content.ContextCompat
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -31,6 +35,10 @@ import `in`.chinmoydas.signal.screens.LoginScreen
 import `in`.chinmoydas.signal.ui.theme.CDSignalTheme
 import `in`.chinmoydas.signal.viewmodel.ViewModelFactory
 import `in`.chinmoydas.signal.viewmodel.WalkieViewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
@@ -38,30 +46,14 @@ class MainActivity : ComponentActivity() {
     private var isBound = false
     private lateinit var walkieViewModel: WalkieViewModel
 
-    private val incomingReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == "in.chinmoydas.signal.INCOMING_TALK") {
-                val channel = intent.getStringExtra("channel_name") ?: ""
-                val ip = intent.getStringExtra("sender_ip") ?: "" // GET IP FROM SERVICE
-
-                if (::walkieViewModel.isInitialized) {
-                    if (channel.isEmpty()) {
-                        walkieViewModel.onReceptionEnded()
-                    } else {
-                        // Pass IP to ViewModel so we can reply
-                        walkieViewModel.onReceptionStarted(channel, ip)
-                    }
-                }
-            }
-        }
-    }
-
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(className: ComponentName, service: IBinder) {
             val binder = service as VoiceService.LocalBinder
             voiceService = binder.getService()
             isBound = true
+            observeServiceState()
         }
+
         override fun onServiceDisconnected(arg0: ComponentName) {
             isBound = false
             voiceService = null
@@ -73,53 +65,78 @@ class MainActivity : ComponentActivity() {
 
         requestBatteryOptimizationExemption()
 
-        val filter = IntentFilter("in.chinmoydas.signal.INCOMING_TALK")
-        ContextCompat.registerReceiver(this, incomingReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
-
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
         )
 
-        val repository = MainRepository(applicationContext)
-        val factory = ViewModelFactory(repository)
+        lifecycleScope.launch {
+            val repository = withContext(Dispatchers.IO) {
+                MainRepository(applicationContext)
+            }
+            val factory = ViewModelFactory(repository)
 
-        setContent {
-            CDSignalTheme {
-                val navController = rememberNavController()
-                val prefs = remember { getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE) }
+            setContent {
+                CDSignalTheme {
+                    var startDest by remember { mutableStateOf<String?>(null) }
 
-                walkieViewModel = viewModel(factory = factory)
-                val currentName by repository.myUsername.collectAsState()
+                    LaunchedEffect(Unit) {
+                        val prefs = withContext(Dispatchers.IO) {
+                            getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
+                        }
+                        startDest = if (prefs.getString("jwt_token", null) != null) "home" else "login"
+                    }
 
-                LaunchedEffect(intent) {
-                    handleIntent(intent)
-                }
+                    if (startDest != null) {
+                        val navController = rememberNavController()
+                        walkieViewModel = ViewModelProvider(this@MainActivity, factory)[WalkieViewModel::class.java]
+                        val currentName by repository.myUsername.collectAsState()
 
-                val savedToken = prefs.getString("jwt_token", null)
-                val startDest = if (savedToken != null) "home" else "login"
+                        LaunchedEffect(intent) {
+                            handleIntent(intent)
+                        }
 
-                NavHost(navController = navController, startDestination = startDest) {
-                    composable("login") { LoginScreen(navController, prefs) }
-                    composable("help") { HelpScreen(navController) }
-                    composable("diagnostics") { DiagnosticsScreen(navController) }
-                    composable("home") {
-                        HomeScreen(
-                            navController = navController,
-                            service = voiceService,
-                            viewModel = walkieViewModel,
-                            myName = currentName,
-                            onPermissionsGranted = { startAndBindService() },
-                            onLogout = {
-                                prefs.edit().clear().apply()
-                                stopAndUnbindService()
-                                navController.navigate("login") { popUpTo("home") { inclusive = true } }
-                            },
-                            onExit = {
-                                stopAndUnbindService()
-                                finishAndRemoveTask()
+                        NavHost(navController = navController, startDestination = startDest!!) {
+                            composable("login") { LoginScreen(navController, getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)) }
+                            composable("help") { HelpScreen(navController) }
+                            composable("diagnostics") { DiagnosticsScreen(navController) }
+                            composable("home") {
+                                HomeScreen(
+                                    navController = navController,
+                                    service = voiceService,
+                                    viewModel = walkieViewModel,
+                                    myName = currentName,
+                                    onPermissionsGranted = { startAndBindService() },
+                                    onLogout = {
+                                        getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE).edit().clear().apply()
+                                        stopAndUnbindService()
+                                        navController.navigate("login") { popUpTo("home") { inclusive = true } }
+                                    },
+                                    onExit = {
+                                        stopAndUnbindService()
+                                        finishAndRemoveTask()
+                                    }
+                                )
                             }
-                        )
+                        }
+                    } else {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun observeServiceState() {
+        lifecycleScope.launch {
+            voiceService?.voiceServiceState?.collectLatest { state ->
+                if (::walkieViewModel.isInitialized) {
+                    if (state.incomingCall != null && state.incomingIp != null) {
+                        walkieViewModel.onReceptionStarted(state.incomingCall, state.incomingIp)
+                    } else {
+                        walkieViewModel.onReceptionEnded()
                     }
                 }
             }
@@ -185,10 +202,5 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         stopAndUnbindService()
-        try {
-            unregisterReceiver(incomingReceiver)
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Failed to unregister receiver", e)
-        }
     }
 }
