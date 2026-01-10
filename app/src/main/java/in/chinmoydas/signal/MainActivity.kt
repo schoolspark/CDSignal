@@ -23,7 +23,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
-import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
@@ -109,12 +108,11 @@ class MainActivity : ComponentActivity() {
                                     onPermissionsGranted = { startAndBindService() },
                                     onLogout = {
                                         getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE).edit().clear().apply()
-                                        stopAndUnbindService()
+                                        performExplicitExit() // FIX: Correctly stop service
                                         navController.navigate("login") { popUpTo("home") { inclusive = true } }
                                     },
                                     onExit = {
-                                        stopAndUnbindService()
-                                        finishAndRemoveTask()
+                                        performExplicitExit() // FIX: Correctly stop service and app
                                     }
                                 )
                             }
@@ -182,13 +180,29 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun stopAndUnbindService() {
+    // --- NEW FUNCTION: Handles proper shutdown ---
+    private fun performExplicitExit() {
+        // 1. Unbind UI first
         if (isBound) {
-            try {
-                unbindService(connection)
-            } catch (e: Exception) {
-                Log.e("MainActivity", "Failed to unbind service", e)
-            }
+            try { unbindService(connection) } catch (e: Exception) {}
+            isBound = false
+        }
+
+        // 2. Send the specific STOP command to VoiceService
+        // This triggers the "START_NOT_STICKY" logic in onStartCommand
+        val stopIntent = Intent(this, VoiceService::class.java).apply {
+            action = "STOP_SERVICE"
+        }
+        startService(stopIntent)
+
+        // 3. Close the UI
+        finishAffinity()
+    }
+
+    private fun stopAndUnbindService() {
+        // Deprecated for Exit logic, but kept for cleanup if needed internally
+        if (isBound) {
+            try { unbindService(connection) } catch (e: Exception) {}
             isBound = false
         }
         stopService(Intent(this, VoiceService::class.java))
@@ -201,6 +215,16 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        stopAndUnbindService()
+        // --- CRITICAL FIX ---
+        // We ONLY unbind here. We do NOT stop the service.
+        // This allows the "Background Listening" to work when user swipes app away.
+        if (isBound) {
+            try {
+                unbindService(connection)
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Failed to unbind service", e)
+            }
+            isBound = false
+        }
     }
 }

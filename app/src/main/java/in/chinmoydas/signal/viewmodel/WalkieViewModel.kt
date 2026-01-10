@@ -21,6 +21,8 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import android.graphics.Color as AndroidColor
 
+// --- REMOVED UiState CLASS DEFINITION (It is now in UiState.kt) ---
+
 data class Contact(val name: String, var ip: String, val isTrusted: Boolean = false, val savedCode: String = "")
 
 class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
@@ -111,14 +113,13 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         if (localManager == null) {
             localManager = LocalLinkManager(context, { name, inetAddress, _ ->
                 viewModelScope.launch {
-                    val displayName = name.removePrefix("CD-")
                     val ip = inetAddress.hostAddress ?: ""
-                    if (blockedContacts.none { it.name == displayName }) {
-                        val existingIndex = nearbyUsers.indexOfFirst { it.name == displayName }
+                    if (blockedContacts.none { it.name == name }) {
+                        val existingIndex = nearbyUsers.indexOfFirst { it.name == name }
                         if (existingIndex != -1) {
                             if (nearbyUsers[existingIndex].ip != ip) nearbyUsers[existingIndex] = nearbyUsers[existingIndex].copy(ip = ip)
                         } else {
-                            nearbyUsers.add(Contact(displayName, ip, false))
+                            nearbyUsers.add(Contact(name, ip, false))
                         }
                     }
                 }

@@ -1,6 +1,7 @@
 package `in`.chinmoydas.signal
 
 import android.Manifest
+import android.app.AlarmManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -67,6 +68,7 @@ class VoiceService : Service() {
     @Volatile private var currentChannelKey: String? = null
 
     @Volatile var isSilenced = false
+    @Volatile private var userPrefersSpeaker = true // Default to Loudspeaker
     private val sequenceMap = ConcurrentHashMap<String, Int>()
 
     private val blockedCache = ConcurrentHashMap.newKeySet<String>()
@@ -177,9 +179,29 @@ class VoiceService : Service() {
         if (localLinkManager == null) localLinkManager = LocalLinkManager(this, { _, _, _ -> }, { _ -> })
         localLinkManager?.startAdvertising(myUsername, UDP_PORT)
 
-        // REMOVED: toggleSpeaker(true) -> This was the bug causing WhatsApp to fail
         startHeartbeatLoop()
         return START_STICKY
+    }
+
+    // --- FIX: AUTO-RESTART WHEN TASK REMOVED ---
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        val restartServiceIntent = Intent(applicationContext, VoiceService::class.java).also {
+            it.setPackage(packageName)
+        }
+
+        val restartServicePendingIntent = PendingIntent.getService(
+            this, 1, restartServiceIntent,
+            PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val alarmService = applicationContext.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        alarmService.set(
+            AlarmManager.ELAPSED_REALTIME,
+            SystemClock.elapsedRealtime() + 1000,
+            restartServicePendingIntent
+        )
+
+        super.onTaskRemoved(rootIntent)
     }
 
     private fun handleIncomingPacket(data: ByteArray, length: Int, senderIp: String) {
@@ -310,7 +332,9 @@ class VoiceService : Service() {
 
     @Suppress("DEPRECATION")
     fun toggleSpeaker(on: Boolean) {
-        // Only modify if we are actively in a call
+        userPrefersSpeaker = on // 1. Save the preference
+
+        // 2. If a call is ALREADY active, apply it immediately
         if (activeCalls.get() > 0) {
             audioManager.isSpeakerphoneOn = on
             if (!on) {
@@ -320,15 +344,29 @@ class VoiceService : Service() {
                 } catch (e: Exception) {
                     Log.w(tag, "Could not start Bluetooth SCO", e)
                 }
+            } else {
+                try {
+                    audioManager.stopBluetoothSco()
+                    audioManager.isBluetoothScoOn = false
+                } catch (e: Exception) {}
             }
         }
     }
 
     private fun acquireResources() {
         if (activeCalls.getAndIncrement() == 0) {
-            // --- FIX: Switch to Call Mode HERE, not in onStart ---
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            audioManager.isSpeakerphoneOn = true // Default to speaker for PTT
+
+            // FIX: Use the user's preference instead of hardcoded 'true'
+            audioManager.isSpeakerphoneOn = userPrefersSpeaker
+
+            // If they prefer Earpiece, ensure Bluetooth is ready if connected
+            if (!userPrefersSpeaker) {
+                try {
+                    audioManager.startBluetoothSco()
+                    audioManager.isBluetoothScoOn = true
+                } catch (e: Exception) {}
+            }
 
             if (!wakeLock.isHeld) wakeLock.acquire(10 * 60 * 1000L)
             requestFocus()
@@ -337,7 +375,6 @@ class VoiceService : Service() {
 
     private fun releaseResourcesIfNeeded() {
         if (activeCalls.decrementAndGet() == 0) {
-            // --- FIX: Release Call Mode immediately ---
             audioManager.mode = AudioManager.MODE_NORMAL
             audioManager.isSpeakerphoneOn = false
 
