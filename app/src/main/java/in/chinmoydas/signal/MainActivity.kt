@@ -1,8 +1,10 @@
 package `in`.chinmoydas.signal
 
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.net.Uri
 import android.os.Build
@@ -21,6 +23,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.core.content.ContextCompat // <--- IMPORT THIS
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.navigation.compose.NavHost
@@ -45,6 +48,15 @@ class MainActivity : ComponentActivity() {
     private var isBound = false
     private lateinit var walkieViewModel: WalkieViewModel
 
+    private val exitReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == "in.chinmoydas.signal.ACTION_EXIT") {
+                Log.d("MainActivity", "Received Exit Signal from Notification. Closing App.")
+                finishAffinity()
+            }
+        }
+    }
+
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(className: ComponentName, service: IBinder) {
             val binder = service as VoiceService.LocalBinder
@@ -61,6 +73,16 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // --- FIX: USE ContextCompat (Handles the Red Flag automatically) ---
+        val filter = IntentFilter("in.chinmoydas.signal.ACTION_EXIT")
+        ContextCompat.registerReceiver(
+            this,
+            exitReceiver,
+            filter,
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        // ------------------------------------------------------------------
 
         requestBatteryOptimizationExemption()
 
@@ -108,11 +130,11 @@ class MainActivity : ComponentActivity() {
                                     onPermissionsGranted = { startAndBindService() },
                                     onLogout = {
                                         getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE).edit().clear().apply()
-                                        performExplicitExit() // FIX: Correctly stop service
+                                        performExplicitExit()
                                         navController.navigate("login") { popUpTo("home") { inclusive = true } }
                                     },
                                     onExit = {
-                                        performExplicitExit() // FIX: Correctly stop service and app
+                                        performExplicitExit()
                                     }
                                 )
                             }
@@ -180,32 +202,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // --- NEW FUNCTION: Handles proper shutdown ---
     private fun performExplicitExit() {
-        // 1. Unbind UI first
         if (isBound) {
             try { unbindService(connection) } catch (e: Exception) {}
             isBound = false
         }
-
-        // 2. Send the specific STOP command to VoiceService
-        // This triggers the "START_NOT_STICKY" logic in onStartCommand
         val stopIntent = Intent(this, VoiceService::class.java).apply {
             action = "STOP_SERVICE"
         }
         startService(stopIntent)
-
-        // 3. Close the UI
         finishAffinity()
-    }
-
-    private fun stopAndUnbindService() {
-        // Deprecated for Exit logic, but kept for cleanup if needed internally
-        if (isBound) {
-            try { unbindService(connection) } catch (e: Exception) {}
-            isBound = false
-        }
-        stopService(Intent(this, VoiceService::class.java))
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -215,9 +221,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // --- CRITICAL FIX ---
-        // We ONLY unbind here. We do NOT stop the service.
-        // This allows the "Background Listening" to work when user swipes app away.
+        try { unregisterReceiver(exitReceiver) } catch (e: Exception) {}
+
         if (isBound) {
             try {
                 unbindService(connection)

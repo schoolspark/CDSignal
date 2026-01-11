@@ -40,12 +40,13 @@ import androidx.navigation.NavController
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import `in`.chinmoydas.signal.VoiceService
+import `in`.chinmoydas.signal.VoiceServiceState // Essential Import
 import `in`.chinmoydas.signal.viewmodel.UiState
 import `in`.chinmoydas.signal.viewmodel.WalkieViewModel
 import java.text.SimpleDateFormat
 import java.util.*
 
-@SuppressLint("MissingPermission") // Suppresses the permission check warning since we request it in LaunchedEffect
+@SuppressLint("MissingPermission")
 @Composable
 fun TalkTab(
     modifier: Modifier = Modifier,
@@ -56,16 +57,27 @@ fun TalkTab(
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsState()
 
-    // 1. Permission Launcher
+    // --- UI OBSERVER: Truth comes from Service ---
+    val serviceState by service?.voiceServiceState?.collectAsState(initial = VoiceServiceState())
+        ?: remember { mutableStateOf(VoiceServiceState()) }
+
     val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-        if (it.getOrDefault(Manifest.permission.RECORD_AUDIO, false)) {
-            onPermissionsGranted()
+        if (it.getOrDefault(Manifest.permission.RECORD_AUDIO, false)) onPermissionsGranted()
+    }
+
+    // --- BRIDGE: Connect Background Service to Foreground Screen ---
+    LaunchedEffect(service) {
+        service?.voiceServiceState?.collect { state ->
+            if (state.incomingCall != null) {
+                viewModel.onReceptionStarted(state.incomingCall, state.incomingIp ?: "")
+            } else {
+                viewModel.onReceptionEnded()
+            }
         }
     }
 
     var lastClickTime by remember { mutableLongStateOf(0L) }
 
-    // 2. Request Permissions on Entry
     LaunchedEffect(Unit) {
         val perms = mutableListOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.VIBRATE)
         if (Build.VERSION.SDK_INT >= 34) perms.add(Manifest.permission.FOREGROUND_SERVICE_MICROPHONE)
@@ -93,39 +105,28 @@ fun TalkTab(
             is UiState.Error -> state.message to Color.Gray
         }
 
-        // --- Header Row ---
         Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = { service?.triggerHeartbeat(); Toast.makeText(context, "Connection Synced", Toast.LENGTH_SHORT).show() }) {
                 Icon(Icons.Default.Sync, "Sync", tint = MaterialTheme.colorScheme.primary)
             }
             Row {
+                // UI buttons now reflect `serviceState` directly
                 IconButton(onClick = { viewModel.toggleSilence(service) }) {
-                    Icon(if (viewModel.isSilenced) Icons.Default.NotificationsOff else Icons.Default.NotificationsActive, "Silent Mode", tint = if (viewModel.isSilenced) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+                    Icon(if (serviceState.isSilenced) Icons.Default.NotificationsOff else Icons.Default.NotificationsActive, "Silent Mode", tint = if (serviceState.isSilenced) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 IconButton(onClick = { viewModel.toggleBroadcastMode() }) {
                     Icon(Icons.Default.Groups, "Broadcast", tint = if (viewModel.isBroadcastMode) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 IconButton(onClick = { viewModel.toggleSpeaker(service) }) {
-                    Icon(if (viewModel.isSpeakerEnabled) Icons.AutoMirrored.Filled.VolumeUp else Icons.Default.Hearing, "Speaker", tint = MaterialTheme.colorScheme.primary)
+                    Icon(if (serviceState.isSpeakerOn) Icons.AutoMirrored.Filled.VolumeUp else Icons.Default.Hearing, "Speaker", tint = MaterialTheme.colorScheme.primary)
                 }
             }
         }
 
         Spacer(Modifier.height(10.dp))
-
-        // --- Status Text ---
-        Text(
-            statusText, 
-            fontSize = 24.sp, 
-            fontWeight = FontWeight.Bold, 
-            color = statusColor,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis
-        )
-
+        Text(statusText, fontSize = 24.sp, fontWeight = FontWeight.Bold, color = statusColor, maxLines = 2, overflow = TextOverflow.Ellipsis)
         Spacer(Modifier.height(40.dp))
 
-        // --- PTT Button and Hang Up ---
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
             if (uiState is UiState.Transmitting || uiState is UiState.Receiving) {
                 IconButton(onClick = { viewModel.hangUp(service) }, modifier = Modifier.size(64.dp).background(Color.Red, CircleShape)) {
@@ -141,15 +142,8 @@ fun TalkTab(
                         detectTapGestures(
                             onPress = {
                                 if (!viewModel.isHandsFree && service != null) {
-                                    viewModel.startTransmission(
-                                        onIpsFound = { ips, port -> service?.startTalk(ips, port) },
-                                        onUpdateIps = { newIps -> service?.updateTalkTargets(newIps) }
-                                    )
-                                    try {
-                                        awaitRelease()
-                                    } finally {
-                                        viewModel.stopTransmission { service?.stopTalk() }
-                                    }
+                                    viewModel.startTransmission(onIpsFound = { ips, port -> service.startTalk(ips, port) }, onUpdateIps = { newIps -> service.updateTalkTargets(newIps) })
+                                    try { awaitRelease() } finally { viewModel.stopTransmission { service.stopTalk() } }
                                 }
                             },
                             onTap = {
@@ -157,11 +151,8 @@ fun TalkTab(
                                     val now = System.currentTimeMillis()
                                     if (now - lastClickTime > 300) {
                                         lastClickTime = now
-                                        if (uiState is UiState.Transmitting) viewModel.stopTransmission { service?.stopTalk() }
-                                        else viewModel.startTransmission(
-                                            onIpsFound = { ips, port -> service?.startTalk(ips, port) },
-                                            onUpdateIps = { newIps -> service?.updateTalkTargets(newIps) }
-                                        )
+                                        if (uiState is UiState.Transmitting) viewModel.stopTransmission { service.stopTalk() }
+                                        else viewModel.startTransmission(onIpsFound = { ips, port -> service.startTalk(ips, port) }, onUpdateIps = { newIps -> service.updateTalkTargets(newIps) })
                                     }
                                 }
                             }
@@ -177,7 +168,6 @@ fun TalkTab(
 
         Spacer(Modifier.height(30.dp))
 
-        // --- Hands-Free Toggle ---
         OutlinedButton(
             onClick = { viewModel.isHandsFree = !viewModel.isHandsFree; if (uiState is UiState.Transmitting) viewModel.stopTransmission { service?.stopTalk() } },
             colors = ButtonDefaults.outlinedButtonColors(containerColor = if(viewModel.isHandsFree) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
@@ -191,42 +181,66 @@ fun TalkTab(
 
 @Composable
 fun HistoryTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
+    val context = LocalContext.current
     val callLogs by viewModel.callLogs.collectAsState()
+    val recordedMessages = viewModel.recordedMessages
     val sdf = remember { SimpleDateFormat("MMM dd, HH:mm", Locale.getDefault()) }
+
+    LaunchedEffect(Unit) { viewModel.loadRecordings(context) }
 
     Column(modifier = modifier.fillMaxSize().padding(16.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Text("Recent Activity", style = MaterialTheme.typography.headlineMedium)
-            IconButton(onClick = { viewModel.clearHistory() }) {
-                Icon(Icons.Default.DeleteSweep, "Clear History", tint = MaterialTheme.colorScheme.error)
-            }
+            Text("Activity & Messages", style = MaterialTheme.typography.headlineMedium)
+            IconButton(onClick = { viewModel.clearHistory() }) { Icon(Icons.Default.DeleteSweep, "Clear Logs", tint = MaterialTheme.colorScheme.error) }
         }
-
         Spacer(Modifier.height(16.dp))
 
-        if (callLogs.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No recent calls", color = Color.Gray) }
+        if (callLogs.isEmpty() && recordedMessages.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No recent activity", color = Color.Gray) }
         } else {
             LazyColumn(modifier = Modifier.fillMaxSize()) {
-                items(callLogs) { log ->
-                    var showMenu by remember { mutableStateOf(false) }
-                    ListItem(
-                        headlineContent = { Text(if (log.callerName.startsWith("group:")) log.callerName.substringAfter(":") else log.callerName, fontWeight = FontWeight.Bold) },
-                        supportingContent = { Text(sdf.format(Date(log.timestamp))) },
-                        leadingContent = { Icon(if (log.isIncoming) Icons.Default.CallReceived else Icons.Default.CallMade, null, tint = if (log.isIncoming) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary) },
-                        trailingContent = {
-                            Box {
-                                IconButton(onClick = { showMenu = true }) { Icon(Icons.Default.MoreVert, "Options") }
-                                DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
-                                    DropdownMenuItem(text = { Text("Connect") }, onClick = { viewModel.setTarget(log.callerName); showMenu = false }, leadingIcon = { Icon(Icons.Default.Chat, null) })
-                                    if (!log.callerName.startsWith("group:")) {
-                                        DropdownMenuItem(text = { Text("Block User") }, onClick = { viewModel.blockContact(log.callerName); showMenu = false }, leadingIcon = { Icon(Icons.Default.Block, null, tint = Color.Red) })
-                                    }
+                // --- MISSED MESSAGES SECTION ---
+                if (recordedMessages.isNotEmpty()) {
+                    item { Text("Voice Messages (Tap to Play & Delete)", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 8.dp)) }
+                    items(recordedMessages) { file ->
+                        val parts = file.name.removeSuffix(".wav").split("_")
+                        val time = parts.getOrNull(0)?.toLongOrNull() ?: 0L
+                        val sender = parts.getOrElse(1) { "Unknown" }
+                        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer), modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                            Row(modifier = Modifier.padding(12.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("From: $sender", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onErrorContainer)
+                                    Text(sdf.format(Date(time)), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer)
+                                }
+                                Button(onClick = { viewModel.playAndBurnMessage(file) }, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.onErrorContainer)) {
+                                    Icon(Icons.Default.PlayArrow, "Play", tint = MaterialTheme.colorScheme.errorContainer); Spacer(Modifier.width(8.dp)); Text("Play", color = MaterialTheme.colorScheme.errorContainer)
                                 }
                             }
                         }
-                    )
-                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp), thickness = 0.5.dp, color = Color.LightGray)
+                    }
+                    item { HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp), thickness = 2.dp) }
+                }
+
+                if (callLogs.isNotEmpty()) {
+                    item { Text("Call History", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 8.dp)) }
+                    items(callLogs) { log ->
+                        var showMenu by remember { mutableStateOf(false) }
+                        ListItem(
+                            headlineContent = { Text(if (log.callerName.startsWith("group:")) log.callerName.substringAfter(":") else log.callerName, fontWeight = FontWeight.Bold) },
+                            supportingContent = { Text(sdf.format(Date(log.timestamp))) },
+                            leadingContent = { Icon(if (log.isIncoming) Icons.Default.CallReceived else Icons.Default.CallMade, null, tint = if (log.isIncoming) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary) },
+                            trailingContent = {
+                                Box {
+                                    IconButton(onClick = { showMenu = true }) { Icon(Icons.Default.MoreVert, "Options") }
+                                    DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                                        DropdownMenuItem(text = { Text("Connect") }, onClick = { viewModel.setTarget(log.callerName); showMenu = false }, leadingIcon = { Icon(Icons.Default.Chat, null) })
+                                        if (!log.callerName.startsWith("group:")) { DropdownMenuItem(text = { Text("Block User") }, onClick = { viewModel.blockContact(log.callerName); showMenu = false }, leadingIcon = { Icon(Icons.Default.Block, null, tint = Color.Red) }) }
+                                    }
+                                }
+                            }
+                        )
+                        HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp), thickness = 0.5.dp, color = Color.LightGray)
+                    }
                 }
             }
         }
@@ -235,11 +249,7 @@ fun HistoryTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ConnectTab(
-    modifier: Modifier = Modifier, 
-    viewModel: WalkieViewModel, 
-    onConnected: () -> Unit
-) {
+fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConnected: () -> Unit) {
     val context = LocalContext.current
     var codeInput by remember { mutableStateOf("") }
     var inputName by remember { mutableStateOf("") }
@@ -251,20 +261,10 @@ fun ConnectTab(
             if (result.contents.startsWith("CHANNEL:")) {
                 val data = result.contents.removePrefix("CHANNEL:")
                 val parts = data.split("|")
-                if (parts.size > 1) {
-                    viewModel.saveInternetContact("group:${parts[0]}", parts[1], {
-                        Toast.makeText(context, "Channel Joined!", Toast.LENGTH_SHORT).show()
-                        onConnected()
-                    }, {})
-                }
+                if (parts.size > 1) { viewModel.saveInternetContact("group:${parts[0]}", parts[1], { Toast.makeText(context, "Channel Joined!", Toast.LENGTH_SHORT).show(); onConnected() }, {}) }
             } else {
                 val parts = result.contents.split("|")
-                if (parts.size > 1) {
-                    viewModel.setTarget(parts[0])
-                    codeInput = parts[1]
-                    isGroupMode = false
-                    viewModel.saveInternetContact(parts[0], parts[1], { onConnected() }, {})
-                }
+                if (parts.size > 1) { viewModel.setTarget(parts[0]); codeInput = parts[1]; isGroupMode = false; viewModel.saveInternetContact(parts[0], parts[1], { onConnected() }, {}) }
             }
         }
     }
@@ -275,18 +275,13 @@ fun ConnectTab(
     Column(modifier = modifier.fillMaxSize().padding(24.dp)) {
         Text("Add Contact", style = MaterialTheme.typography.headlineMedium)
         Spacer(Modifier.height(16.dp))
-
         SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
             SegmentedButton(selected = !isGroupMode, onClick = { isGroupMode = false }, shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2), icon = { Icon(Icons.Default.Person, null) }) { Text("Person") }
             SegmentedButton(selected = isGroupMode, onClick = { isGroupMode = true }, shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2), icon = { Icon(Icons.Default.Groups, null) }) { Text("Channel") }
         }
-
         Spacer(Modifier.height(16.dp))
-
         Card(onClick = { scanLauncher.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE)) }, modifier = Modifier.fillMaxWidth().height(64.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Row { Icon(Icons.Default.QrCodeScanner, null); Spacer(Modifier.width(8.dp)); Text("Scan QR Code") } } }
-
         Spacer(Modifier.height(16.dp))
-
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(value = inputName, onValueChange = { inputName = it }, label = { Text(if (isGroupMode) "Channel Name" else "Username") }, modifier = Modifier.weight(0.6f), singleLine = true)
             Spacer(Modifier.width(8.dp))
@@ -294,12 +289,7 @@ fun ConnectTab(
             Spacer(Modifier.width(8.dp))
             Button(onClick = { val finalName = if (isGroupMode) "group:$inputName" else inputName; viewModel.saveInternetContact(finalName, codeInput, { Toast.makeText(context, "Saved!", Toast.LENGTH_SHORT).show(); inputName = ""; codeInput = "" }, { Toast.makeText(context, "Failed", Toast.LENGTH_SHORT).show() }) }, contentPadding = PaddingValues(0.dp), modifier = Modifier.size(56.dp), shape = RoundedCornerShape(12.dp)) { Icon(Icons.Default.Save, null) }
         }
-
-        Spacer(Modifier.height(8.dp))
-        if (isGroupMode) Text("Set a Passkey to make this channel private.", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
-
         Spacer(Modifier.height(24.dp))
-
         if (viewModel.nearbyUsers.isNotEmpty()) {
             Text("Nearby Devices", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
             LazyColumn(modifier = Modifier.height(120.dp)) {
@@ -313,7 +303,6 @@ fun ConnectTab(
                 }
             }
         }
-
         Spacer(Modifier.height(16.dp))
         Text("My Contacts", style = MaterialTheme.typography.titleSmall)
         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(vertical = 8.dp)) {
@@ -321,128 +310,50 @@ fun ConnectTab(
                 val isGroup = contact.name.startsWith("group:")
                 val displayName = if (isGroup) contact.name.substringAfter(":") else contact.name
                 var showMenu by remember { mutableStateOf(false) }
-
                 Box {
                     InputChip(selected = viewModel.targetUser == contact.name, onClick = { viewModel.setTarget(contact.name); onConnected() }, label = { Text(displayName) }, avatar = { Icon(if (isGroup) Icons.Default.Groups else Icons.Default.Person, null) }, trailingIcon = { IconButton(onClick = { showMenu = true }, modifier = Modifier.size(18.dp)) { Icon(Icons.Default.ArrowDropDown, null) } })
                     DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
                         DropdownMenuItem(text = { Text("Delete") }, onClick = { viewModel.deleteContact(contact.name); showMenu = false }, leadingIcon = { Icon(Icons.Default.Delete, null) })
-                        if (isGroup) {
-                            DropdownMenuItem(text = { Text("Share Channel QR") }, onClick = { viewModel.generateChannelQr(contact.name, contact.savedCode); showChannelQrDialog = true; showMenu = false }, leadingIcon = { Icon(Icons.Default.QrCode, null) })
-                        } else {
-                            DropdownMenuItem(text = { Text("Block") }, onClick = { viewModel.blockContact(contact.name); showMenu = false; Toast.makeText(context, "Blocked", Toast.LENGTH_SHORT).show() }, leadingIcon = { Icon(Icons.Default.Block, null, tint = Color.Red) })
-                        }
+                        if (isGroup) { DropdownMenuItem(text = { Text("Share Channel QR") }, onClick = { viewModel.generateChannelQr(contact.name, contact.savedCode); showChannelQrDialog = true; showMenu = false }, leadingIcon = { Icon(Icons.Default.QrCode, null) }) }
+                        else { DropdownMenuItem(text = { Text("Block") }, onClick = { viewModel.blockContact(contact.name); showMenu = false; Toast.makeText(context, "Blocked", Toast.LENGTH_SHORT).show() }, leadingIcon = { Icon(Icons.Default.Block, null, tint = Color.Red) }) }
                     }
                 }
             }
         }
     }
-
     if (showChannelQrDialog) {
-        AlertDialog(
-            onDismissRequest = { showChannelQrDialog = false },
-            title = { Text("Channel Frequency") },
-            text = { Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) { Text(viewModel.sharingChannelName, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Spacer(Modifier.height(16.dp)); viewModel.channelQrBitmap?.let { Image(bitmap = it.asImageBitmap(), contentDescription = "Channel QR", modifier = Modifier.size(200.dp)) }; Spacer(Modifier.height(8.dp)); Text("Others can scan this to tune in instantly.", style = MaterialTheme.typography.bodySmall, color = Color.Gray) } },
-            confirmButton = { TextButton(onClick = { showChannelQrDialog = false }) { Text("Close") } }
-        )
+        AlertDialog(onDismissRequest = { showChannelQrDialog = false }, title = { Text("Channel Frequency") }, text = { Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) { Text(viewModel.sharingChannelName, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Spacer(Modifier.height(16.dp)); viewModel.channelQrBitmap?.let { Image(bitmap = it.asImageBitmap(), contentDescription = "Channel QR", modifier = Modifier.size(200.dp)) } } }, confirmButton = { TextButton(onClick = { showChannelQrDialog = false }) { Text("Close") } })
     }
 }
 
 @Composable
-fun ProfileTab(
-    modifier: Modifier = Modifier,
-    navController: NavController,
-    myName: String,
-    viewModel: WalkieViewModel,
-    onLogout: () -> Unit,
-    onExit: () -> Unit
-) {
+fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myName: String, viewModel: WalkieViewModel, onLogout: () -> Unit, onExit: () -> Unit) {
     val context = LocalContext.current
     var showBlockedDialog by remember { mutableStateOf(false) }
     val myCode by viewModel.myPairingCode.collectAsState()
+    LaunchedEffect(myCode) { if (myCode.isNotBlank()) viewModel.qrBitmap = viewModel.generateQr("$myName|$myCode") }
 
-    LaunchedEffect(myCode) {
-        if (myCode.isNotBlank()) {
-            viewModel.qrBitmap = viewModel.generateQr("$myName|$myCode")
-        }
-    }
-
-    Column(
-        modifier = modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState()),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Top
-    ) {
+    Column(modifier = modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Top) {
         Card(elevation = CardDefaults.cardElevation(8.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
             Column(Modifier.padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("MY FREQUENCY ID", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
-                Text(myName, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(16.dp))
-                Text("PAIRING PIN", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
-                Text(myCode, style = MaterialTheme.typography.displayMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary, letterSpacing = 4.sp)
-                TextButton(onClick = { viewModel.resetPairingCode(myName) }) {
-                    Icon(Icons.Default.Refresh, null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("Reset PIN")
-                }
-                Spacer(Modifier.height(16.dp))
-                viewModel.qrBitmap?.let { Image(bitmap = it.asImageBitmap(), contentDescription = "QR", modifier = Modifier.size(180.dp)) }
+                Text("MY FREQUENCY ID", style = MaterialTheme.typography.labelSmall, color = Color.Gray); Text(myName, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold); Spacer(Modifier.height(16.dp))
+                Text("PAIRING PIN", style = MaterialTheme.typography.labelSmall, color = Color.Gray); Text(myCode, style = MaterialTheme.typography.displayMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary, letterSpacing = 4.sp)
+                TextButton(onClick = { viewModel.resetPairingCode(myName) }) { Icon(Icons.Default.Refresh, null, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(4.dp)); Text("Reset PIN") }
+                Spacer(Modifier.height(16.dp)); viewModel.qrBitmap?.let { Image(bitmap = it.asImageBitmap(), contentDescription = "QR", modifier = Modifier.size(180.dp)) }
             }
         }
-
         Spacer(Modifier.height(16.dp))
-
-        OutlinedButton(onClick = { showBlockedDialog = true }, modifier = Modifier.fillMaxWidth()) {
-            Icon(Icons.Default.PrivacyTip, null)
-            Spacer(Modifier.width(8.dp))
-            Text("Privacy: Blocked Users")
-        }
-
+        OutlinedButton(onClick = { showBlockedDialog = true }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.PrivacyTip, null); Spacer(Modifier.width(8.dp)); Text("Privacy: Blocked Users") }
         Spacer(Modifier.height(16.dp))
-
-        OutlinedButton(onClick = { navController.navigate("diagnostics") }, modifier = Modifier.fillMaxWidth()) {
-            Icon(Icons.Default.Build, null)
-            Spacer(Modifier.width(8.dp))
-            Text("Run System Diagnostics")
-        }
-
+        OutlinedButton(onClick = { navController.navigate("diagnostics") }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Build, null); Spacer(Modifier.width(8.dp)); Text("Run System Diagnostics") }
         Spacer(Modifier.height(32.dp))
-
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            OutlinedButton(onClick = onLogout, modifier = Modifier.weight(1f)) {
-                Icon(Icons.AutoMirrored.Filled.ExitToApp, null)
-                Spacer(Modifier.width(8.dp))
-                Text("Logout")
-            }
-            Button(onClick = onExit, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) {
-                Icon(Icons.Default.PowerSettingsNew, null)
-                Spacer(Modifier.width(8.dp))
-                Text("Exit App")
-            }
+            OutlinedButton(onClick = onLogout, modifier = Modifier.weight(1f)) { Icon(Icons.AutoMirrored.Filled.ExitToApp, null); Spacer(Modifier.width(8.dp)); Text("Logout") }
+            Button(onClick = onExit, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Icon(Icons.Default.PowerSettingsNew, null); Spacer(Modifier.width(8.dp)); Text("Exit App") }
         }
-
         Spacer(Modifier.height(50.dp))
     }
-
     if (showBlockedDialog) {
-        AlertDialog(
-            onDismissRequest = { showBlockedDialog = false },
-            title = { Text("Blocked Users") },
-            text = {
-                if (viewModel.blockedContacts.isEmpty()) {
-                    Text("No blocked users.")
-                } else {
-                    LazyColumn {
-                        items(viewModel.blockedContacts) { contact ->
-                            Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                                Text(contact.name)
-                                TextButton(onClick = { viewModel.unblockContact(contact.name) }) {
-                                    Text("Unblock")
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            confirmButton = { TextButton(onClick = { showBlockedDialog = false }) { Text("Close") } }
-        )
+        AlertDialog(onDismissRequest = { showBlockedDialog = false }, title = { Text("Blocked Users") }, text = { if (viewModel.blockedContacts.isEmpty()) Text("No blocked users.") else LazyColumn { items(viewModel.blockedContacts) { contact -> Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text(contact.name); TextButton(onClick = { viewModel.unblockContact(contact.name) }) { Text("Unblock") } } } } }, confirmButton = { TextButton(onClick = { showBlockedDialog = false }) { Text("Close") } })
     }
 }

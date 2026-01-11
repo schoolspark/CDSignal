@@ -31,7 +31,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -57,6 +56,7 @@ fun DiagnosticsScreen(navController: NavController) {
     var batteryStatus by remember { mutableStateOf(checkBattery(context)) }
     var netStatus by remember { mutableStateOf("Checking...") }
     var serverStatus by remember { mutableStateOf("Checking...") }
+    var storageStatus by remember { mutableStateOf(checkStorage(context)) }
 
     // Audio Output State
     var audioRouteInfo by remember { mutableStateOf(getAudioRoute(context)) }
@@ -85,6 +85,7 @@ fun DiagnosticsScreen(navController: NavController) {
                     IconButton(onClick = {
                         permStatus = checkPermissions(context)
                         batteryStatus = checkBattery(context)
+                        storageStatus = checkStorage(context)
                         audioRouteInfo = getAudioRoute(context)
                         scope.launch {
                             netStatus = "Checking..."
@@ -105,7 +106,8 @@ fun DiagnosticsScreen(navController: NavController) {
             DiagnosticRow("Permissions", permStatus)
             DiagnosticRow("Battery Opt", batteryStatus)
             DiagnosticRow("Network", netStatus)
-            DiagnosticRow("Server", serverStatus)
+            DiagnosticRow("Server API", serverStatus)
+            DiagnosticRow("Storage", storageStatus)
 
             HorizontalDivider(Modifier.padding(vertical = 24.dp))
 
@@ -236,7 +238,7 @@ fun toggleSpeakerTest(context: Context, on: Boolean) {
     }
 }
 
-// --- EXISTING DIAGNOSTIC HELPERS ---
+// --- DIAGNOSTIC HELPERS ---
 @Composable
 fun DiagnosticRow(label: String, status: String) {
     val isPass = status.startsWith("OK") || status.startsWith("Yes") || status.startsWith("Connected")
@@ -257,15 +259,43 @@ fun DiagnosticRow(label: String, status: String) {
     }
 }
 
+// Updated for v4.0: Checks Mic, Notifications (A13+), and Nearby Devices (A13+)
 fun checkPermissions(context: Context): String {
     val mic = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-    return if (mic) "OK (Granted)" else "Fail (Mic Denied)"
+
+    val notif = if (Build.VERSION.SDK_INT >= 33) {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+    } else true
+
+    val nearby = if (Build.VERSION.SDK_INT >= 33) {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
+    } else true
+
+    return when {
+        !mic -> "Fail (Mic Denied)"
+        !notif -> "Fail (Notif Denied)"
+        !nearby -> "Fail (Nearby Denied)"
+        else -> "OK (All Granted)"
+    }
 }
 
 fun checkBattery(context: Context): String {
     val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
     val isIgnored = pm.isIgnoringBatteryOptimizations(context.packageName)
     return if (isIgnored) "OK (Unrestricted)" else "Warning (Restricted)"
+}
+
+// New: Verifies we can write to cache (Critical for Voice Pager)
+fun checkStorage(context: Context): String {
+    return try {
+        val file = File(context.cacheDir, "test_write.tmp")
+        file.writeText("test")
+        val success = file.exists()
+        file.delete()
+        if (success) "OK (Writable)" else "Fail (Read-Only)"
+    } catch (e: Exception) {
+        "Fail (Error)"
+    }
 }
 
 fun checkNetwork(context: Context): String {

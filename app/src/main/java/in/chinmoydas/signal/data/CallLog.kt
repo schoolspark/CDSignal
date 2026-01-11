@@ -15,7 +15,7 @@ data class ContactEntity(
     @PrimaryKey val name: String,
     val ip: String,
     val savedCode: String = "",
-    val isBlocked: Boolean = false // New field for blocking
+    val isBlocked: Boolean = false
 )
 
 @Dao
@@ -49,9 +49,13 @@ interface ContactDao {
 
     @Query("UPDATE contacts SET isBlocked = :blocked WHERE name = :name")
     suspend fun setBlockedStatus(name: String, blocked: Boolean)
+
+    // --- NEW: Background IP Updater ---
+    @Query("UPDATE contacts SET ip = :newIp WHERE name = :name")
+    suspend fun updateIp(name: String, newIp: String)
 }
 
-@Database(entities = [CallLog::class, ContactEntity::class], version = 3) // Version bumped
+@Database(entities = [CallLog::class, ContactEntity::class], version = 3)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun callLogDao(): CallLogDao
     abstract fun contactDao(): ContactDao

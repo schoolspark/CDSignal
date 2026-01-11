@@ -13,7 +13,6 @@ class MainRepository(context: Context) {
     private val callLogDao = db.callLogDao()
     private val prefs: SharedPreferences = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
 
-    // --- Reactive Preferences ---
     private val _targetUser = MutableStateFlow(prefs.getString("current_target", "") ?: "")
     val targetUser: StateFlow<String> = _targetUser.asStateFlow()
     private val _channelKey = MutableStateFlow(prefs.getString("channel_key", "") ?: "")
@@ -24,7 +23,6 @@ class MainRepository(context: Context) {
     private val _myPairingCode = MutableStateFlow(prefs.getString("my_pairing_code", "----") ?: "----")
     val myPairingCode: StateFlow<String> = _myPairingCode.asStateFlow()
 
-    // CHANGED: Generic "Config Changed" trigger for Keys AND Blocks
     private val _configTrigger = MutableStateFlow(0)
     val configTrigger: StateFlow<Int> = _configTrigger.asStateFlow()
 
@@ -42,13 +40,20 @@ class MainRepository(context: Context) {
         prefs.registerOnSharedPreferenceChangeListener(prefsListener)
     }
 
-    // --- Contacts ---
     suspend fun getAllContacts() = contactDao.getAllContacts()
     suspend fun getBlockedContacts() = contactDao.getBlockedContacts()
 
     suspend fun saveContact(name: String, ip: String, code: String) {
         contactDao.insert(ContactEntity(name, ip, code, isBlocked = false))
-        triggerConfigRefresh() // FIX: Notify Service to reload keys immediately
+        triggerConfigRefresh()
+    }
+
+    // --- NEW: Efficient Background Update ---
+    // Called by VoiceService to silently update IP without redrawing UI
+    suspend fun updateContactIp(name: String, ip: String) {
+        contactDao.updateIp(name, ip)
+        // Note: We do NOT trigger config refresh here.
+        // This prevents the UI from flickering while you are talking.
     }
 
     suspend fun deleteContact(name: String) {
@@ -61,20 +66,17 @@ class MainRepository(context: Context) {
         triggerConfigRefresh()
     }
 
-    // Helper to update the shared preference that triggers the flow
     private fun triggerConfigRefresh() {
         val current = prefs.getInt("config_refresh_trigger", 0)
         prefs.edit().putInt("config_refresh_trigger", current + 1).apply()
     }
 
-    // --- Call Logs ---
     suspend fun getAllLogs() = callLogDao.getAllLogs()
     suspend fun insertLog(name: String, isIncoming: Boolean) {
         callLogDao.insert(CallLog(callerName = name, isIncoming = isIncoming))
     }
     suspend fun clearLogs() = callLogDao.clearAll()
 
-    // --- Preferences ---
     fun getTargetUser(): String = targetUser.value
     fun setTargetUser(name: String) {
         prefs.edit().putString("current_target", name).apply()
@@ -90,7 +92,6 @@ class MainRepository(context: Context) {
 
     fun getToken(): String? = prefs.getString("jwt_token", null)
 
-    // --- Network / API ---
     suspend fun findPeer(token: String, name: String, code: String) =
         RetrofitClient.api.findPeer("Bearer $token", name, code)
 

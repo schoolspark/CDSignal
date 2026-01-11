@@ -5,12 +5,14 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -54,7 +56,25 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 2: EVENT / OFFLINE MODE ---
+            // --- SECTION 2: VOICE PAGER (NEW) ---
+            HelpCard(
+                title = "📟 VOICE PAGER (SILENT MODE)",
+                icon = Icons.Default.NotificationsOff,
+                color = MaterialTheme.colorScheme.tertiaryContainer
+            ) {
+                Text("Never miss a message even when you're busy.", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                Step(1, "Tap the 'Silent Mode' (Bell) icon on the Radio screen.")
+                Step(2, "When someone talks, the app stays silent but RECORDS the message.")
+                Step(3, "Go to the 'History' tab to see missed messages in RED.")
+                Step(4, "Tap 'Play'. The message self-destructs after listening to protect privacy.")
+                Spacer(Modifier.height(8.dp))
+                Text("Tip: You can now Mute/Unmute or Exit directly from your phone's notification panel!", style = MaterialTheme.typography.bodySmall, fontStyle = FontStyle.Italic)
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // --- SECTION 3: EVENT / OFFLINE MODE ---
             HelpCard(
                 title = "📢 EVENT / OFFLINE MODE",
                 icon = Icons.Default.Wifi,
@@ -78,7 +98,7 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 3: INDIVIDUAL & FAST-LINK ---
+            // --- SECTION 4: INDIVIDUAL & FAST-LINK ---
             HelpCard(
                 title = "👤 INDIVIDUAL CALLS",
                 icon = Icons.Default.Person,
@@ -93,13 +113,13 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 4: TROUBLESHOOTING ---
+            // --- SECTION 5: TROUBLESHOOTING ---
             Text("Troubleshooting", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
             Text("• Screeching? The app has built-in feedback suppression, but try to keep phones 2-3 meters apart.")
             Text("• No devices found? Ensure 'AP Isolation' is OFF in your Router settings.")
             Text("• Sound clear on one side only? Check the noisy device's mic for dust or cases blocking the secondary mic.")
-            
+
             Spacer(Modifier.height(32.dp))
         }
     }
