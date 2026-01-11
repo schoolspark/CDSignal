@@ -32,12 +32,14 @@ import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
+// --- UPDATED STATE: Added lastPingResponse ---
 data class VoiceServiceState(
     val incomingCall: String? = null,
     val incomingIp: String? = null,
     val networkStatus: String = "Listening...",
     val isSilenced: Boolean = false,
-    val isSpeakerOn: Boolean = true
+    val isSpeakerOn: Boolean = true,
+    val lastPingResponse: Long = 0L // New field to track handshake
 )
 
 class VoiceService : Service() {
@@ -53,6 +55,12 @@ class VoiceService : Service() {
     private lateinit var repository: MainRepository
 
     private val END_STREAM_SIGNAL = "__END_TX__"
+
+    // --- NEW SIGNALS ---
+    private val PING_SIGNAL = "__PING__"
+    private val PONG_SIGNAL = "__PONG__"
+    // -------------------
+
     private val UDP_PORT = 50005
     private val IGNORE_SENDER_DELAY = 5000L
 
@@ -86,12 +94,7 @@ class VoiceService : Service() {
     }
 
     private val sequenceMap = ConcurrentHashMap<String, Int>()
-
-    // --- NEW: IP CACHE FOR BACKGROUND UPDATES ---
-    // Tracks the last known IP for each user to minimize DB writes
     private val activeIpCache = ConcurrentHashMap<String, String>()
-    // --------------------------------------------
-
     private val blockedCache = ConcurrentHashMap.newKeySet<String>()
     @Volatile private var ignoredSender: String? = null
     @Volatile private var activeTargets: List<String> = emptyList()
@@ -224,11 +227,52 @@ class VoiceService : Service() {
         super.onTaskRemoved(rootIntent)
     }
 
+    // --- NEW: SEND PING (BURST) ---
+    fun sendPing(ip: String) {
+        scope.launch {
+            val signalBytes = PING_SIGNAL.toByteArray()
+            val buf = ByteArray(1 + signalBytes.size + 4)
+            buf[0] = signalBytes.size.toByte()
+            System.arraycopy(signalBytes, 0, buf, 1, signalBytes.size)
+            // Burst 3 times to ensure delivery over UDP
+            repeat(3) {
+                networkEngine.send(buf, listOf(ip), UDP_PORT)
+                delay(15)
+            }
+        }
+    }
+
+    // --- NEW: SEND PONG (REPLY) ---
+    private fun sendPong(ip: String) {
+        scope.launch {
+            val signalBytes = PONG_SIGNAL.toByteArray()
+            val buf = ByteArray(1 + signalBytes.size + 4)
+            buf[0] = signalBytes.size.toByte()
+            System.arraycopy(signalBytes, 0, buf, 1, signalBytes.size)
+            networkEngine.send(buf, listOf(ip), UDP_PORT)
+        }
+    }
+
     private fun handleIncomingPacket(data: ByteArray, length: Int, senderIp: String) {
         if (isSending || senderIp == myLocalIp || length <= 5) return
         val nameLen = data[0].toInt() and 0xFF
         if (nameLen + 5 > length) return
         val senderName = String(data, 1, nameLen)
+
+        // --- INTERCEPT HANDSHAKE SIGNALS ---
+        if (senderName == PING_SIGNAL) {
+            // Received PING -> Reply PONG
+            sendPong(senderIp)
+            return
+        }
+        if (senderName == PONG_SIGNAL) {
+            // Received PONG -> Update State (Success!)
+            _voiceServiceState.value = _voiceServiceState.value.copy(
+                lastPingResponse = System.currentTimeMillis()
+            )
+            return
+        }
+        // -----------------------------------
 
         if (senderName == END_STREAM_SIGNAL) {
             if (isReceiving) {
@@ -261,16 +305,13 @@ class VoiceService : Service() {
         val lastSeq = sequenceMap.getOrPut(senderName) { -1 }
 
         if (seqNum > lastSeq || seqNum < lastSeq - 1000 || seqNum == 0) {
-            // --- FIX: BACKGROUND IP UPDATER ---
-            // If the IP changed, update the DB immediately so we can reply
-            // even if the UI is dead or asleep.
+            // Auto-Learn Logic
             if (!senderName.startsWith("group:") && activeIpCache[senderName] != senderIp) {
                 activeIpCache[senderName] = senderIp
                 scope.launch {
                     repository.updateContactIp(senderName, senderIp)
                 }
             }
-            // ----------------------------------
 
             if (seqNum == 0 || seqNum < lastSeq - 1000) {
                 scope.launch { repository.insertLog(senderName, true) }

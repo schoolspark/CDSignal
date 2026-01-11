@@ -40,7 +40,8 @@ import androidx.navigation.NavController
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import `in`.chinmoydas.signal.VoiceService
-import `in`.chinmoydas.signal.VoiceServiceState // Essential Import
+import `in`.chinmoydas.signal.VoiceServiceState
+import `in`.chinmoydas.signal.viewmodel.ConnectionStatus
 import `in`.chinmoydas.signal.viewmodel.UiState
 import `in`.chinmoydas.signal.viewmodel.WalkieViewModel
 import java.text.SimpleDateFormat
@@ -57,7 +58,6 @@ fun TalkTab(
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsState()
 
-    // --- UI OBSERVER: Truth comes from Service ---
     val serviceState by service?.voiceServiceState?.collectAsState(initial = VoiceServiceState())
         ?: remember { mutableStateOf(VoiceServiceState()) }
 
@@ -65,7 +65,6 @@ fun TalkTab(
         if (it.getOrDefault(Manifest.permission.RECORD_AUDIO, false)) onPermissionsGranted()
     }
 
-    // --- BRIDGE: Connect Background Service to Foreground Screen ---
     LaunchedEffect(service) {
         service?.voiceServiceState?.collect { state ->
             if (state.incomingCall != null) {
@@ -73,6 +72,16 @@ fun TalkTab(
             } else {
                 viewModel.onReceptionEnded()
             }
+        }
+    }
+
+    LaunchedEffect(service) {
+        viewModel.observeServicePing(service)
+    }
+
+    LaunchedEffect(viewModel.targetUser) {
+        if (viewModel.targetUser.isNotEmpty()) {
+            viewModel.triggerPing(service)
         }
     }
 
@@ -106,11 +115,10 @@ fun TalkTab(
         }
 
         Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { service?.triggerHeartbeat(); Toast.makeText(context, "Connection Synced", Toast.LENGTH_SHORT).show() }) {
+            IconButton(onClick = { service?.triggerHeartbeat(); viewModel.triggerPing(service); Toast.makeText(context, "Synced", Toast.LENGTH_SHORT).show() }) {
                 Icon(Icons.Default.Sync, "Sync", tint = MaterialTheme.colorScheme.primary)
             }
             Row {
-                // UI buttons now reflect `serviceState` directly
                 IconButton(onClick = { viewModel.toggleSilence(service) }) {
                     Icon(if (serviceState.isSilenced) Icons.Default.NotificationsOff else Icons.Default.NotificationsActive, "Silent Mode", tint = if (serviceState.isSilenced) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
                 }
@@ -124,7 +132,21 @@ fun TalkTab(
         }
 
         Spacer(Modifier.height(10.dp))
-        Text(statusText, fontSize = 24.sp, fontWeight = FontWeight.Bold, color = statusColor, maxLines = 2, overflow = TextOverflow.Ellipsis)
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (viewModel.targetUser.isNotEmpty() && !viewModel.isBroadcastMode) {
+                val (dotColor, dotState) = when (viewModel.connectionStatus) {
+                    ConnectionStatus.READY -> Color.Green to "Ready"
+                    ConnectionStatus.CHECKING -> Color.Yellow to "Checking..."
+                    ConnectionStatus.OFFLINE -> Color.Red to "Offline"
+                    else -> Color.Gray to "Idle"
+                }
+                Box(Modifier.size(12.dp).background(dotColor, CircleShape))
+                Spacer(Modifier.width(8.dp))
+            }
+            Text(statusText, fontSize = 24.sp, fontWeight = FontWeight.Bold, color = statusColor, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        }
+
         Spacer(Modifier.height(40.dp))
 
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
@@ -199,27 +221,48 @@ fun HistoryTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No recent activity", color = Color.Gray) }
         } else {
             LazyColumn(modifier = Modifier.fillMaxSize()) {
-                // --- MISSED MESSAGES SECTION ---
+
+                // --- UPDATED VOICE MESSAGES SECTION ---
                 if (recordedMessages.isNotEmpty()) {
-                    item { Text("Voice Messages (Tap to Play & Delete)", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 8.dp)) }
+                    item {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Text("Voice Messages", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                            // Delete All Button
+                            TextButton(onClick = { viewModel.deleteAllRecordings(context) }) {
+                                Text("Delete All", color = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                    }
                     items(recordedMessages) { file ->
                         val parts = file.name.removeSuffix(".wav").split("_")
                         val time = parts.getOrNull(0)?.toLongOrNull() ?: 0L
                         val sender = parts.getOrElse(1) { "Unknown" }
+
                         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer), modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                             Row(modifier = Modifier.padding(12.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text("From: $sender", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onErrorContainer)
                                     Text(sdf.format(Date(time)), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer)
                                 }
-                                Button(onClick = { viewModel.playAndBurnMessage(file) }, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.onErrorContainer)) {
-                                    Icon(Icons.Default.PlayArrow, "Play", tint = MaterialTheme.colorScheme.errorContainer); Spacer(Modifier.width(8.dp)); Text("Play", color = MaterialTheme.colorScheme.errorContainer)
+
+                                // Play and Delete Buttons
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    IconButton(onClick = { viewModel.deleteRecording(file) }) {
+                                        Icon(Icons.Default.Delete, "Delete", tint = MaterialTheme.colorScheme.onErrorContainer)
+                                    }
+                                    Spacer(Modifier.width(4.dp))
+                                    Button(onClick = { viewModel.playAndBurnMessage(file) }, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.onErrorContainer)) {
+                                        Icon(Icons.Default.PlayArrow, "Play", tint = MaterialTheme.colorScheme.errorContainer)
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("Play", color = MaterialTheme.colorScheme.errorContainer)
+                                    }
                                 }
                             }
                         }
                     }
                     item { HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp), thickness = 2.dp) }
                 }
+                // --------------------------------------
 
                 if (callLogs.isNotEmpty()) {
                     item { Text("Call History", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 8.dp)) }

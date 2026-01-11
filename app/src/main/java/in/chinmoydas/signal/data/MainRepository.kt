@@ -43,10 +43,13 @@ class MainRepository(context: Context) {
     suspend fun getAllContacts() = contactDao.getAllContacts()
     suspend fun getBlockedContacts() = contactDao.getBlockedContacts()
 
+    // --- FIX: Preserve "Blocked" status when updating a contact ---
     suspend fun saveContact(name: String, ip: String, code: String) {
-        contactDao.insert(ContactEntity(name, ip, code, isBlocked = false))
+        val isBlocked = contactDao.isBlocked(name) // Check if already blocked
+        contactDao.insert(ContactEntity(name, ip, code, isBlocked = isBlocked))
         triggerConfigRefresh()
     }
+    // -------------------------------------------------------------
 
     // --- NEW: Efficient Background Update ---
     // Called by VoiceService to silently update IP without redrawing UI

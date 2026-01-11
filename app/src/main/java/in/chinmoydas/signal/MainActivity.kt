@@ -23,7 +23,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.core.content.ContextCompat // <--- IMPORT THIS
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.navigation.compose.NavHost
@@ -44,14 +44,20 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
-    private var voiceService by mutableStateOf<VoiceService?>(null)
+    // Removed nullable state, we will control binding flow explicitly
+    private var voiceService: VoiceService? = null
     private var isBound = false
+
+    // We will initialize this inside onCreate, but use it safely in Compose
     private lateinit var walkieViewModel: WalkieViewModel
+
+    // State to pass to Compose triggers
+    private val serviceBoundState = mutableStateOf<VoiceService?>(null)
 
     private val exitReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action == "in.chinmoydas.signal.ACTION_EXIT") {
-                Log.d("MainActivity", "Received Exit Signal from Notification. Closing App.")
+                Log.d("MainActivity", "Received Exit Signal. Closing App.")
                 finishAffinity()
             }
         }
@@ -62,19 +68,21 @@ class MainActivity : ComponentActivity() {
             val binder = service as VoiceService.LocalBinder
             voiceService = binder.getService()
             isBound = true
-            observeServiceState()
+            // UPDATE: Notify Compose that service is ready
+            serviceBoundState.value = binder.getService()
         }
 
         override fun onServiceDisconnected(arg0: ComponentName) {
             isBound = false
             voiceService = null
+            serviceBoundState.value = null
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // --- FIX: USE ContextCompat (Handles the Red Flag automatically) ---
+        // 1. Register Receiver Securely (Fixes Screenshot Error)
         val filter = IntentFilter("in.chinmoydas.signal.ACTION_EXIT")
         ContextCompat.registerReceiver(
             this,
@@ -82,7 +90,6 @@ class MainActivity : ComponentActivity() {
             filter,
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
-        // ------------------------------------------------------------------
 
         requestBatteryOptimizationExemption()
 
@@ -101,6 +108,10 @@ class MainActivity : ComponentActivity() {
                 CDSignalTheme {
                     var startDest by remember { mutableStateOf<String?>(null) }
 
+                    // Observe Service State HERE (Safe Zone)
+                    // This guarantees walkieViewModel is ready because it's in the same scope
+                    val currentService by serviceBoundState
+
                     LaunchedEffect(Unit) {
                         val prefs = withContext(Dispatchers.IO) {
                             getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
@@ -110,8 +121,22 @@ class MainActivity : ComponentActivity() {
 
                     if (startDest != null) {
                         val navController = rememberNavController()
+
+                        // Initialize ViewModel immediately
                         walkieViewModel = ViewModelProvider(this@MainActivity, factory)[WalkieViewModel::class.java]
                         val currentName by repository.myUsername.collectAsState()
+
+                        // --- CRITICAL FIX: Observe Service ONLY when UI & VM are ready ---
+                        LaunchedEffect(currentService) {
+                            currentService?.voiceServiceState?.collectLatest { state ->
+                                if (state.incomingCall != null && state.incomingIp != null) {
+                                    walkieViewModel.onReceptionStarted(state.incomingCall, state.incomingIp)
+                                } else {
+                                    walkieViewModel.onReceptionEnded()
+                                }
+                            }
+                        }
+                        // ----------------------------------------------------------------
 
                         LaunchedEffect(intent) {
                             handleIntent(intent)
@@ -124,7 +149,7 @@ class MainActivity : ComponentActivity() {
                             composable("home") {
                                 HomeScreen(
                                     navController = navController,
-                                    service = voiceService,
+                                    service = currentService, // Pass the observable state
                                     viewModel = walkieViewModel,
                                     myName = currentName,
                                     onPermissionsGranted = { startAndBindService() },
@@ -149,23 +174,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun observeServiceState() {
-        lifecycleScope.launch {
-            voiceService?.voiceServiceState?.collectLatest { state ->
-                if (::walkieViewModel.isInitialized) {
-                    if (state.incomingCall != null && state.incomingIp != null) {
-                        walkieViewModel.onReceptionStarted(state.incomingCall, state.incomingIp)
-                    } else {
-                        walkieViewModel.onReceptionEnded()
-                    }
-                }
-            }
-        }
-    }
-
     private fun handleIntent(intent: Intent?) {
         val autoChannel = intent?.getStringExtra("auto_connect_channel")
         if (autoChannel != null) {
+            // Safe check, though flow above makes this robust
             if (::walkieViewModel.isInitialized) {
                 walkieViewModel.setTarget(autoChannel)
             }

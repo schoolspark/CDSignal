@@ -17,12 +17,21 @@ import `in`.chinmoydas.signal.VoiceService
 import `in`.chinmoydas.signal.data.CallLog
 import `in`.chinmoydas.signal.data.MainRepository
 import `in`.chinmoydas.signal.utils.LocalLinkManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import android.graphics.Color as AndroidColor
 
 data class Contact(val name: String, var ip: String, val isTrusted: Boolean = false, val savedCode: String = "")
+
+// Connection Health Enum
+enum class ConnectionStatus {
+    IDLE, CHECKING, READY, OFFLINE
+}
 
 class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
@@ -33,7 +42,10 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     var targetUser by mutableStateOf("")
         private set
 
-    // REMOVED LOCAL STATE for isSilenced/isSpeakerEnabled -> Now Service controls this
+    // Connection Status State
+    var connectionStatus by mutableStateOf(ConnectionStatus.IDLE)
+        private set
+    private var pingJob: Job? = null
 
     var qrBitmap by mutableStateOf<Bitmap?>(null)
     var channelQrBitmap by mutableStateOf<Bitmap?>(null)
@@ -59,10 +71,55 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                 if (_uiState.value is UiState.Ready || _uiState.value is UiState.Connected) {
                     _uiState.value = if (newTarget.isEmpty()) UiState.Ready else UiState.Connected(newTarget)
                 }
+                // Reset status when target changes
+                if (newTarget.isNotEmpty()) connectionStatus = ConnectionStatus.CHECKING else connectionStatus = ConnectionStatus.IDLE
             }
         }
         loadData()
     }
+
+    // --- PING/PONG LOGIC ---
+    fun observeServicePing(service: VoiceService?) {
+        viewModelScope.launch {
+            service?.voiceServiceState?.collect { state ->
+                // If we get a fresh PONG (< 2s ago), set status to READY
+                val diff = System.currentTimeMillis() - state.lastPingResponse
+                if (state.lastPingResponse > 0 && diff < 2000) {
+                    connectionStatus = ConnectionStatus.READY
+                }
+            }
+        }
+    }
+
+    fun triggerPing(service: VoiceService?) {
+        if (targetUser.isEmpty() || isBroadcastMode) {
+            connectionStatus = ConnectionStatus.IDLE
+            return
+        }
+
+        connectionStatus = ConnectionStatus.CHECKING
+        val contact = savedContacts.find { it.name == targetUser }
+
+        var targetIp = contact?.ip
+        if (targetIp == null) {
+            targetIp = nearbyUsers.find { it.name == targetUser }?.ip
+        }
+
+        if (targetIp != null && targetIp != "SERVER_LINK") {
+            service?.sendPing(targetIp)
+
+            pingJob?.cancel()
+            pingJob = viewModelScope.launch {
+                delay(2000)
+                if (connectionStatus == ConnectionStatus.CHECKING) {
+                    connectionStatus = ConnectionStatus.OFFLINE
+                }
+            }
+        } else {
+            connectionStatus = ConnectionStatus.OFFLINE
+        }
+    }
+    // -----------------------
 
     fun loadData() {
         viewModelScope.launch {
@@ -74,14 +131,50 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         }
     }
 
+    // --- UPDATED: Load + Auto-Cleanup ---
     fun loadRecordings(context: Context) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             val dir = context.cacheDir
+            val sevenDaysAgo = System.currentTimeMillis() - (7 * 24 * 60 * 60 * 1000)
+
+            // 1. Run Cleanup Task (Delete files older than 7 days)
+            dir.listFiles { _, name -> name.endsWith(".wav") }?.forEach { file ->
+                if (file.lastModified() < sevenDaysAgo) {
+                    try { file.delete() } catch (e: Exception) { Log.e("WalkieViewModel", "Cleanup failed for ${file.name}", e) }
+                }
+            }
+
+            // 2. Load Remaining Files
             val files = dir.listFiles { _, name -> name.endsWith(".wav") }
-            recordedMessages.clear()
-            files?.sortedByDescending { it.lastModified() }?.let { recordedMessages.addAll(it) }
+
+            // 3. Update UI on Main Thread
+            withContext(Dispatchers.Main) {
+                recordedMessages.clear()
+                files?.sortedByDescending { it.lastModified() }?.let { recordedMessages.addAll(it) }
+            }
         }
     }
+
+    // --- NEW: Manual Delete Functions ---
+    fun deleteRecording(file: File) {
+        try {
+            if (file.exists()) file.delete()
+            recordedMessages.remove(file)
+        } catch (e: Exception) { Log.e("WalkieViewModel", "Delete failed", e) }
+    }
+
+    fun deleteAllRecordings(context: Context) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val dir = context.cacheDir
+            dir.listFiles { _, name -> name.endsWith(".wav") }?.forEach {
+                try { it.delete() } catch (e: Exception) {}
+            }
+            withContext(Dispatchers.Main) {
+                recordedMessages.clear()
+            }
+        }
+    }
+    // ------------------------------------
 
     fun playAndBurnMessage(file: File) {
         try {
@@ -283,6 +376,14 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                         if (index != -1) nearbyUsers[index] = existing.copy(ip = ip)
                     }
                 } else { nearbyUsers.add(Contact(from, ip, false)) }
+
+                val saved = savedContacts.find { it.name == from }
+                if (saved != null && saved.ip != ip) {
+                    Log.d("WalkieViewModel", "Auto-updating Contact IP: $from -> $ip")
+                    repository.saveContact(from, ip, saved.savedCode)
+                    val idx = savedContacts.indexOf(saved)
+                    if (idx != -1) savedContacts[idx] = saved.copy(ip = ip)
+                }
             }
         }
     }
@@ -293,7 +394,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         }
     }
 
-    // --- SERVICE TRIGGER FUNCTIONS ---
     fun toggleSilence(service: VoiceService?) {
         service?.let {
             val intent = android.content.Intent(service, VoiceService::class.java)
@@ -310,7 +410,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     fun toggleSpeaker(service: VoiceService?) {
         service?.toggleSpeaker(!(service.voiceServiceState.value.isSpeakerOn))
     }
-    // ---------------------------------
 
     fun generateQr(content: String): Bitmap? {
         try {
