@@ -7,6 +7,9 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AutomaticGainControl
+import android.media.audiofx.NoiseSuppressor
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
@@ -20,7 +23,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.Hearing
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PlayArrow
@@ -42,6 +44,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.net.DatagramSocket
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -57,6 +60,7 @@ fun DiagnosticsScreen(navController: NavController) {
     var netStatus by remember { mutableStateOf("Checking...") }
     var serverStatus by remember { mutableStateOf("Checking...") }
     var storageStatus by remember { mutableStateOf(checkStorage(context)) }
+    var audioFxStatus by remember { mutableStateOf(checkAudioEffects()) } // NEW
 
     // Audio Output State
     var audioRouteInfo by remember { mutableStateOf(getAudioRoute(context)) }
@@ -86,6 +90,7 @@ fun DiagnosticsScreen(navController: NavController) {
                         permStatus = checkPermissions(context)
                         batteryStatus = checkBattery(context)
                         storageStatus = checkStorage(context)
+                        audioFxStatus = checkAudioEffects()
                         audioRouteInfo = getAudioRoute(context)
                         scope.launch {
                             netStatus = "Checking..."
@@ -108,6 +113,7 @@ fun DiagnosticsScreen(navController: NavController) {
             DiagnosticRow("Network", netStatus)
             DiagnosticRow("Server API", serverStatus)
             DiagnosticRow("Storage", storageStatus)
+            DiagnosticRow("Audio HW", audioFxStatus) // NEW
 
             HorizontalDivider(Modifier.padding(vertical = 24.dp))
 
@@ -241,7 +247,7 @@ fun toggleSpeakerTest(context: Context, on: Boolean) {
 // --- DIAGNOSTIC HELPERS ---
 @Composable
 fun DiagnosticRow(label: String, status: String) {
-    val isPass = status.startsWith("OK") || status.startsWith("Yes") || status.startsWith("Connected")
+    val isPass = status.startsWith("OK") || status.startsWith("Yes") || status.startsWith("Connected") || status.contains("✓")
     val icon = if (isPass) Icons.Default.CheckCircle else if (status.contains("Checking")) Icons.Default.Refresh else Icons.Default.Warning
     val color = if (isPass) Color(0xFF4CAF50) else if (status.contains("Checking")) Color.Gray else MaterialTheme.colorScheme.error
 
@@ -283,6 +289,14 @@ fun checkBattery(context: Context): String {
     val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
     val isIgnored = pm.isIgnoringBatteryOptimizations(context.packageName)
     return if (isIgnored) "OK (Unrestricted)" else "Warning (Restricted)"
+}
+
+// NEW: Checks for Hardware Audio Effects (Critical for Echo/Noise issues)
+fun checkAudioEffects(): String {
+    val aec = AcousticEchoCanceler.isAvailable()
+    val ns = NoiseSuppressor.isAvailable()
+    val agc = AutomaticGainControl.isAvailable()
+    return "AEC:${if(aec) "✓" else "✗"} NS:${if(ns) "✓" else "✗"} AGC:${if(agc) "✓" else "✗"}"
 }
 
 // New: Verifies we can write to cache (Critical for Voice Pager)

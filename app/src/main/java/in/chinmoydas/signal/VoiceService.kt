@@ -8,6 +8,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
@@ -18,9 +19,14 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.*
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
+import android.view.KeyEvent
 import android.util.Log
 import androidx.annotation.RequiresPermission
+import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
+import androidx.media.session.MediaButtonReceiver
 import `in`.chinmoydas.signal.data.MainRepository
 import `in`.chinmoydas.signal.utils.AudioEngine
 import `in`.chinmoydas.signal.utils.LocalLinkManager
@@ -28,18 +34,20 @@ import `in`.chinmoydas.signal.utils.NetworkEngine
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
-// --- UPDATED STATE: Added lastPingResponse ---
 data class VoiceServiceState(
     val incomingCall: String? = null,
     val incomingIp: String? = null,
     val networkStatus: String = "Listening...",
     val isSilenced: Boolean = false,
     val isSpeakerOn: Boolean = true,
-    val lastPingResponse: Long = 0L // New field to track handshake
+    val lastPingResponse: Long = 0L,
+    val isHeadsetLinked: Boolean = true,
+    val isTransmitting: Boolean = false
 )
 
 class VoiceService : Service() {
@@ -54,12 +62,12 @@ class VoiceService : Service() {
     private lateinit var networkEngine: NetworkEngine
     private lateinit var repository: MainRepository
 
-    private val END_STREAM_SIGNAL = "__END_TX__"
+    private lateinit var mediaSession: MediaSessionCompat
+    private var isHeadsetLinked = true
 
-    // --- NEW SIGNALS ---
+    private val END_STREAM_SIGNAL = "__END_TX__"
     private val PING_SIGNAL = "__PING__"
     private val PONG_SIGNAL = "__PONG__"
-    // -------------------
 
     private val UDP_PORT = 50005
     private val IGNORE_SENDER_DELAY = 5000L
@@ -87,10 +95,14 @@ class VoiceService : Service() {
     private var userPrefersSpeaker = true
 
     private fun updateState() {
-        _voiceServiceState.value = _voiceServiceState.value.copy(
-            isSilenced = isSilenced,
-            isSpeakerOn = userPrefersSpeaker
-        )
+        _voiceServiceState.update {
+            it.copy(
+                isSilenced = isSilenced,
+                isSpeakerOn = userPrefersSpeaker,
+                isHeadsetLinked = isHeadsetLinked,
+                isTransmitting = isSending
+            )
+        }
     }
 
     private val sequenceMap = ConcurrentHashMap<String, Int>()
@@ -141,11 +153,73 @@ class VoiceService : Service() {
         networkEngine = NetworkEngine(UDP_PORT)
         repository = MainRepository(applicationContext)
         observeRepositoryFlows()
+
+        initMediaSession()
+
         multicastLock.setReferenceCounted(false)
         wakeLock.setReferenceCounted(false)
         wifiLock.setReferenceCounted(false)
         val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         connectivityManager.registerNetworkCallback(NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), networkCallback)
+    }
+
+    private fun initMediaSession() {
+        val componentName = android.content.ComponentName(this, MediaButtonReceiver::class.java)
+        mediaSession = MediaSessionCompat(this, "VoiceServiceMediaSession", componentName, null)
+        mediaSession.setFlags(MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS)
+
+        mediaSession.setCallback(object : MediaSessionCompat.Callback() {
+            override fun onMediaButtonEvent(mediaButtonEvent: Intent?): Boolean {
+                val keyEvent = mediaButtonEvent?.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
+                if (keyEvent?.action == KeyEvent.ACTION_DOWN) {
+                    when (keyEvent.keyCode) {
+                        KeyEvent.KEYCODE_HEADSETHOOK,
+                        KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+                        KeyEvent.KEYCODE_MEDIA_PLAY,
+                        KeyEvent.KEYCODE_MEDIA_PAUSE -> {
+                            toggleTalk()
+                            return true
+                        }
+                    }
+                }
+                return super.onMediaButtonEvent(mediaButtonEvent)
+            }
+        })
+        isHeadsetLinked = true
+        mediaSession.isActive = true
+    }
+
+    private fun toggleTalk() {
+        if (isSending) {
+            stopTalk()
+            vibrate()
+        } else {
+            scope.launch {
+                val target = repository.getTargetUser()
+                if (target.isBlank()) return@launch
+
+                // 1. Get IP
+                var ip = activeIpCache[target]
+                if (ip == null) {
+                    val contact = repository.getAllContacts().find { it.name == target }
+                    ip = contact?.ip
+                }
+
+                // 2. Start (if permission granted)
+                if (!ip.isNullOrBlank()) {
+                    if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                        vibrate()
+                        startTalk(listOf(ip), UDP_PORT)
+                    } else {
+                        Log.e(tag, "Headset PTT failed: Permission missing")
+                        updateNotification("Missing Mic Permission", null)
+                    }
+                } else {
+                    // Connectivity Fix: If no IP known, try triggering heartbeat to find them
+                    triggerHeartbeat()
+                }
+            }
+        }
     }
 
     private fun observeRepositoryFlows() {
@@ -159,7 +233,19 @@ class VoiceService : Service() {
                         currentChannel = parts[0]
                     } else { currentChannel = raw }
                 } else { currentChannel = null; currentChannelKey = null }
-                triggerHeartbeat()
+
+                // --- CONNECTIVITY FIX: Burst Ping Immediately ---
+                triggerHeartbeat() // Tell Server "I'm here"
+
+                // Tell Peer "I'm here" (Directly)
+                val ip = activeIpCache[target]
+                    ?: repository.getAllContacts().find { it.name == target }?.ip
+
+                if (!ip.isNullOrBlank() && ip != "SERVER_LINK") { // <--- ADD THIS CHECK
+                    Log.d(tag, "Switching target to $target ($ip), sending aggressive ping")
+                    sendPing(ip)
+                }
+                // -----------------------------------------------
             }
         }
         scope.launch {
@@ -178,6 +264,7 @@ class VoiceService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        MediaButtonReceiver.handleIntent(mediaSession, intent)
         val action = intent?.action
 
         if (action == "STOP_SERVICE") {
@@ -196,6 +283,13 @@ class VoiceService : Service() {
                     acquireResources()
                 }
             }
+            return START_STICKY
+        }
+        if (action == "TOGGLE_HEADSET") {
+            isHeadsetLinked = !isHeadsetLinked
+            mediaSession.isActive = isHeadsetLinked
+            updateState()
+            updateNotification(if (isHeadsetLinked) "Keys Attached" else "Keys Detached", null)
             return START_STICKY
         }
 
@@ -227,22 +321,16 @@ class VoiceService : Service() {
         super.onTaskRemoved(rootIntent)
     }
 
-    // --- NEW: SEND PING (BURST) ---
     fun sendPing(ip: String) {
         scope.launch {
             val signalBytes = PING_SIGNAL.toByteArray()
             val buf = ByteArray(1 + signalBytes.size + 4)
             buf[0] = signalBytes.size.toByte()
             System.arraycopy(signalBytes, 0, buf, 1, signalBytes.size)
-            // Burst 3 times to ensure delivery over UDP
-            repeat(3) {
-                networkEngine.send(buf, listOf(ip), UDP_PORT)
-                delay(15)
-            }
+            repeat(3) { networkEngine.send(buf, listOf(ip), UDP_PORT); delay(20) }
         }
     }
 
-    // --- NEW: SEND PONG (REPLY) ---
     private fun sendPong(ip: String) {
         scope.launch {
             val signalBytes = PONG_SIGNAL.toByteArray()
@@ -259,20 +347,11 @@ class VoiceService : Service() {
         if (nameLen + 5 > length) return
         val senderName = String(data, 1, nameLen)
 
-        // --- INTERCEPT HANDSHAKE SIGNALS ---
-        if (senderName == PING_SIGNAL) {
-            // Received PING -> Reply PONG
-            sendPong(senderIp)
-            return
-        }
+        if (senderName == PING_SIGNAL) { sendPong(senderIp); return }
         if (senderName == PONG_SIGNAL) {
-            // Received PONG -> Update State (Success!)
-            _voiceServiceState.value = _voiceServiceState.value.copy(
-                lastPingResponse = System.currentTimeMillis()
-            )
+            _voiceServiceState.update { it.copy(lastPingResponse = System.currentTimeMillis()) }
             return
         }
-        // -----------------------------------
 
         if (senderName == END_STREAM_SIGNAL) {
             if (isReceiving) {
@@ -288,7 +367,7 @@ class VoiceService : Service() {
                 }
                 currentSpeakerName = null
                 resetJob?.cancel()
-                _voiceServiceState.value = _voiceServiceState.value.copy(incomingCall = null, networkStatus = "Listening...")
+                _voiceServiceState.update { it.copy(incomingCall = null, networkStatus = "Listening...") }
                 updateNotification("Listening...", null)
                 releaseResourcesIfNeeded()
             }
@@ -305,12 +384,9 @@ class VoiceService : Service() {
         val lastSeq = sequenceMap.getOrPut(senderName) { -1 }
 
         if (seqNum > lastSeq || seqNum < lastSeq - 1000 || seqNum == 0) {
-            // Auto-Learn Logic
             if (!senderName.startsWith("group:") && activeIpCache[senderName] != senderIp) {
                 activeIpCache[senderName] = senderIp
-                scope.launch {
-                    repository.updateContactIp(senderName, senderIp)
-                }
+                scope.launch { repository.updateContactIp(senderName, senderIp) }
             }
 
             if (seqNum == 0 || seqNum < lastSeq - 1000) {
@@ -323,12 +399,8 @@ class VoiceService : Service() {
 
             if (payloadLen > 0) {
                 val rawAudio = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
-                if (!isSilenced) {
-                    try { audioEngine.writeAudio(seqNum, rawAudio) } catch (e: Exception) {}
-                }
-                if (isRecordingEnabled) {
-                    synchronized(bufferLock) { try { incomingBuffer.write(rawAudio) } catch (t: Throwable) {} }
-                }
+                if (!isSilenced) { try { audioEngine.writeAudio(seqNum, rawAudio) } catch (e: Exception) {} }
+                if (isRecordingEnabled) { synchronized(bufferLock) { try { incomingBuffer.write(rawAudio) } catch (t: Throwable) {} } }
             }
         }
     }
@@ -341,7 +413,7 @@ class VoiceService : Service() {
             val status = if(isSilenced) "Missed: $callerName" else "Incoming: $callerName"
             updateNotification(status, callerName)
             if (!isSilenced) vibrate()
-            _voiceServiceState.value = _voiceServiceState.value.copy(incomingCall = callerName, incomingIp = lastIncomingIp)
+            _voiceServiceState.update { it.copy(incomingCall = callerName, incomingIp = lastIncomingIp) }
         }
         lastReceiveTime = currentTime
         resetJob?.cancel()
@@ -351,7 +423,7 @@ class VoiceService : Service() {
                 isReceiving = false
                 releaseResourcesIfNeeded()
                 updateNotification("Listening...", null)
-                _voiceServiceState.value = _voiceServiceState.value.copy(incomingCall = null, networkStatus = "Listening...")
+                _voiceServiceState.update { it.copy(incomingCall = null, networkStatus = "Listening...") }
             }
         }
     }
@@ -376,6 +448,8 @@ class VoiceService : Service() {
         activeTargets = ips
         lastPort = port
 
+        updateState()
+
         scope.launch { repository.insertLog(if (ips.size > 1) "Group Broadcast" else "PTT Call", false) }
 
         val nameBytes = myUsername.toByteArray()
@@ -397,6 +471,9 @@ class VoiceService : Service() {
     fun stopTalk() {
         if (!isSending) return
         isSending = false
+
+        updateState()
+
         audioEngine.stopRecording()
         scope.launch {
             val endNameBytes = END_STREAM_SIGNAL.toByteArray()
@@ -412,7 +489,7 @@ class VoiceService : Service() {
         ignoredSender = lastIncomingIp
         isReceiving = false
         resetJob?.cancel()
-        _voiceServiceState.value = _voiceServiceState.value.copy(incomingCall = null, networkStatus = "Listening...")
+        _voiceServiceState.update { it.copy(incomingCall = null, networkStatus = "Listening...") }
         updateNotification("Listening...", null)
         releaseResourcesIfNeeded()
         scope.launch { delay(IGNORE_SENDER_DELAY); ignoredSender = null }
@@ -538,10 +615,20 @@ class VoiceService : Service() {
         val muteIcon = if (isSilenced) android.R.drawable.ic_lock_silent_mode else android.R.drawable.ic_lock_silent_mode_off
         val muteAction = NotificationCompat.Action.Builder(muteIcon, muteLabel, mutePendingIntent).build()
 
+        val headsetIntent = Intent(this, VoiceService::class.java).apply { action = "TOGGLE_HEADSET" }
+        val headsetPendingIntent = PendingIntent.getService(this, 777, headsetIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+
+        val headsetIcon = if (isHeadsetLinked) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+        val headsetLabel = if (isHeadsetLinked) "Detach Keys" else "Grab Keys"
+        val headsetAction = NotificationCompat.Action.Builder(headsetIcon, headsetLabel, headsetPendingIntent).build()
+
         return NotificationCompat.Builder(this, "VoiceChannel")
             .setContentTitle("CD Signal").setContentText(text).setSmallIcon(R.mipmap.ic_launcher_foreground).setContentIntent(pendingIntent)
-            .setOnlyAlertOnce(true).setOngoing(true).addAction(muteAction).addAction(exitAction)
-            .setStyle(androidx.media.app.NotificationCompat.MediaStyle().setShowActionsInCompactView(0, 1)).build()
+            .setOnlyAlertOnce(true).setOngoing(true)
+            .addAction(muteAction)
+            .addAction(headsetAction)
+            .addAction(exitAction)
+            .setStyle(androidx.media.app.NotificationCompat.MediaStyle().setShowActionsInCompactView(0, 1, 2)).build()
     }
 
     override fun onDestroy() {
@@ -549,6 +636,7 @@ class VoiceService : Service() {
         audioEngine.shutdown()
         networkEngine.stop()
         localLinkManager?.stop()
+        mediaSession.release()
         (getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)?.unregisterNetworkCallback(networkCallback)
         if (wakeLock.isHeld) wakeLock.release()
         if (multicastLock.isHeld) multicastLock.release()

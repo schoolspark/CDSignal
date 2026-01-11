@@ -1,7 +1,9 @@
 package `in`.chinmoydas.signal.screens
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -56,7 +58,39 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 2: VOICE PAGER & POCKET MODE ---
+            // --- SECTION 2: STATUS INDICATORS (NEW) ---
+            HelpCard(
+                title = "🚦 STATUS LIGHTS & INDICATORS",
+                icon = Icons.Default.Info,
+                color = MaterialTheme.colorScheme.surfaceVariant
+            ) {
+                Text("Understand exactly what is happening:", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(12.dp))
+
+                StatusDotRow(Color.Green, "Green Dot", "Connection Ready. Peer is online & reachable.")
+                StatusDotRow(Color.Yellow, "Yellow Dot", "Checking Connection. Finding peer's IP...")
+                StatusDotRow(Color.Red, "Red Dot", "Offline. Peer is not connected.")
+
+                Spacer(Modifier.height(8.dp))
+                HorizontalDivider(thickness = 1.dp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.2f))
+                Spacer(Modifier.height(8.dp))
+
+                StatusDotRow(MaterialTheme.colorScheme.primary, "Blue Button", "Standby. Hold to Talk.")
+                StatusDotRow(MaterialTheme.colorScheme.error, "Red Button (ON AIR)", "Transmitting. You are live.")
+
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 4.dp)) {
+                    Icon(Icons.Default.Lock, null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Column {
+                        Text("Handsfree Mode", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyMedium)
+                        Text("Tap 'Handsfree' to switch modes. Tap once to talk, tap again to stop.", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // --- SECTION 3: VOICE PAGER & POCKET MODE ---
             HelpCard(
                 title = "📟 VOICE PAGER & POCKET MODE",
                 icon = Icons.Default.NotificationsOff,
@@ -75,7 +109,7 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 3: EVENT / OFFLINE MODE ---
+            // --- SECTION 4: EVENT / OFFLINE MODE ---
             HelpCard(
                 title = "📢 EVENT / OFFLINE MODE",
                 icon = Icons.Default.Wifi,
@@ -99,7 +133,7 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 4: INDIVIDUAL & FAST-LINK ---
+            // --- SECTION 5: INDIVIDUAL CALLS ---
             HelpCard(
                 title = "👤 INDIVIDUAL CALLS",
                 icon = Icons.Default.Person,
@@ -114,10 +148,11 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 5: TROUBLESHOOTING ---
+            // --- SECTION 6: TROUBLESHOOTING ---
             Text("Troubleshooting", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
             Text("• Screeching? The app has built-in feedback suppression, but try to keep phones 2-3 meters apart.")
+            Text("• Light stuck on Yellow? Tap the Sync (Refresh) icon at the top left to force a connection check.")
             Text("• No devices found? Ensure 'AP Isolation' is OFF in your Router settings.")
             Text("• Sound clear on one side only? Check the noisy device's mic for dust or cases blocking the secondary mic.")
 
@@ -149,5 +184,17 @@ fun Step(num: Int, text: String, isBold: Boolean = false) {
     Row(Modifier.padding(vertical = 4.dp)) {
         Text("$num.", fontWeight = FontWeight.Bold, modifier = Modifier.width(24.dp))
         Text(text, fontWeight = if (isBold) FontWeight.Bold else FontWeight.Normal)
+    }
+}
+
+@Composable
+fun StatusDotRow(color: Color, title: String, desc: String) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 4.dp)) {
+        Box(Modifier.size(12.dp).background(color, CircleShape))
+        Spacer(Modifier.width(12.dp))
+        Column {
+            Text(title, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyMedium)
+            Text(desc, style = MaterialTheme.typography.bodySmall)
+        }
     }
 }
