@@ -56,9 +56,9 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 2: VOICE PAGER (NEW) ---
+            // --- SECTION 2: VOICE PAGER & POCKET MODE ---
             HelpCard(
-                title = "📟 VOICE PAGER (SILENT MODE)",
+                title = "📟 VOICE PAGER & POCKET MODE",
                 icon = Icons.Default.NotificationsOff,
                 color = MaterialTheme.colorScheme.tertiaryContainer
             ) {
@@ -67,9 +67,10 @@ fun HelpScreen(navController: NavController) {
                 Step(1, "Tap the 'Silent Mode' (Bell) icon on the Radio screen.")
                 Step(2, "When someone talks, the app stays silent but RECORDS the message.")
                 Step(3, "Go to the 'History' tab to see missed messages in RED.")
-                Step(4, "Tap 'Play'. The message self-destructs after listening to protect privacy.")
                 Spacer(Modifier.height(8.dp))
-                Text("Tip: You can now Mute/Unmute or Exit directly from your phone's notification panel!", style = MaterialTheme.typography.bodySmall, fontStyle = FontStyle.Italic)
+                Text("🎧 Pocket Mode:", fontWeight = FontWeight.Bold)
+                Step(4, "Click your Wired or Bluetooth Headset button to talk, even if the phone is in your pocket.")
+                Step(5, "Tip: Use 'Detach Keys' in the notification to let your music app take back control.")
             }
 
             Spacer(Modifier.height(16.dp))

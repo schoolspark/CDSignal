@@ -389,6 +389,12 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
         OutlinedButton(onClick = { showBlockedDialog = true }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.PrivacyTip, null); Spacer(Modifier.width(8.dp)); Text("Privacy: Blocked Users") }
         Spacer(Modifier.height(16.dp))
         OutlinedButton(onClick = { navController.navigate("diagnostics") }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Build, null); Spacer(Modifier.width(8.dp)); Text("Run System Diagnostics") }
+        Spacer(Modifier.height(16.dp))
+        OutlinedButton(onClick = { navController.navigate("info") }, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Default.Info, null)
+            Spacer(Modifier.width(8.dp))
+            Text("About & Legal Info")
+        }
         Spacer(Modifier.height(32.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             OutlinedButton(onClick = onLogout, modifier = Modifier.weight(1f)) { Icon(Icons.AutoMirrored.Filled.ExitToApp, null); Spacer(Modifier.width(8.dp)); Text("Logout") }

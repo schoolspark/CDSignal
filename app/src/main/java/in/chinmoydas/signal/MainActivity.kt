@@ -33,6 +33,7 @@ import `in`.chinmoydas.signal.data.MainRepository
 import `in`.chinmoydas.signal.screens.DiagnosticsScreen
 import `in`.chinmoydas.signal.screens.HelpScreen
 import `in`.chinmoydas.signal.screens.HomeScreen
+import `in`.chinmoydas.signal.screens.InfoScreen
 import `in`.chinmoydas.signal.screens.LoginScreen
 import `in`.chinmoydas.signal.ui.theme.CDSignalTheme
 import `in`.chinmoydas.signal.viewmodel.ViewModelFactory
@@ -146,6 +147,7 @@ class MainActivity : ComponentActivity() {
                             composable("login") { LoginScreen(navController, getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)) }
                             composable("help") { HelpScreen(navController) }
                             composable("diagnostics") { DiagnosticsScreen(navController) }
+                            composable("info") { InfoScreen(navController) }
                             composable("home") {
                                 HomeScreen(
                                     navController = navController,
