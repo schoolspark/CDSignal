@@ -5,6 +5,7 @@ import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.Field
 import retrofit2.http.FormUrlEncoded
+import retrofit2.http.GET
 import retrofit2.http.Header
 import retrofit2.http.POST
 import java.util.concurrent.TimeUnit
@@ -39,6 +40,10 @@ data class ChannelResponse(
 data class ResetResponse(
     val status: String,
     val new_code: String?
+)
+
+data class SignalResponse(
+    val callers: List<String>?
 )
 
 // --- API INTERFACE ---
@@ -83,6 +88,19 @@ interface ApiService {
     suspend fun resetCode(
         @Header("Authorization") token: String
     ): ResetResponse
+
+    @FormUrlEncoded
+    @POST("api/signal.php")
+    suspend fun sendSignal(
+        @Header("Authorization") token: String,
+        @Field("action") action: String,
+        @Field("target") target: String?
+    ): retrofit2.Response<Unit>
+
+    @GET("api/signal.php?action=check_signals")
+    suspend fun checkSignals(
+        @Header("Authorization") token: String
+    ): SignalResponse
 }
 
 object RetrofitClient {

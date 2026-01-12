@@ -133,6 +133,7 @@ class VoiceService : Service() {
     private val multicastLock by lazy { (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).createMulticastLock("CDSignal:MulticastLock") }
     private val activeCalls = AtomicInteger(0)
     private var heartbeatJob: Job? = null
+    private var signalingJob: Job? = null
     private var currentSequenceNumber = 0
     private var localLinkManager: LocalLinkManager? = null
 
@@ -198,18 +199,29 @@ class VoiceService : Service() {
                 val target = repository.getTargetUser()
                 if (target.isBlank()) return@launch
 
+                // 1. Resolve Target IP
                 var ip = activeIpCache[target]
                 if (ip == null) {
                     val contact = repository.getAllContacts().find { it.name == target }
                     ip = contact?.ip
                 }
 
-                // --- [GOLDEN BUILD] FIX: Map SERVER_LINK to Real Host ---
+                // 2. DNS Fix for Group Channels
                 if (ip == "SERVER_LINK") {
                     ip = "signal.chinmoydas.in"
                 }
-                // --------------------------------------------------------
 
+                // 3. START SIGNALING (Fire & Forget to open NAT)
+                launch(Dispatchers.IO) {
+                    try {
+                        val token = repository.getToken()
+                        if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
+                            RetrofitClient.api.sendSignal("Bearer $token", "call_request", target)
+                        }
+                    } catch (e: Exception) { Log.e(tag, "Signaling failed", e) }
+                }
+
+                // 4. Start Audio
                 if (!ip.isNullOrBlank()) {
                     if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                         vibrate()
@@ -310,7 +322,43 @@ class VoiceService : Service() {
         localLinkManager?.startAdvertising(myUsername, UDP_PORT)
 
         startHeartbeatLoop()
+        startSignalLoop() // <-- New Signaling Polling Loop
         return START_STICKY
+    }
+
+    // --- NEW: SIGNALING LOOP FOR HOLE PUNCHING (FIXED SYNTAX) ---
+    private fun startSignalLoop() {
+        signalingJob?.cancel()
+        signalingJob = scope.launch {
+            while (isActive) {
+                val token = repository.getToken()
+                if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
+                    try {
+                        val response = RetrofitClient.api.checkSignals("Bearer $token")
+                        // Safe call on callers list
+                        val callers = response.callers
+                        if (!callers.isNullOrEmpty()) {
+                            // Find trusted contacts first
+                            val contacts = repository.getAllContacts()
+
+                            callers.forEach { caller ->
+                                // Hole Punch: Someone is calling me. Send packets to them NOW.
+                                val ip = activeIpCache[caller]
+                                    ?: contacts.find { it.name == caller }?.ip
+
+                                if (!ip.isNullOrBlank() && ip != "SERVER_LINK") {
+                                    Log.d(tag, "Hole Punch triggered for caller: $caller at $ip")
+                                    sendPing(ip)
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        // Ignore harmless poll errors
+                    }
+                }
+                delay(5000) // Poll every 3 seconds (Low bandwidth)
+            }
+        }
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -327,6 +375,7 @@ class VoiceService : Service() {
             val buf = ByteArray(1 + signalBytes.size + 4)
             buf[0] = signalBytes.size.toByte()
             System.arraycopy(signalBytes, 0, buf, 1, signalBytes.size)
+            // Burst of 3 packets to punch hole
             repeat(3) { networkEngine.send(buf, listOf(ip), UDP_PORT); delay(20) }
         }
     }
@@ -570,7 +619,12 @@ class VoiceService : Service() {
 
     private fun startHeartbeatLoop() {
         heartbeatJob?.cancel()
-        heartbeatJob = scope.launch { while (isActive) { triggerHeartbeat(); delay(30000) } }
+        heartbeatJob = scope.launch {
+            while (isActive) {
+                triggerHeartbeat()
+                delay(25000) // Tuned for carrier CGNAT stability
+            }
+        }
     }
 
     fun triggerHeartbeat(status: String = "online") {
