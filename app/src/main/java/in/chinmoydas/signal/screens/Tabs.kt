@@ -58,6 +58,7 @@ fun TalkTab(
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsState()
 
+    // --- [GOLDEN BUILD] FIX: Listen to Hardware Service State ---
     val serviceState by service?.voiceServiceState?.collectAsState(initial = VoiceServiceState())
         ?: remember { mutableStateOf(VoiceServiceState()) }
 
@@ -126,7 +127,7 @@ fun TalkTab(
                     Icon(Icons.Default.Groups, "Broadcast", tint = if (viewModel.isBroadcastMode) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 IconButton(onClick = { viewModel.toggleSpeaker(service) }) {
-                    Icon(if (serviceState.isSpeakerOn) Icons.AutoMirrored.Filled.VolumeUp else Icons.Default.Hearing, "Speaker", tint = MaterialTheme.colorScheme.primary)
+                    Icon(if (serviceState.isSpeakerOn) Icons.AutoMirrored.Filled.VolumeUp else Icons.Default.Hearing, "Speaker", tint = if (serviceState.isSpeakerOn) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
@@ -150,7 +151,8 @@ fun TalkTab(
         Spacer(Modifier.height(40.dp))
 
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
-            if (uiState is UiState.Transmitting || uiState is UiState.Receiving) {
+            // FIX: Use serviceState.incomingCall to detect receiving state
+            if (serviceState.isTransmitting || serviceState.incomingCall != null || uiState is UiState.Receiving) {
                 IconButton(onClick = { viewModel.hangUp(service) }, modifier = Modifier.size(64.dp).background(Color.Red, CircleShape)) {
                     Icon(Icons.Default.CallEnd, "Hang Up", tint = Color.White)
                 }
@@ -159,12 +161,22 @@ fun TalkTab(
 
             Box(
                 contentAlignment = Alignment.Center,
-                modifier = Modifier.size(200.dp).clip(CircleShape).background(if (uiState is UiState.Transmitting) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+                modifier = Modifier
+                    .size(240.dp)
+                    .clip(CircleShape)
+                    .background(
+                        // --- [GOLDEN BUILD] FIX: Use Hardware State for Color Sync ---
+                        if (serviceState.isTransmitting) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.primary
+                    )
                     .pointerInput(Unit) {
                         detectTapGestures(
                             onPress = {
                                 if (!viewModel.isHandsFree && service != null) {
-                                    viewModel.startTransmission(onIpsFound = { ips, port -> service.startTalk(ips, port) }, onUpdateIps = { newIps -> service.updateTalkTargets(newIps) })
+                                    viewModel.startTransmission(
+                                        onIpsFound = { ips, port -> service.startTalk(ips, port) },
+                                        onUpdateIps = { newIps -> service.updateTalkTargets(newIps) }
+                                    )
                                     try { awaitRelease() } finally { viewModel.stopTransmission { service.stopTalk() } }
                                 }
                             },
@@ -173,7 +185,7 @@ fun TalkTab(
                                     val now = System.currentTimeMillis()
                                     if (now - lastClickTime > 300) {
                                         lastClickTime = now
-                                        if (uiState is UiState.Transmitting) viewModel.stopTransmission { service.stopTalk() }
+                                        if (serviceState.isTransmitting) viewModel.stopTransmission { service.stopTalk() }
                                         else viewModel.startTransmission(onIpsFound = { ips, port -> service.startTalk(ips, port) }, onUpdateIps = { newIps -> service.updateTalkTargets(newIps) })
                                     }
                                 }
@@ -182,16 +194,39 @@ fun TalkTab(
                     }
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(Icons.Default.FlashOn, null, tint = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.size(48.dp))
-                    Text(if (uiState is UiState.Transmitting) "ON AIR" else if (viewModel.isHandsFree) "TAP TO TALK" else "HOLD TO TALK", color = MaterialTheme.colorScheme.onPrimary, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    Icon(
+                        if (serviceState.isTransmitting) Icons.Default.Mic else Icons.Default.MicNone,
+                        null,
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier.size(64.dp)
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        if (serviceState.isTransmitting) "ON AIR"
+                        else if (viewModel.isHandsFree) "TAP TO TALK"
+                        else "HOLD TO TALK",
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 18.sp
+                    )
                 }
             }
         }
 
-        Spacer(Modifier.height(30.dp))
+        Spacer(Modifier.height(24.dp))
+
+        if (serviceState.isHeadsetLinked) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Headset, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Pocket Mode Active (Headset Key Ready)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
 
         OutlinedButton(
-            onClick = { viewModel.isHandsFree = !viewModel.isHandsFree; if (uiState is UiState.Transmitting) viewModel.stopTransmission { service?.stopTalk() } },
+            onClick = { viewModel.isHandsFree = !viewModel.isHandsFree; if (serviceState.isTransmitting) viewModel.stopTransmission { service?.stopTalk() } },
             colors = ButtonDefaults.outlinedButtonColors(containerColor = if(viewModel.isHandsFree) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
         ) {
             Icon(if(viewModel.isHandsFree) Icons.Default.Lock else Icons.Default.LockOpen, null)
@@ -201,6 +236,7 @@ fun TalkTab(
     }
 }
 
+// ... (Rest of Tabs.kt remains same, History/Connect/Profile tabs are stable)
 @Composable
 fun HistoryTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
     val context = LocalContext.current

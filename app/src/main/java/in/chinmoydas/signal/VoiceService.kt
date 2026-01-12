@@ -20,7 +20,6 @@ import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.*
 import android.support.v4.media.session.MediaSessionCompat
-import android.support.v4.media.session.PlaybackStateCompat
 import android.view.KeyEvent
 import android.util.Log
 import androidx.annotation.RequiresPermission
@@ -31,6 +30,7 @@ import `in`.chinmoydas.signal.data.MainRepository
 import `in`.chinmoydas.signal.utils.AudioEngine
 import `in`.chinmoydas.signal.utils.LocalLinkManager
 import `in`.chinmoydas.signal.utils.NetworkEngine
+import `in`.chinmoydas.signal.utils.WavUtils
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -198,14 +198,18 @@ class VoiceService : Service() {
                 val target = repository.getTargetUser()
                 if (target.isBlank()) return@launch
 
-                // 1. Get IP
                 var ip = activeIpCache[target]
                 if (ip == null) {
                     val contact = repository.getAllContacts().find { it.name == target }
                     ip = contact?.ip
                 }
 
-                // 2. Start (if permission granted)
+                // --- [GOLDEN BUILD] FIX: Map SERVER_LINK to Real Host ---
+                if (ip == "SERVER_LINK") {
+                    ip = "signal.chinmoydas.in"
+                }
+                // --------------------------------------------------------
+
                 if (!ip.isNullOrBlank()) {
                     if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                         vibrate()
@@ -215,7 +219,6 @@ class VoiceService : Service() {
                         updateNotification("Missing Mic Permission", null)
                     }
                 } else {
-                    // Connectivity Fix: If no IP known, try triggering heartbeat to find them
                     triggerHeartbeat()
                 }
             }
@@ -234,18 +237,15 @@ class VoiceService : Service() {
                     } else { currentChannel = raw }
                 } else { currentChannel = null; currentChannelKey = null }
 
-                // --- CONNECTIVITY FIX: Burst Ping Immediately ---
-                triggerHeartbeat() // Tell Server "I'm here"
+                triggerHeartbeat()
 
-                // Tell Peer "I'm here" (Directly)
                 val ip = activeIpCache[target]
                     ?: repository.getAllContacts().find { it.name == target }?.ip
 
-                if (!ip.isNullOrBlank() && ip != "SERVER_LINK") { // <--- ADD THIS CHECK
+                if (!ip.isNullOrBlank() && ip != "SERVER_LINK") {
                     Log.d(tag, "Switching target to $target ($ip), sending aggressive ping")
                     sendPing(ip)
                 }
-                // -----------------------------------------------
             }
         }
         scope.launch {
@@ -398,9 +398,11 @@ class VoiceService : Service() {
             handleIncomingSignal(senderName)
 
             if (payloadLen > 0) {
-                val rawAudio = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
-                if (!isSilenced) { try { audioEngine.writeAudio(seqNum, rawAudio) } catch (e: Exception) {} }
-                if (isRecordingEnabled) { synchronized(bufferLock) { try { incomingBuffer.write(rawAudio) } catch (t: Throwable) {} } }
+                val payload = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
+
+                // --- DIRECT PLAYBACK (Raw PCM) ---
+                if (!isSilenced) { try { audioEngine.writeAudio(seqNum, payload) } catch (e: Exception) {} }
+                if (isRecordingEnabled) { synchronized(bufferLock) { try { incomingBuffer.write(payload) } catch (t: Throwable) {} } }
             }
         }
     }
@@ -434,7 +436,7 @@ class VoiceService : Service() {
                 val timestamp = System.currentTimeMillis()
                 val fileName = "${timestamp}_${sender}.wav"
                 val file = java.io.File(cacheDir, fileName)
-                `in`.chinmoydas.signal.utils.WavUtils.saveWavFile(file, data)
+                WavUtils.saveWavFile(file, data)
             } catch (e: Exception) { Log.e(tag, "Failed to save message", e) }
         }
     }
@@ -455,8 +457,8 @@ class VoiceService : Service() {
         val nameBytes = myUsername.toByteArray()
         val headerLen = 1 + nameBytes.size + 4
 
-        audioEngine.startRecording { opusBuffer ->
-            val payload = opusBuffer
+        audioEngine.startRecording { rawBuffer ->
+            val payload = rawBuffer
             val sendBuf = ByteArray(headerLen + payload.size)
             sendBuf[0] = nameBytes.size.toByte()
             System.arraycopy(nameBytes, 0, sendBuf, 1, nameBytes.size)

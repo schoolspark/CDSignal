@@ -19,7 +19,7 @@ import kotlin.math.abs
 class AudioEngine(context: Context) {
     private val tag = "AudioEngine"
 
-    // 16kHz is "Wideband HD Voice"
+    // [Golden Build] Standard Wideband Voice (16kHz)
     private val sampleRate = 16000
 
     // --- AUDIO HARDWARE ---
@@ -57,6 +57,7 @@ class AudioEngine(context: Context) {
     private val BUFFER_THRESHOLD = 3
 
     // --- CONFIG ---
+    // 640 shorts = 40ms at 16kHz (Standard PTT Frame)
     private val FRAME_SIZE = 640
     private val NOISE_GATE_THRESHOLD = 50
     private val GAIN_LIMIT_THRESHOLD = 30000
@@ -79,7 +80,7 @@ class AudioEngine(context: Context) {
 
             audioTrack?.play()
             startPlaybackThread()
-            Log.d(tag, "Playback started.")
+            Log.d(tag, "Playback started at $sampleRate Hz.")
         } catch (e: Exception) {
             Log.e(tag, "Playback initialization failed", e)
         }
@@ -154,7 +155,7 @@ class AudioEngine(context: Context) {
             audioRecord?.startRecording()
 
             startRecordingThread(FRAME_SIZE, onDataReady)
-            Log.d(tag, "Recording started.")
+            Log.d(tag, "Recording started ($sampleRate Hz).")
         } catch (e: Exception) {
             Log.e(tag, "Recording initialization failed", e)
             stopRecording()
@@ -173,7 +174,6 @@ class AudioEngine(context: Context) {
 
                     var readSize = 0
                     while (readSize < frameSizeShorts && isRecording.get()) {
-                        // FIX: This read is blocking. Releasing hardware forces this to exit.
                         val result = recorder.read(pcmBuffer, readSize, frameSizeShorts - readSize)
                         if (result > 0) {
                             readSize += result
@@ -193,8 +193,8 @@ class AudioEngine(context: Context) {
                         }
 
                         if (maxAmplitude > NOISE_GATE_THRESHOLD) {
-                            val bytes = ShortToByte(pcmBuffer, readSize)
-                            onDataReady(bytes)
+                            val rawBytes = ShortToByte(pcmBuffer, readSize)
+                            onDataReady(rawBytes) // Direct PCM Transmission
                         }
                     }
                 }
@@ -210,24 +210,21 @@ class AudioEngine(context: Context) {
         try {
             Log.d(tag, "Releasing Microphone Hardware...")
 
-            // --- CRITICAL FIX: RELEASE HARDWARE FIRST ---
-            // Releasing the object forces the thread's read() to fail immediately.
             val recorder = audioRecord
-            audioRecord = null // Nullify global reference first
+            audioRecord = null
 
             try {
                 recorder?.stop()
             } catch (e: IllegalStateException) {
                 // Ignore if not initialized
             }
-            recorder?.release() // <--- THIS FREES THE MIC FOR WHATSAPP
+            recorder?.release()
 
             // Release effects
             aec?.release(); aec = null
             ns?.release(); ns = null
             agc?.release(); agc = null
 
-            // Now the thread is unblocked and can be stopped
             recordingThread?.interrupt()
             recordingThread?.join(100)
             recordingThread = null
