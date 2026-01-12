@@ -59,8 +59,8 @@ class AudioEngine(context: Context) {
     // --- CONFIG ---
     // 640 shorts = 40ms at 16kHz (Standard PTT Frame)
     private val FRAME_SIZE = 640
-    private val NOISE_GATE_THRESHOLD = 50
-    private val GAIN_LIMIT_THRESHOLD = 30000
+    private val NOISE_GATE_THRESHOLD = 150 // Was 50
+    private val GAIN_LIMIT_THRESHOLD = 28000 // Was 30000 (Provides headroom)
 
     // =========================================================================
     // PLAYBACK LOGIC

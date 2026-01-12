@@ -206,29 +206,16 @@ class VoiceService : Service() {
                     ip = contact?.ip
                 }
 
-                // 2. DNS Fix for Group Channels
-                if (ip == "SERVER_LINK") {
-                    ip = "signal.chinmoydas.in"
-                }
+                // 2. DNS Fix
+                if (ip == "SERVER_LINK") ip = "signal.chinmoydas.in"
 
-                // 3. START SIGNALING (Fire & Forget to open NAT)
-                launch(Dispatchers.IO) {
-                    try {
-                        val token = repository.getToken()
-                        if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
-                            RetrofitClient.api.sendSignal("Bearer $token", "call_request", target)
-                        }
-                    } catch (e: Exception) { Log.e(tag, "Signaling failed", e) }
-                }
-
-                // 4. Start Audio
+                // 3. Start Audio (Signaling is now handled inside startTalk)
                 if (!ip.isNullOrBlank()) {
                     if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                         vibrate()
                         startTalk(listOf(ip), UDP_PORT)
                     } else {
                         Log.e(tag, "Headset PTT failed: Permission missing")
-                        updateNotification("Missing Mic Permission", null)
                     }
                 } else {
                     triggerHeartbeat()
@@ -322,11 +309,11 @@ class VoiceService : Service() {
         localLinkManager?.startAdvertising(myUsername, UDP_PORT)
 
         startHeartbeatLoop()
-        startSignalLoop() // <-- New Signaling Polling Loop
+        startSignalLoop() // Ensure Signaling Loop is started!
         return START_STICKY
     }
 
-    // --- NEW: SIGNALING LOOP FOR HOLE PUNCHING (FIXED SYNTAX) ---
+    // --- NEW: SIGNALING LOOP FOR HOLE PUNCHING ---
     private fun startSignalLoop() {
         signalingJob?.cancel()
         signalingJob = scope.launch {
@@ -335,12 +322,9 @@ class VoiceService : Service() {
                 if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
                     try {
                         val response = RetrofitClient.api.checkSignals("Bearer $token")
-                        // Safe call on callers list
                         val callers = response.callers
                         if (!callers.isNullOrEmpty()) {
-                            // Find trusted contacts first
                             val contacts = repository.getAllContacts()
-
                             callers.forEach { caller ->
                                 // Hole Punch: Someone is calling me. Send packets to them NOW.
                                 val ip = activeIpCache[caller]
@@ -356,7 +340,7 @@ class VoiceService : Service() {
                         // Ignore harmless poll errors
                     }
                 }
-                delay(5000) // Poll every 3 seconds (Low bandwidth)
+                delay(3000) // Poll every 3 seconds (Low bandwidth)
             }
         }
     }
@@ -493,6 +477,28 @@ class VoiceService : Service() {
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     fun startTalk(ips: List<String>, port: Int) {
         if (isSending) return
+
+        // --- FIX: TRIGGER SIGNALING HERE (Works for UI & Headset) ---
+        val currentTarget = repository.getTargetUser()
+
+        // Only signal if we have a specific target (not a broadcast/channel)
+        // AND we are not just talking to ourselves
+        if (ips.isNotEmpty() && currentTarget.isNotBlank() && !currentTarget.startsWith("group:")) {
+            scope.launch(Dispatchers.IO) {
+                try {
+                    val token = repository.getToken()
+                    // Don't signal if we are in Offline/LAN mode
+                    if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
+                        Log.d(tag, "Signaling: Sending call request to $currentTarget")
+                        RetrofitClient.api.sendSignal("Bearer $token", "call_request", currentTarget)
+                    }
+                } catch (e: Exception) {
+                    Log.e(tag, "Signaling: Failed to send request", e)
+                }
+            }
+        }
+        // -----------------------------------------------------------
+
         acquireResources(forceAudio = true)
         isSending = true
         currentSequenceNumber = 0
