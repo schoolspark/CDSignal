@@ -436,6 +436,9 @@ class VoiceService : Service() {
                 // --- DIRECT PLAYBACK (Raw PCM) ---
                 if (!isSilenced) { try { audioEngine.writeAudio(seqNum, payload) } catch (e: Exception) {} }
                 if (isRecordingEnabled) { synchronized(bufferLock) { try { incomingBuffer.write(payload) } catch (t: Throwable) {} } }
+
+                // [FIX] Audio received = Connection is ALIVE! Turn Green immediately.
+                _voiceServiceState.update { it.copy(lastPingResponse = System.currentTimeMillis()) }
             }
         }
     }

@@ -58,7 +58,7 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 2: STATUS INDICATORS (NEW) ---
+            // --- SECTION 2: STATUS INDICATORS ---
             HelpCard(
                 title = "🚦 STATUS LIGHTS & INDICATORS",
                 icon = Icons.Default.Info,
@@ -67,15 +67,15 @@ fun HelpScreen(navController: NavController) {
                 Text("Understand exactly what is happening:", fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(12.dp))
 
-                StatusDotRow(Color.Green, "Green Dot", "Connection Ready. Peer is online & reachable.")
-                StatusDotRow(Color.Yellow, "Yellow Dot", "Checking Connection. Finding peer's IP...")
-                StatusDotRow(Color.Red, "Red Dot", "Offline. Peer is not connected.")
+                StatusDotRow(Color.Green, "Green Dot", "Connected. Audio Received & Path Open.")
+                StatusDotRow(Color.Yellow, "Yellow Dot", "Signaling. Waking up the peer...")
+                StatusDotRow(Color.Red, "Red Dot", "Standby. Press PTT to wake up.")
 
                 Spacer(Modifier.height(8.dp))
                 HorizontalDivider(thickness = 1.dp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.2f))
                 Spacer(Modifier.height(8.dp))
 
-                StatusDotRow(MaterialTheme.colorScheme.primary, "Blue Button", "Standby. Hold to Talk.")
+                StatusDotRow(MaterialTheme.colorScheme.primary, "Blue Button", "Ready. Hold to Talk.")
                 StatusDotRow(MaterialTheme.colorScheme.error, "Red Button (ON AIR)", "Transmitting. You are live.")
 
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 4.dp)) {
@@ -133,17 +133,19 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 5: INDIVIDUAL CALLS ---
+            // --- SECTION 5: INDIVIDUAL CALLS & CONNECTION ---
             HelpCard(
-                title = "👤 INDIVIDUAL CALLS",
+                title = "👤 INDIVIDUAL CALLS (The 'Double Punch')",
                 icon = Icons.Default.Person,
                 color = MaterialTheme.colorScheme.surfaceVariant
             ) {
-                Text("New: Speculative Routing enabled.", fontWeight = FontWeight.Bold)
+                Text("How to connect instantly on mobile networks (Jio/Airtel):", fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
                 Step(1, "Select a person from your contacts.")
-                Step(2, "The app now connects INSTANTLY using the last known IP while updating from the server in the background.")
-                Step(3, "You no longer have to wait for server confirmation to start talking.")
+                Step(2, "The 'Double Punch' Rule:", isBold = true)
+                Text("For the fastest connection, BOTH users should press the Talk button once.", modifier = Modifier.padding(start = 24.dp))
+                Step(3, "This 'wakes up' the connection instantly on strict firewalls.")
+                Step(4, "As soon as you hear audio, the status light will turn GREEN.")
             }
 
             Spacer(Modifier.height(16.dp))
@@ -151,6 +153,7 @@ fun HelpScreen(navController: NavController) {
             // --- SECTION 6: TROUBLESHOOTING ---
             Text("Troubleshooting", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
+            Text("• Status stays Red? Just press the Talk button! It sends a wake-up signal to your peer.")
             Text("• Screeching? The app has built-in feedback suppression, but try to keep phones 2-3 meters apart.")
             Text("• Light stuck on Yellow? Tap the Sync (Refresh) icon at the top left to force a connection check.")
             Text("• No devices found? Ensure 'AP Isolation' is OFF in your Router settings.")
