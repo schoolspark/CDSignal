@@ -1,6 +1,8 @@
 package `in`.chinmoydas.signal.screens
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioDeviceInfo
@@ -14,6 +16,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.PowerManager
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -23,6 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Hearing
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PlayArrow
@@ -44,8 +48,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.net.DatagramSocket
 import java.net.HttpURLConnection
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.net.URL
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -55,12 +60,14 @@ fun DiagnosticsScreen(navController: NavController) {
     val scope = rememberCoroutineScope()
 
     // System Check State
+    var deviceInfo by remember { mutableStateOf(getDeviceDetails(context)) }
     var permStatus by remember { mutableStateOf(checkPermissions(context)) }
     var batteryStatus by remember { mutableStateOf(checkBattery(context)) }
     var netStatus by remember { mutableStateOf("Checking...") }
+    var localIp by remember { mutableStateOf("...") }
     var serverStatus by remember { mutableStateOf("Checking...") }
     var storageStatus by remember { mutableStateOf(checkStorage(context)) }
-    var audioFxStatus by remember { mutableStateOf(checkAudioEffects()) } // NEW
+    var audioFxStatus by remember { mutableStateOf(checkAudioEffects()) }
 
     // Audio Output State
     var audioRouteInfo by remember { mutableStateOf(getAudioRoute(context)) }
@@ -74,10 +81,41 @@ fun DiagnosticsScreen(navController: NavController) {
     val player = remember { mutableStateOf<MediaPlayer?>(null) }
     val testFile = File(context.cacheDir, "audio_test.3gp")
 
+    // Safety: Reset Audio Mode when leaving this screen
+    DisposableEffect(Unit) {
+        onDispose {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            am.mode = AudioManager.MODE_NORMAL
+            am.isSpeakerphoneOn = false
+        }
+    }
+
     LaunchedEffect(Unit) {
         netStatus = checkNetwork(context)
+        localIp = getLocalIpAddress()
         serverStatus = checkServer()
         audioRouteInfo = getAudioRoute(context)
+    }
+
+    fun copyReport() {
+        val report = """
+            CD SIGNAL DIAGNOSTIC REPORT
+            ---------------------------
+            Device: $deviceInfo
+            Permissions: $permStatus
+            Battery: $batteryStatus
+            Network: $netStatus
+            Local IP: $localIp
+            Server: $serverStatus
+            Storage: $storageStatus
+            Audio HW: $audioFxStatus
+            Audio Route: ${audioRouteInfo.displayText.replace("\n", " | ")}
+        """.trimIndent()
+
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = ClipData.newPlainText("Diagnostic Report", report)
+        clipboard.setPrimaryClip(clip)
+        Toast.makeText(context, "Report copied to clipboard", Toast.LENGTH_SHORT).show()
     }
 
     Scaffold(
@@ -86,12 +124,14 @@ fun DiagnosticsScreen(navController: NavController) {
                 title = { Text("System Check") },
                 navigationIcon = { IconButton(onClick = { navController.popBackStack() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
                 actions = {
+                    IconButton(onClick = { copyReport() }) { Icon(Icons.Default.ContentCopy, "Copy Report") }
                     IconButton(onClick = {
                         permStatus = checkPermissions(context)
                         batteryStatus = checkBattery(context)
                         storageStatus = checkStorage(context)
                         audioFxStatus = checkAudioEffects()
                         audioRouteInfo = getAudioRoute(context)
+                        localIp = getLocalIpAddress()
                         scope.launch {
                             netStatus = "Checking..."
                             serverStatus = "Checking..."
@@ -105,15 +145,19 @@ fun DiagnosticsScreen(navController: NavController) {
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
 
+            // 0. DEVICE INFO (New)
+            Text(deviceInfo, style = MaterialTheme.typography.labelSmall, color = Color.Gray, modifier = Modifier.padding(bottom = 16.dp))
+
             // 1. SYSTEM HEALTH
             Text("System Health", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(8.dp))
             DiagnosticRow("Permissions", permStatus)
             DiagnosticRow("Battery Opt", batteryStatus)
             DiagnosticRow("Network", netStatus)
-            DiagnosticRow("Server API", serverStatus)
+            DiagnosticRow("Local IP", localIp) // NEW: Shows IP address
+            DiagnosticRow("Server API", serverStatus) // NEW: Shows Latency
             DiagnosticRow("Storage", storageStatus)
-            DiagnosticRow("Audio HW", audioFxStatus) // NEW
+            DiagnosticRow("Audio HW", audioFxStatus)
 
             HorizontalDivider(Modifier.padding(vertical = 24.dp))
 
@@ -265,17 +309,19 @@ fun DiagnosticRow(label: String, status: String) {
     }
 }
 
-// Updated for v4.0: Checks Mic, Notifications (A13+), and Nearby Devices (A13+)
+fun getDeviceDetails(context: Context): String {
+    return try {
+        val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+        "${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}) | v${pInfo.versionName}"
+    } catch (e: Exception) {
+        "Unknown Device"
+    }
+}
+
 fun checkPermissions(context: Context): String {
     val mic = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-
-    val notif = if (Build.VERSION.SDK_INT >= 33) {
-        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
-    } else true
-
-    val nearby = if (Build.VERSION.SDK_INT >= 33) {
-        ContextCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
-    } else true
+    val notif = if (Build.VERSION.SDK_INT >= 33) ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED else true
+    val nearby = if (Build.VERSION.SDK_INT >= 33) ContextCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED else true
 
     return when {
         !mic -> "Fail (Mic Denied)"
@@ -291,7 +337,6 @@ fun checkBattery(context: Context): String {
     return if (isIgnored) "OK (Unrestricted)" else "Warning (Restricted)"
 }
 
-// NEW: Checks for Hardware Audio Effects (Critical for Echo/Noise issues)
 fun checkAudioEffects(): String {
     val aec = AcousticEchoCanceler.isAvailable()
     val ns = NoiseSuppressor.isAvailable()
@@ -299,7 +344,6 @@ fun checkAudioEffects(): String {
     return "AEC:${if(aec) "✓" else "✗"} NS:${if(ns) "✓" else "✗"} AGC:${if(agc) "✓" else "✗"}"
 }
 
-// New: Verifies we can write to cache (Critical for Voice Pager)
 fun checkStorage(context: Context): String {
     return try {
         val file = File(context.cacheDir, "test_write.tmp")
@@ -319,15 +363,34 @@ fun checkNetwork(context: Context): String {
     return if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) "Connected (WiFi)" else "Connected (Mobile Data)"
 }
 
+fun getLocalIpAddress(): String {
+    try {
+        val en = NetworkInterface.getNetworkInterfaces()
+        while (en.hasMoreElements()) {
+            val intf = en.nextElement()
+            val enumIpAddr = intf.inetAddresses
+            while (enumIpAddr.hasMoreElements()) {
+                val inetAddress = enumIpAddr.nextElement()
+                if (!inetAddress.isLoopbackAddress && inetAddress is Inet4Address) {
+                    return inetAddress.hostAddress ?: "Unknown"
+                }
+            }
+        }
+    } catch (ex: Exception) { }
+    return "Not Found"
+}
+
 suspend fun checkServer(): String = withContext(Dispatchers.IO) {
     try {
+        val start = System.currentTimeMillis()
         val url = URL("https://signal.chinmoydas.in/api/auth.php")
         val conn = url.openConnection() as HttpURLConnection
         conn.requestMethod = "POST"
         conn.connectTimeout = 3000
         conn.connect()
+        val duration = System.currentTimeMillis() - start
         val code = conn.responseCode
-        if (code in 200..405) "OK (Reachable)" else "Fail (Error $code)"
+        if (code in 200..405) "OK ($duration ms)" else "Fail (Error $code)"
     } catch (e: Exception) {
         "Fail (Offline)"
     }

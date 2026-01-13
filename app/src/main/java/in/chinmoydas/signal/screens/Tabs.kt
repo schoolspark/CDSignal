@@ -58,7 +58,6 @@ fun TalkTab(
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsState()
 
-    // --- [GOLDEN BUILD] FIX: Listen to Hardware Service State ---
     val serviceState by service?.voiceServiceState?.collectAsState(initial = VoiceServiceState())
         ?: remember { mutableStateOf(VoiceServiceState()) }
 
@@ -151,7 +150,6 @@ fun TalkTab(
         Spacer(Modifier.height(40.dp))
 
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
-            // FIX: Use serviceState.incomingCall to detect receiving state
             if (serviceState.isTransmitting || serviceState.incomingCall != null || uiState is UiState.Receiving) {
                 IconButton(onClick = { viewModel.hangUp(service) }, modifier = Modifier.size(64.dp).background(Color.Red, CircleShape)) {
                     Icon(Icons.Default.CallEnd, "Hang Up", tint = Color.White)
@@ -165,7 +163,6 @@ fun TalkTab(
                     .size(240.dp)
                     .clip(CircleShape)
                     .background(
-                        // --- [GOLDEN BUILD] FIX: Use Hardware State for Color Sync ---
                         if (serviceState.isTransmitting) MaterialTheme.colorScheme.error
                         else MaterialTheme.colorScheme.primary
                     )
@@ -236,7 +233,6 @@ fun TalkTab(
     }
 }
 
-// ... (Rest of Tabs.kt remains same, History/Connect/Profile tabs are stable)
 @Composable
 fun HistoryTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
     val context = LocalContext.current
@@ -257,13 +253,10 @@ fun HistoryTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No recent activity", color = Color.Gray) }
         } else {
             LazyColumn(modifier = Modifier.fillMaxSize()) {
-
-                // --- UPDATED VOICE MESSAGES SECTION ---
                 if (recordedMessages.isNotEmpty()) {
                     item {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                             Text("Voice Messages", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
-                            // Delete All Button
                             TextButton(onClick = { viewModel.deleteAllRecordings(context) }) {
                                 Text("Delete All", color = MaterialTheme.colorScheme.error)
                             }
@@ -280,8 +273,6 @@ fun HistoryTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
                                     Text("From: $sender", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onErrorContainer)
                                     Text(sdf.format(Date(time)), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer)
                                 }
-
-                                // Play and Delete Buttons
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     IconButton(onClick = { viewModel.deleteRecording(file) }) {
                                         Icon(Icons.Default.Delete, "Delete", tint = MaterialTheme.colorScheme.onErrorContainer)
@@ -298,7 +289,6 @@ fun HistoryTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
                     }
                     item { HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp), thickness = 2.dp) }
                 }
-                // --------------------------------------
 
                 if (callLogs.isNotEmpty()) {
                     item { Text("Call History", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 8.dp)) }
@@ -334,16 +324,32 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
     var inputName by remember { mutableStateOf("") }
     var isGroupMode by remember { mutableStateOf(false) }
     var showChannelQrDialog by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
+
+    val filteredContacts = remember(searchQuery, viewModel.savedContacts) {
+        if (searchQuery.isBlank()) viewModel.savedContacts.toList()
+        else viewModel.savedContacts.filter { it.name.contains(searchQuery, ignoreCase = true) }
+    }
 
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         if (result.contents != null) {
             if (result.contents.startsWith("CHANNEL:")) {
                 val data = result.contents.removePrefix("CHANNEL:")
                 val parts = data.split("|")
-                if (parts.size > 1) { viewModel.saveInternetContact("group:${parts[0]}", parts[1], { Toast.makeText(context, "Channel Joined!", Toast.LENGTH_SHORT).show(); onConnected() }, {}) }
+                if (parts.size > 1) {
+                    viewModel.saveInternetContact("group:${parts[0]}", parts[1], {
+                        Toast.makeText(context, "Channel Joined!", Toast.LENGTH_SHORT).show()
+                        onConnected()
+                    }, {})
+                }
             } else {
                 val parts = result.contents.split("|")
-                if (parts.size > 1) { viewModel.setTarget(parts[0]); codeInput = parts[1]; isGroupMode = false; viewModel.saveInternetContact(parts[0], parts[1], { onConnected() }, {}) }
+                if (parts.size > 1) {
+                    viewModel.setTarget(parts[0])
+                    codeInput = parts[1]
+                    isGroupMode = false
+                    viewModel.saveInternetContact(parts[0], parts[1], { onConnected() }, {})
+                }
             }
         }
     }
@@ -351,57 +357,140 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
     LaunchedEffect(Unit) { viewModel.startLocalDiscovery(context) }
     DisposableEffect(Unit) { onDispose { viewModel.stopLocalDiscovery() } }
 
-    Column(modifier = modifier.fillMaxSize().padding(24.dp)) {
-        Text("Add Contact", style = MaterialTheme.typography.headlineMedium)
-        Spacer(Modifier.height(16.dp))
-        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-            SegmentedButton(selected = !isGroupMode, onClick = { isGroupMode = false }, shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2), icon = { Icon(Icons.Default.Person, null) }) { Text("Person") }
-            SegmentedButton(selected = isGroupMode, onClick = { isGroupMode = true }, shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2), icon = { Icon(Icons.Default.Groups, null) }) { Text("Channel") }
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(24.dp)
+    ) {
+
+        item {
+            OutlinedTextField(
+                value = searchQuery,
+                onValueChange = { searchQuery = it },
+                placeholder = { Text("Search contacts...") },
+                leadingIcon = { Icon(Icons.Default.Search, null) },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                singleLine = true
+            )
         }
-        Spacer(Modifier.height(16.dp))
-        Card(onClick = { scanLauncher.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE)) }, modifier = Modifier.fillMaxWidth().height(64.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Row { Icon(Icons.Default.QrCodeScanner, null); Spacer(Modifier.width(8.dp)); Text("Scan QR Code") } } }
-        Spacer(Modifier.height(16.dp))
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(value = inputName, onValueChange = { inputName = it }, label = { Text(if (isGroupMode) "Channel Name" else "Username") }, modifier = Modifier.weight(0.6f), singleLine = true)
-            Spacer(Modifier.width(8.dp))
-            OutlinedTextField(value = codeInput, onValueChange = { if(it.length <= 8) codeInput = it }, label = { Text(if (isGroupMode) "Passkey" else "PIN") }, modifier = Modifier.weight(0.35f), singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = if (isGroupMode) KeyboardType.Text else KeyboardType.Number))
-            Spacer(Modifier.width(8.dp))
-            Button(onClick = { val finalName = if (isGroupMode) "group:$inputName" else inputName; viewModel.saveInternetContact(finalName, codeInput, { Toast.makeText(context, "Saved!", Toast.LENGTH_SHORT).show(); inputName = ""; codeInput = "" }, { Toast.makeText(context, "Failed", Toast.LENGTH_SHORT).show() }) }, contentPadding = PaddingValues(0.dp), modifier = Modifier.size(56.dp), shape = RoundedCornerShape(12.dp)) { Icon(Icons.Default.Save, null) }
-        }
-        Spacer(Modifier.height(24.dp))
-        if (viewModel.nearbyUsers.isNotEmpty()) {
-            Text("Nearby Devices", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
-            LazyColumn(modifier = Modifier.height(120.dp)) {
-                items(viewModel.nearbyUsers) { user ->
-                    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
-                        Row(Modifier.padding(8.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                            Column { Text(user.name, fontWeight = FontWeight.Bold); Text(user.ip, style = MaterialTheme.typography.bodySmall) }
-                            Button(onClick = { viewModel.addContact(user.name, user.ip, ""); onConnected() }) { Text("Connect") }
+
+        if (filteredContacts.isNotEmpty()) {
+            item {
+                Column {
+                    Text("Speed Dial", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.height(8.dp))
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                        items(filteredContacts) { contact ->
+                            val isGroup = contact.name.startsWith("group:")
+                            val displayName = if (isGroup) contact.name.substringAfter(":") else contact.name
+                            var showMenu by remember { mutableStateOf(false) }
+
+                            ElevatedCard(
+                                onClick = { viewModel.setTarget(contact.name); onConnected() },
+                                colors = CardDefaults.elevatedCardColors(
+                                    containerColor = if (viewModel.targetUser == contact.name) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
+                                )
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp).widthIn(min = 80.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Box {
+                                        Icon(if (isGroup) Icons.Default.Groups else Icons.Default.Person, null, modifier = Modifier.size(32.dp), tint = MaterialTheme.colorScheme.primary)
+                                        Box(Modifier.matchParentSize().pointerInput(Unit) { detectTapGestures(onLongPress = { showMenu = true }) { viewModel.setTarget(contact.name); onConnected() } })
+                                    }
+                                    Spacer(Modifier.height(8.dp))
+                                    Text(displayName, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+
+                                    DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                                        DropdownMenuItem(text = { Text("Delete") }, onClick = { viewModel.deleteContact(contact.name); showMenu = false }, leadingIcon = { Icon(Icons.Default.Delete, null) })
+                                        if (isGroup) {
+                                            DropdownMenuItem(text = { Text("Share QR") }, onClick = { viewModel.generateChannelQr(contact.name, contact.savedCode); showChannelQrDialog = true; showMenu = false }, leadingIcon = { Icon(Icons.Default.QrCode, null) })
+                                        } else {
+                                            DropdownMenuItem(text = { Text("Block") }, onClick = { viewModel.blockContact(contact.name); showMenu = false }, leadingIcon = { Icon(Icons.Default.Block, null, tint = Color.Red) })
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-        Spacer(Modifier.height(16.dp))
-        Text("My Contacts", style = MaterialTheme.typography.titleSmall)
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(vertical = 8.dp)) {
-            items(viewModel.savedContacts) { contact ->
-                val isGroup = contact.name.startsWith("group:")
-                val displayName = if (isGroup) contact.name.substringAfter(":") else contact.name
-                var showMenu by remember { mutableStateOf(false) }
-                Box {
-                    InputChip(selected = viewModel.targetUser == contact.name, onClick = { viewModel.setTarget(contact.name); onConnected() }, label = { Text(displayName) }, avatar = { Icon(if (isGroup) Icons.Default.Groups else Icons.Default.Person, null) }, trailingIcon = { IconButton(onClick = { showMenu = true }, modifier = Modifier.size(18.dp)) { Icon(Icons.Default.ArrowDropDown, null) } })
-                    DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
-                        DropdownMenuItem(text = { Text("Delete") }, onClick = { viewModel.deleteContact(contact.name); showMenu = false }, leadingIcon = { Icon(Icons.Default.Delete, null) })
-                        if (isGroup) { DropdownMenuItem(text = { Text("Share Channel QR") }, onClick = { viewModel.generateChannelQr(contact.name, contact.savedCode); showChannelQrDialog = true; showMenu = false }, leadingIcon = { Icon(Icons.Default.QrCode, null) }) }
-                        else { DropdownMenuItem(text = { Text("Block") }, onClick = { viewModel.blockContact(contact.name); showMenu = false; Toast.makeText(context, "Blocked", Toast.LENGTH_SHORT).show() }, leadingIcon = { Icon(Icons.Default.Block, null, tint = Color.Red) }) }
+
+        item {
+            Column {
+                Text("Add New Connection", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)), shape = RoundedCornerShape(16.dp)) {
+                    Column(Modifier.padding(16.dp)) {
+                        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                            SegmentedButton(selected = !isGroupMode, onClick = { isGroupMode = false }, shape = RoundedCornerShape(topStart = 12.dp, bottomStart = 12.dp), icon = { Icon(Icons.Default.Person, null) }) { Text("Person") }
+                            SegmentedButton(selected = isGroupMode, onClick = { isGroupMode = true }, shape = RoundedCornerShape(topEnd = 12.dp, bottomEnd = 12.dp), icon = { Icon(Icons.Default.Groups, null) }) { Text("Channel") }
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            OutlinedTextField(
+                                value = inputName,
+                                onValueChange = { inputName = it },
+                                label = { Text(if (isGroupMode) "Channel Name" else "Username") },
+                                modifier = Modifier.weight(1f),
+                                singleLine = true,
+                                trailingIcon = { IconButton(onClick = { scanLauncher.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE)) }) { Icon(Icons.Default.QrCodeScanner, "Scan", tint = MaterialTheme.colorScheme.primary) } }
+                            )
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            OutlinedTextField(value = codeInput, onValueChange = { if (it.length <= 8) codeInput = it }, label = { Text(if (isGroupMode) "Passkey" else "User PIN") }, modifier = Modifier.weight(1f), singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = if (isGroupMode) KeyboardType.Text else KeyboardType.Number))
+                            Spacer(Modifier.width(8.dp))
+                            Button(
+                                enabled = inputName.isNotBlank() && codeInput.isNotBlank(),
+                                onClick = {
+                                    val finalName = if (isGroupMode) "group:$inputName" else inputName
+                                    if (finalName.isNotBlank() && codeInput.isNotBlank()) {
+                                        viewModel.saveInternetContact(finalName, codeInput, { Toast.makeText(context, "Saved!", Toast.LENGTH_SHORT).show(); inputName = ""; codeInput = "" }, { Toast.makeText(context, "Connection Failed", Toast.LENGTH_SHORT).show() })
+                                    }
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.height(56.dp)
+                            ) { Text("Add"); Spacer(Modifier.width(4.dp)); Icon(Icons.Default.AddLink, null) }
+                        }
                     }
                 }
             }
         }
+
+        item {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.WifiTethering, null, tint = MaterialTheme.colorScheme.secondary, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Nearby Devices (Local Network)", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.secondary)
+            }
+        }
+
+        if (viewModel.nearbyUsers.isNotEmpty()) {
+            items(viewModel.nearbyUsers) { user ->
+                Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                    Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Column { Text(user.name, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyLarge); Text(user.ip, style = MaterialTheme.typography.labelSmall, color = Color.Gray) }
+                        FilledTonalButton(onClick = { viewModel.addContact(user.name, user.ip, ""); onConnected() }) { Text("Connect") }
+                    }
+                }
+            }
+        } else {
+            item {
+                Box(Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) { CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp, color = Color.LightGray); Spacer(Modifier.height(8.dp)); Text("Scanning local network...", style = MaterialTheme.typography.bodySmall, color = Color.Gray) }
+                }
+            }
+        }
     }
+
     if (showChannelQrDialog) {
-        AlertDialog(onDismissRequest = { showChannelQrDialog = false }, title = { Text("Channel Frequency") }, text = { Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) { Text(viewModel.sharingChannelName, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Spacer(Modifier.height(16.dp)); viewModel.channelQrBitmap?.let { Image(bitmap = it.asImageBitmap(), contentDescription = "Channel QR", modifier = Modifier.size(200.dp)) } } }, confirmButton = { TextButton(onClick = { showChannelQrDialog = false }) { Text("Close") } })
+        AlertDialog(
+            onDismissRequest = { showChannelQrDialog = false },
+            title = { Text("Channel Frequency") },
+            text = { Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) { Text(viewModel.sharingChannelName, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Spacer(Modifier.height(16.dp)); viewModel.channelQrBitmap?.let { Image(bitmap = it.asImageBitmap(), contentDescription = "Channel QR", modifier = Modifier.size(200.dp)) } } },
+            confirmButton = { TextButton(onClick = { showChannelQrDialog = false }) { Text("Close") } }
+        )
     }
 }
 
