@@ -22,6 +22,7 @@ import android.os.*
 import android.support.v4.media.session.MediaSessionCompat
 import android.view.KeyEvent
 import android.util.Log
+import android.widget.Toast
 import androidx.annotation.RequiresPermission
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
@@ -218,7 +219,11 @@ class VoiceService : Service() {
                         Log.e(tag, "Headset PTT failed: Permission missing")
                     }
                 } else {
-                    triggerHeartbeat()
+                    // Even if we don't have an IP, try to signal the server
+                    if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                        vibrate()
+                        startTalk(if(ip != null) listOf(ip) else emptyList(), UDP_PORT)
+                    }
                 }
             }
         }
@@ -313,7 +318,7 @@ class VoiceService : Service() {
         return START_STICKY
     }
 
-    // --- NEW: SIGNALING LOOP FOR HOLE PUNCHING ---
+    // --- SIGNALING LOOP FOR HOLE PUNCHING & INTERRUPTIONS ---
     private fun startSignalLoop() {
         signalingJob?.cancel()
         signalingJob = scope.launch {
@@ -324,9 +329,31 @@ class VoiceService : Service() {
                         val response = RetrofitClient.api.checkSignals("Bearer $token")
                         val callers = response.callers
                         if (!callers.isNullOrEmpty()) {
+
+                            // [NEW] CHECK FOR INTERRUPTIONS (Remote Hangup)
+                            if (isSending) {
+                                // If I am talking, and I receive a signal from the person I am talking to,
+                                // they are pressing "Hang Up" to interrupt me.
+                                val interrupter = callers.firstOrNull { caller ->
+                                    val ip = activeIpCache[caller]
+                                    // Check if this caller matches our target IP OR target username
+                                    (ip != null && activeTargets.contains(ip)) ||
+                                            (repository.getTargetUser() == caller)
+                                }
+
+                                if (interrupter != null) {
+                                    Log.w(tag, "Remote Hangup Received from $interrupter")
+                                    stopTalk() // <--- KILL SWITCH
+
+                                    withContext(Dispatchers.Main) {
+                                        Toast.makeText(applicationContext, "Call ended by $interrupter", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            }
+
+                            // Normal Hole Punch Logic (Only if receiving or idle)
                             val contacts = repository.getAllContacts()
                             callers.forEach { caller ->
-                                // Hole Punch: Someone is calling me. Send packets to them NOW.
                                 val ip = activeIpCache[caller]
                                     ?: contacts.find { it.name == caller }?.ip
 
@@ -340,7 +367,7 @@ class VoiceService : Service() {
                         // Ignore harmless poll errors
                     }
                 }
-                delay(3000) // Poll every 3 seconds (Low bandwidth)
+                delay(2000) // Polling every 2s for better interrupt responsiveness
             }
         }
     }
@@ -359,7 +386,6 @@ class VoiceService : Service() {
             val buf = ByteArray(1 + signalBytes.size + 4)
             buf[0] = signalBytes.size.toByte()
             System.arraycopy(signalBytes, 0, buf, 1, signalBytes.size)
-            // Burst of 3 packets to punch hole
             repeat(3) { networkEngine.send(buf, listOf(ip), UDP_PORT); delay(20) }
         }
     }
@@ -432,12 +458,9 @@ class VoiceService : Service() {
 
             if (payloadLen > 0) {
                 val payload = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
-
-                // --- DIRECT PLAYBACK (Raw PCM) ---
                 if (!isSilenced) { try { audioEngine.writeAudio(seqNum, payload) } catch (e: Exception) {} }
                 if (isRecordingEnabled) { synchronized(bufferLock) { try { incomingBuffer.write(payload) } catch (t: Throwable) {} } }
 
-                // [FIX] Audio received = Connection is ALIVE! Turn Green immediately.
                 _voiceServiceState.update { it.copy(lastPingResponse = System.currentTimeMillis()) }
             }
         }
@@ -477,30 +500,48 @@ class VoiceService : Service() {
         }
     }
 
+    // [NEW] FUNCTION TO SEND A REMOTE HANGUP SIGNAL
+    fun sendRemoteHangup() {
+        val target = _voiceServiceState.value.incomingCall
+
+        // Always stop receiving locally first
+        stopReceiving()
+
+        if (!target.isNullOrBlank() && !target.startsWith("group:")) {
+            scope.launch(Dispatchers.IO) {
+                try {
+                    val token = repository.getToken()
+                    if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
+                        Log.d(tag, "Sending Remote Hangup to $target")
+                        // Fire 'hangup' signal to server (requires updated signal.php)
+                        RetrofitClient.api.sendSignal("Bearer $token", "hangup", target)
+                    }
+                } catch (e: Exception) {
+                    Log.e(tag, "Failed to send remote hangup", e)
+                }
+            }
+        }
+    }
+
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     fun startTalk(ips: List<String>, port: Int) {
         if (isSending) return
 
-        // --- FIX: TRIGGER SIGNALING HERE (Works for UI & Headset) ---
-        val currentTarget = repository.getTargetUser()
+        val targetUser = repository.getTargetUser()
 
-        // Only signal if we have a specific target (not a broadcast/channel)
-        // AND we are not just talking to ourselves
-        if (ips.isNotEmpty() && currentTarget.isNotBlank() && !currentTarget.startsWith("group:")) {
+        if (targetUser.isNotBlank() && !targetUser.startsWith("group:")) {
             scope.launch(Dispatchers.IO) {
                 try {
                     val token = repository.getToken()
-                    // Don't signal if we are in Offline/LAN mode
                     if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
-                        Log.d(tag, "Signaling: Sending call request to $currentTarget")
-                        RetrofitClient.api.sendSignal("Bearer $token", "call_request", currentTarget)
+                        Log.d(tag, "Signaling: Sending call request to $targetUser")
+                        RetrofitClient.api.sendSignal("Bearer $token", "call_request", targetUser)
                     }
                 } catch (e: Exception) {
-                    Log.e(tag, "Signaling: Failed to send request", e)
+                    Log.e(tag, "Signaling failed", e)
                 }
             }
         }
-        // -----------------------------------------------------------
 
         acquireResources(forceAudio = true)
         isSending = true

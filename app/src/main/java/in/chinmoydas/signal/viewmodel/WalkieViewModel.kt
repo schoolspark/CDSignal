@@ -357,10 +357,24 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         onStop()
     }
 
+    // [UPDATED] REMOTE HANGUP LOGIC
     fun hangUp(service: VoiceService?) {
         _uiState.value = if (targetUser.isNotEmpty()) UiState.Connected(targetUser) else UiState.Ready
-        service?.stopReceiving()
-        service?.stopTalk()
+
+        if (service == null) return
+
+        val state = service.voiceServiceState.value
+
+        if (state.isTransmitting) {
+            // If I am talking, just stop talking
+            service.stopTalk()
+        } else if (state.incomingCall != null) {
+            // If I am listening, SEND A SIGNAL to shut them up!
+            service.sendRemoteHangup()
+        } else {
+            // Default cleanup
+            service.stopReceiving()
+        }
     }
 
     fun onReceptionStarted(from: String, ip: String) {
