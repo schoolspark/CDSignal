@@ -13,3 +13,10 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Ignore release builds
+/release/
+*.aab
+*.apk
+*.dm
+output-metadata.json
