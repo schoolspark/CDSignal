@@ -553,19 +553,30 @@ class VoiceService : Service() {
         lastPort = port
         updateState()
 
-        // [MODIFIED] SMART LOGIC:
-        // Compress if: NOT on WiFi AND Data Saver is ON
-        // Otherwise (WiFi or Saver OFF), use High Quality.
+        // [MODIFIED] SMART GROUP COMPRESSION LOGIC
         val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
         dataSaverEnabled = prefs.getBoolean("data_saver", false)
-        val shouldCompress = !isOnWifi && dataSaverEnabled
 
-        scope.launch { repository.insertLog(if (ips.size > 1) "Group Broadcast" else "PTT Call", false) }
+        // 1. Check if this is a Group Call (More than 1 target IP)
+        val isGroupCall = ips.size > 1
+
+        // 2. Determine Compression Rule:
+        // - IF Group Call: ALWAYS Compress (Saves critical upload bandwidth).
+        // - IF 1-on-1: Compress only if on Mobile Data AND Data Saver is ON.
+        val shouldCompress = isGroupCall || (!isOnWifi && dataSaverEnabled)
+
+        if (isGroupCall) {
+            Log.d(tag, "Group Call detected (${ips.size} targets). Forcing Compression.")
+        } else {
+            Log.d(tag, "1-on-1 Call. Compression: $shouldCompress")
+        }
+
+        scope.launch { repository.insertLog(if (isGroupCall) "Group Broadcast" else "PTT Call", false) }
 
         val nameBytes = myUsername.toByteArray()
         val headerLen = 1 + nameBytes.size + 4
 
-        // [MODIFIED] Pass detection result to AudioEngine
+        // Pass the smart 'shouldCompress' flag to AudioEngine
         audioEngine.startRecording(shouldCompress) { rawBuffer ->
             val payload = rawBuffer
             val sendBuf = ByteArray(headerLen + payload.size)
