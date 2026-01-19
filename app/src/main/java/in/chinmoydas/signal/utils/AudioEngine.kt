@@ -148,12 +148,10 @@ class AudioEngine(context: Context) {
                         }
 
                         if (maxAmplitude > NOISE_GATE_THRESHOLD) {
-                            // [MODIFIED] Direct Encoding
+                            // [CORRECT] Passing 'pcmBuffer' (Shorts) directly to G711
                             val finalData = if (isCompressionEnabled) {
-                                // Pass the ShortArray directly! No ShortToByte needed for G.711.
                                 G711.encode(pcmBuffer, readSize)
                             } else {
-                                // Only convert to bytes if sending Raw Audio
                                 ShortToByte(pcmBuffer, readSize)
                             }
 

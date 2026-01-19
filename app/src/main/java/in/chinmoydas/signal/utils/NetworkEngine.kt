@@ -25,7 +25,6 @@ class NetworkEngine(private val port: Int) {
         try {
             socket = DatagramSocket(port).apply {
                 reuseAddress = true
-                // [MODIFIED] Smaller buffer for G.711 packets
                 receiveBufferSize = 64 * 1024
                 soTimeout = 0
             }
@@ -75,7 +74,6 @@ class NetworkEngine(private val port: Int) {
         }
     }
 
-    // [MODIFIED] Allows VoiceService to send STUN requests without queuing
     fun sendRawPacket(packet: DatagramPacket) {
         if (!isRunning.get()) return
         try { socket?.send(packet) } catch (e: Exception) { }

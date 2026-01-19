@@ -29,6 +29,7 @@ import androidx.core.app.NotificationCompat
 import androidx.media.session.MediaButtonReceiver
 import `in`.chinmoydas.signal.data.MainRepository
 import `in`.chinmoydas.signal.utils.AudioEngine
+import `in`.chinmoydas.signal.utils.CryptoEngine
 import `in`.chinmoydas.signal.utils.LocalLinkManager
 import `in`.chinmoydas.signal.utils.NetworkEngine
 import `in`.chinmoydas.signal.utils.StunClient
@@ -472,7 +473,26 @@ class VoiceService : Service() {
             handleIncomingSignal(senderName)
 
             if (payloadLen > 0) {
-                val payload = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
+                var payload = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
+
+                // --- DECRYPTION BLOCK ---
+                val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
+                val isSecureMode = prefs.getBoolean("secure_mode", false)
+
+                if (isSecureMode) {
+                    val secretKey = CryptoEngine.deriveKey(currentChannelKey)
+                    // Attempt to decrypt using the Packet's Sequence Number
+                    val decrypted = CryptoEngine.decrypt(payload, seqNum, secretKey)
+
+                    if (decrypted != null) {
+                        payload = decrypted // Success! Play clear audio.
+                    }
+                    // If 'decrypted' is null, we play the original 'payload'.
+                    // Since it is encrypted, it will sound like STATIC noise.
+                    // This tells the user: "Encrypted signal received but I can't read it."
+                }
+                // ------------------------
+
                 if (!isSilenced) { try { audioEngine.writeAudio(seqNum, payload) } catch (e: Exception) {} }
                 if (isRecordingEnabled) { synchronized(bufferLock) { try { incomingBuffer.write(payload) } catch (t: Throwable) {} } }
 
@@ -553,37 +573,41 @@ class VoiceService : Service() {
         lastPort = port
         updateState()
 
-        // [MODIFIED] SMART GROUP COMPRESSION LOGIC
+        // --- OPTION 1 & 3: CONFIGURATION ---
         val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
+
+        // 1. Smart Compression Logic
         dataSaverEnabled = prefs.getBoolean("data_saver", false)
-
-        // 1. Check if this is a Group Call (More than 1 target IP)
         val isGroupCall = ips.size > 1
-
-        // 2. Determine Compression Rule:
-        // - IF Group Call: ALWAYS Compress (Saves critical upload bandwidth).
-        // - IF 1-on-1: Compress only if on Mobile Data AND Data Saver is ON.
         val shouldCompress = isGroupCall || (!isOnWifi && dataSaverEnabled)
 
-        if (isGroupCall) {
-            Log.d(tag, "Group Call detected (${ips.size} targets). Forcing Compression.")
-        } else {
-            Log.d(tag, "1-on-1 Call. Compression: $shouldCompress")
-        }
+        // 2. Secure Mode Logic
+        val isSecureMode = prefs.getBoolean("secure_mode", false)
+        // If Secure Mode is ON, generate the key from the Channel Password
+        val secretKey = if (isSecureMode) CryptoEngine.deriveKey(currentChannelKey) else null
+
+        if (isSecureMode) Log.i(tag, "Starting SECURE transmission")
 
         scope.launch { repository.insertLog(if (isGroupCall) "Group Broadcast" else "PTT Call", false) }
 
         val nameBytes = myUsername.toByteArray()
         val headerLen = 1 + nameBytes.size + 4
 
-        // Pass the smart 'shouldCompress' flag to AudioEngine
         audioEngine.startRecording(shouldCompress) { rawBuffer ->
-            val payload = rawBuffer
-            val sendBuf = ByteArray(headerLen + payload.size)
+            // --- ENCRYPTION BLOCK ---
+            // If Secure Mode is ON, try to encrypt. If it fails, fallback to raw.
+            val payloadToSend = if (isSecureMode && secretKey != null) {
+                CryptoEngine.encrypt(rawBuffer, currentSequenceNumber, secretKey) ?: rawBuffer
+            } else {
+                rawBuffer
+            }
+            // ------------------------
+
+            val sendBuf = ByteArray(headerLen + payloadToSend.size)
             sendBuf[0] = nameBytes.size.toByte()
             System.arraycopy(nameBytes, 0, sendBuf, 1, nameBytes.size)
             ByteBuffer.wrap(sendBuf, 1 + nameBytes.size, 4).putInt(currentSequenceNumber++)
-            System.arraycopy(payload, 0, sendBuf, headerLen, payload.size)
+            System.arraycopy(payloadToSend, 0, sendBuf, headerLen, payloadToSend.size)
             networkEngine.send(sendBuf, activeTargets, port)
         }
     }

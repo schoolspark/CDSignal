@@ -551,6 +551,46 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
 
         Spacer(Modifier.height(16.dp))
 
+        // [NEW] Secure Channel Toggle
+        // Reads/Writes "secure_mode" to SharedPrefs
+        var isSecureMode by remember {
+            mutableStateOf(context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE).getBoolean("secure_mode", false))
+        }
+
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha=0.5f)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Security, null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Secure Channel (Encryption)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    }
+                    Text(
+                        if (isSecureMode) "Audio is encrypted using your Channel Key." else "Standard transmission (Raw Audio).",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = isSecureMode,
+                    onCheckedChange = {
+                        isSecureMode = it
+                        context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
+                            .edit().putBoolean("secure_mode", it).apply()
+                    }
+                )
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
         OutlinedButton(onClick = { showBlockedDialog = true }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.PrivacyTip, null); Spacer(Modifier.width(8.dp)); Text("Privacy: Blocked Users") }
         Spacer(Modifier.height(16.dp))
         OutlinedButton(onClick = { navController.navigate("diagnostics") }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Build, null); Spacer(Modifier.width(8.dp)); Text("Run System Diagnostics") }
