@@ -7,22 +7,15 @@ import java.net.InetAddress
 import java.net.SocketException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * Robust Network Engine for UDP communication.
- * Enhanced with Address Caching to prevent micro-stutters during multi-user broadcasts.
- */
 class NetworkEngine(private val port: Int) {
     private val tag = "NetworkEngine"
     private var socket: DatagramSocket? = null
     private val isRunning = AtomicBoolean(false)
     private val sendQueue = LinkedBlockingQueue<DatagramPacket>(200)
 
-    // Cache for InetAddresses to avoid frequent DNS/Address lookups
     private val addressCache = ConcurrentHashMap<String, InetAddress>()
-
     private var senderThread: Thread? = null
     private var receiverThread: Thread? = null
 
@@ -32,7 +25,8 @@ class NetworkEngine(private val port: Int) {
         try {
             socket = DatagramSocket(port).apply {
                 reuseAddress = true
-                receiveBufferSize = 128 * 1024
+                // [MODIFIED] Smaller buffer for G.711 packets
+                receiveBufferSize = 64 * 1024
                 soTimeout = 0
             }
             Log.d(tag, "Socket started on port $port")
@@ -47,18 +41,10 @@ class NetworkEngine(private val port: Int) {
                 while (isRunning.get()) {
                     val packet = sendQueue.take()
                     if (packet != null) {
-                        try {
-                            socket?.send(packet)
-                        } catch (e: Exception) {
-                            if (isRunning.get()) Log.e(tag, "Send failed: ${e.message}")
-                        }
+                        try { socket?.send(packet) } catch (e: Exception) { }
                     }
                 }
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
-            } catch (e: Exception) {
-                Log.e(tag, "Sender thread crashed: ${e.message}")
-            }
+            } catch (e: Exception) { }
         }, "NetworkSender").apply { start() }
 
         receiverThread = Thread({
@@ -71,32 +57,28 @@ class NetworkEngine(private val port: Int) {
                         val dataCopy = packet.data.copyOf(packet.length)
                         val receivePacket = DatagramPacket(dataCopy, dataCopy.size, packet.address, packet.port)
                         onPacketReceived(receivePacket)
-                    } catch (e: Exception) {
-                        if (isRunning.get()) Log.e(tag, "Receive error: ${e.message}")
-                    }
+                    } catch (e: Exception) { }
                 }
-            } catch (e: Exception) {
-                if (isRunning.get()) Log.e(tag, "Receiver thread crashed: ${e.message}")
-            }
+            } catch (e: Exception) { }
         }, "NetworkReceiver").apply { start() }
         return true
     }
 
     fun send(data: ByteArray, targets: List<String>, targetPort: Int) {
         if (!isRunning.get()) return
-
         for (ip in targets) {
             try {
-                // Use cache to avoid blocking the audio recording thread with lookups
                 val address = addressCache.getOrPut(ip) { InetAddress.getByName(ip) }
                 val packet = DatagramPacket(data, data.size, address, targetPort)
-                if (!sendQueue.offer(packet)) {
-                    Log.w(tag, "Send queue full, dropping packet to $ip")
-                }
-            } catch (e: Exception) {
-                Log.e(tag, "Failed to queue packet for $ip: ${e.message}")
-            }
+                sendQueue.offer(packet)
+            } catch (e: Exception) { }
         }
+    }
+
+    // [MODIFIED] Allows VoiceService to send STUN requests without queuing
+    fun sendRawPacket(packet: DatagramPacket) {
+        if (!isRunning.get()) return
+        try { socket?.send(packet) } catch (e: Exception) { }
     }
 
     fun stop() {

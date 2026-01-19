@@ -2,6 +2,7 @@ package `in`.chinmoydas.signal.screens
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.Context
 import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -499,6 +500,12 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
     val context = LocalContext.current
     var showBlockedDialog by remember { mutableStateOf(false) }
     val myCode by viewModel.myPairingCode.collectAsState()
+
+    // [NEW] Data Saver State
+    var isDataSaver by remember {
+        mutableStateOf(context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE).getBoolean("data_saver", false))
+    }
+
     LaunchedEffect(myCode) { if (myCode.isNotBlank()) viewModel.qrBitmap = viewModel.generateQr("$myName|$myCode") }
 
     Column(modifier = modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Top) {
@@ -510,7 +517,40 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
                 Spacer(Modifier.height(16.dp)); viewModel.qrBitmap?.let { Image(bitmap = it.asImageBitmap(), contentDescription = "QR", modifier = Modifier.size(180.dp)) }
             }
         }
+
         Spacer(Modifier.height(16.dp))
+
+        // [NEW] Data Saver Toggle Card
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha=0.5f)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Data Saver Mode (4G)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    Text(
+                        if (isDataSaver) "Audio compressed on mobile data." else "High Quality Audio on all networks.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = isDataSaver,
+                    onCheckedChange = {
+                        isDataSaver = it
+                        context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
+                            .edit().putBoolean("data_saver", it).apply()
+                    }
+                )
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
         OutlinedButton(onClick = { showBlockedDialog = true }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.PrivacyTip, null); Spacer(Modifier.width(8.dp)); Text("Privacy: Blocked Users") }
         Spacer(Modifier.height(16.dp))
         OutlinedButton(onClick = { navController.navigate("diagnostics") }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Build, null); Spacer(Modifier.width(8.dp)); Text("Run System Diagnostics") }

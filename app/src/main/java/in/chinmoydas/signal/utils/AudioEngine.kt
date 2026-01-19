@@ -18,57 +18,37 @@ import kotlin.math.abs
 
 class AudioEngine(context: Context) {
     private val tag = "AudioEngine"
-
-    // [Golden Build] Standard Wideband Voice (16kHz)
     private val sampleRate = 16000
 
-    // --- AUDIO HARDWARE ---
     @Volatile private var audioTrack: AudioTrack? = null
     @Volatile private var audioRecord: AudioRecord? = null
 
-    // --- AUDIO EFFECTS ---
+    // [NEW] Flag for session compression
+    @Volatile var isCompressionEnabled: Boolean = false
+
     private var aec: AcousticEchoCanceler? = null
     private var ns: NoiseSuppressor? = null
     private var agc: AutomaticGainControl? = null
 
-    // --- THREADING ---
     private var recordingThread: Thread? = null
     private var playbackThread: Thread? = null
     private val isRecording = AtomicBoolean(false)
     private val isPlaying = AtomicBoolean(false)
 
-    // --- JITTER BUFFER ---
     private data class AudioPacket(val seq: Int, val data: ByteArray) : Comparable<AudioPacket> {
         override fun compareTo(other: AudioPacket) = this.seq - other.seq
-        override fun equals(other: Any?): Boolean {
-            if (this === other) return true
-            if (javaClass != other?.javaClass) return false
-            other as AudioPacket
-            return seq == other.seq && data.contentEquals(other.data)
-        }
-        override fun hashCode(): Int {
-            var result = seq
-            result = 31 * result + data.contentHashCode()
-            return result
-        }
+        override fun equals(other: Any?) = other is AudioPacket && seq == other.seq && data.contentEquals(other.data)
+        override fun hashCode() = 31 * seq + data.contentHashCode()
     }
     private val jitterBuffer = PriorityQueue<AudioPacket>()
     private var lastPlayedSeq = -1
     private val BUFFER_THRESHOLD = 3
-
-    // --- CONFIG ---
-    // 640 shorts = 40ms at 16kHz (Standard PTT Frame)
     private val FRAME_SIZE = 640
-    private val NOISE_GATE_THRESHOLD = 150 // Was 50
-    private val GAIN_LIMIT_THRESHOLD = 28000 // Was 30000 (Provides headroom)
-
-    // =========================================================================
-    // PLAYBACK LOGIC
-    // =========================================================================
+    private val NOISE_GATE_THRESHOLD = 150
+    private val GAIN_LIMIT_THRESHOLD = 28000
 
     fun startPlayback() {
         if (isPlaying.get() || audioTrack != null) return
-
         try {
             val minBufSize = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
             audioTrack = AudioTrack.Builder()
@@ -77,18 +57,13 @@ class AudioEngine(context: Context) {
                 .setBufferSizeInBytes(minBufSize * 2)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
-
             audioTrack?.play()
             startPlaybackThread()
-            Log.d(tag, "Playback started at $sampleRate Hz.")
-        } catch (e: Exception) {
-            Log.e(tag, "Playback initialization failed", e)
-        }
+        } catch (e: Exception) { Log.e(tag, "Playback init failed", e) }
     }
 
     private fun startPlaybackThread() {
         if (!isPlaying.compareAndSet(false, true)) return
-
         synchronized(jitterBuffer) { jitterBuffer.clear() }
         lastPlayedSeq = -1
 
@@ -99,67 +74,55 @@ class AudioEngine(context: Context) {
                     var packetToPlay: AudioPacket? = null
                     synchronized(jitterBuffer) {
                         if (jitterBuffer.isNotEmpty()) {
-                            if (lastPlayedSeq != -1 || jitterBuffer.size >= BUFFER_THRESHOLD) {
-                                packetToPlay = jitterBuffer.poll()
-                            }
+                            if (lastPlayedSeq != -1 || jitterBuffer.size >= BUFFER_THRESHOLD) packetToPlay = jitterBuffer.poll()
                         }
                     }
 
                     if (packetToPlay != null) {
-                        if (lastPlayedSeq != -1 && (packetToPlay.seq < lastPlayedSeq || packetToPlay.seq > lastPlayedSeq + 500)) {
-                            lastPlayedSeq = packetToPlay.seq - 1
-                        }
-
+                        if (lastPlayedSeq != -1 && (packetToPlay.seq < lastPlayedSeq || packetToPlay.seq > lastPlayedSeq + 500)) lastPlayedSeq = packetToPlay.seq - 1
                         if (packetToPlay.seq > lastPlayedSeq) {
                             val data = packetToPlay.data
                             audioTrack?.write(data, 0, data.size)
                             lastPlayedSeq = packetToPlay.seq
                         }
-                    } else {
-                        Thread.sleep(2)
-                    }
+                    } else { Thread.sleep(2) }
                 }
-            } catch (e: Exception) {
-                // Ignore interruption
-            }
+            } catch (e: Exception) { }
         }, "AudioPlaybackThread").apply { start() }
     }
 
     fun writeAudio(seq: Int, data: ByteArray) {
         if (!isPlaying.get()) return
+
+        // [MODIFIED] SMART AUTO-DETECTION
+        // 640 bytes = Compressed (G.711). 1280 bytes = Raw (PCM).
+        val pcmData = if (data.size == FRAME_SIZE) {
+            G711.decode(data, data.size)
+        } else {
+            data // Treat as Raw
+        }
+
         synchronized(jitterBuffer) {
             if (jitterBuffer.size > 50) jitterBuffer.clear()
-            jitterBuffer.offer(AudioPacket(seq, data))
+            jitterBuffer.offer(AudioPacket(seq, pcmData))
         }
     }
 
-    // =========================================================================
-    // RECORDING LOGIC
-    // =========================================================================
-
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
-    fun startRecording(onDataReady: (ByteArray) -> Unit) {
+    fun startRecording(useCompression: Boolean, onDataReady: (ByteArray) -> Unit) {
         if (isRecording.get() || audioRecord != null) return
+
+        isCompressionEnabled = useCompression
+        Log.d(tag, "Recording started. Compression: $useCompression")
 
         try {
             val minBufSize = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
             @SuppressLint("MissingPermission")
             audioRecord = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBufSize * 2)
-
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e(tag, "AudioRecord failed to initialize")
-                return
-            }
-
             setupAudioEffects()
             audioRecord?.startRecording()
-
             startRecordingThread(FRAME_SIZE, onDataReady)
-            Log.d(tag, "Recording started ($sampleRate Hz).")
-        } catch (e: Exception) {
-            Log.e(tag, "Recording initialization failed", e)
-            stopRecording()
-        }
+        } catch (e: Exception) { stopRecording() }
     }
 
     private fun startRecordingThread(frameSizeShorts: Int, onDataReady: (ByteArray) -> Unit) {
@@ -167,19 +130,13 @@ class AudioEngine(context: Context) {
         recordingThread = Thread({
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             val pcmBuffer = ShortArray(frameSizeShorts)
-
             try {
                 while (isRecording.get()) {
                     val recorder = audioRecord ?: break
-
                     var readSize = 0
                     while (readSize < frameSizeShorts && isRecording.get()) {
                         val result = recorder.read(pcmBuffer, readSize, frameSizeShorts - readSize)
-                        if (result > 0) {
-                            readSize += result
-                        } else {
-                            break // Error or stopped
-                        }
+                        if (result > 0) readSize += result else break
                     }
 
                     if (readSize == frameSizeShorts) {
@@ -187,52 +144,39 @@ class AudioEngine(context: Context) {
                         for (i in 0 until readSize) {
                             val absValue = abs(pcmBuffer[i].toInt())
                             if (absValue > maxAmplitude) maxAmplitude = absValue
-                            if (absValue > GAIN_LIMIT_THRESHOLD) {
-                                pcmBuffer[i] = (if (pcmBuffer[i] > 0) GAIN_LIMIT_THRESHOLD else -GAIN_LIMIT_THRESHOLD).toShort()
-                            }
+                            if (absValue > GAIN_LIMIT_THRESHOLD) pcmBuffer[i] = (if (pcmBuffer[i] > 0) GAIN_LIMIT_THRESHOLD else -GAIN_LIMIT_THRESHOLD).toShort()
                         }
 
                         if (maxAmplitude > NOISE_GATE_THRESHOLD) {
-                            val rawBytes = ShortToByte(pcmBuffer, readSize)
-                            onDataReady(rawBytes) // Direct PCM Transmission
+                            // [MODIFIED] Direct Encoding
+                            val finalData = if (isCompressionEnabled) {
+                                // Pass the ShortArray directly! No ShortToByte needed for G.711.
+                                G711.encode(pcmBuffer, readSize)
+                            } else {
+                                // Only convert to bytes if sending Raw Audio
+                                ShortToByte(pcmBuffer, readSize)
+                            }
+
+                            onDataReady(finalData)
                         }
                     }
                 }
-            } catch (e: Exception) {
-                Log.e(tag, "Recording thread stopped: ${e.message}")
-            }
+            } catch (e: Exception) { }
         }, "AudioRecordingThread").apply { start() }
     }
 
     fun stopRecording() {
         if (!isRecording.compareAndSet(true, false)) return
-
         try {
-            Log.d(tag, "Releasing Microphone Hardware...")
-
-            val recorder = audioRecord
+            audioRecord?.stop()
+            audioRecord?.release()
             audioRecord = null
-
-            try {
-                recorder?.stop()
-            } catch (e: IllegalStateException) {
-                // Ignore if not initialized
-            }
-            recorder?.release()
-
-            // Release effects
             aec?.release(); aec = null
             ns?.release(); ns = null
             agc?.release(); agc = null
-
             recordingThread?.interrupt()
-            recordingThread?.join(100)
             recordingThread = null
-
-        } catch (e: Exception) {
-            Log.e(tag, "Error freeing microphone", e)
-        }
-        Log.d(tag, "Microphone released.")
+        } catch (e: Exception) { }
     }
 
     private fun ShortToByte(shorts: ShortArray, readSize: Int): ByteArray {
@@ -253,20 +197,13 @@ class AudioEngine(context: Context) {
         if (!isPlaying.compareAndSet(true, false)) return
         try {
             synchronized(jitterBuffer) { jitterBuffer.clear() }
-
             playbackThread?.interrupt()
-            playbackThread?.join(100)
             playbackThread = null
-
             audioTrack?.pause()
             audioTrack?.flush()
             audioTrack?.release()
             audioTrack = null
-
-        } catch (e: Exception) {
-            Log.e(tag, "Error stopping playback", e)
-        }
-        Log.d(tag, "Playback stopped.")
+        } catch (e: Exception) { }
     }
 
     fun shutdown() {

@@ -31,6 +31,7 @@ import `in`.chinmoydas.signal.data.MainRepository
 import `in`.chinmoydas.signal.utils.AudioEngine
 import `in`.chinmoydas.signal.utils.LocalLinkManager
 import `in`.chinmoydas.signal.utils.NetworkEngine
+import `in`.chinmoydas.signal.utils.StunClient
 import `in`.chinmoydas.signal.utils.WavUtils
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -71,6 +72,13 @@ class VoiceService : Service() {
     private val PONG_SIGNAL = "__PONG__"
 
     private val UDP_PORT = 50005
+    // [NEW] Stores Public Port from STUN (Defaults to 50005)
+    @Volatile private var myPublicPort: Int = UDP_PORT
+
+    // [NEW] Smart Network Flags
+    @Volatile private var isOnWifi = false
+    @Volatile private var dataSaverEnabled = false
+
     private val IGNORE_SENDER_DELAY = 5000L
 
     @Volatile private var isReceiving = false
@@ -138,7 +146,17 @@ class VoiceService : Service() {
     private var currentSequenceNumber = 0
     private var localLinkManager: LocalLinkManager? = null
 
+    // [MODIFIED] Network Callback to detect WiFi status
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+            super.onCapabilitiesChanged(network, networkCapabilities)
+            val isWifiNow = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+            if (isOnWifi != isWifiNow) {
+                isOnWifi = isWifiNow
+                Log.d(tag, "Network Changed. WiFi: $isOnWifi")
+            }
+        }
+
         override fun onAvailable(network: Network) {
             myLocalIp = getLocalIpAddress()
             triggerHeartbeat()
@@ -155,6 +173,10 @@ class VoiceService : Service() {
         networkEngine = NetworkEngine(UDP_PORT)
         repository = MainRepository(applicationContext)
         observeRepositoryFlows()
+
+        // Load Preference on startup
+        val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
+        dataSaverEnabled = prefs.getBoolean("data_saver", false)
 
         initMediaSession()
 
@@ -200,17 +222,14 @@ class VoiceService : Service() {
                 val target = repository.getTargetUser()
                 if (target.isBlank()) return@launch
 
-                // 1. Resolve Target IP
                 var ip = activeIpCache[target]
                 if (ip == null) {
                     val contact = repository.getAllContacts().find { it.name == target }
                     ip = contact?.ip
                 }
 
-                // 2. DNS Fix
                 if (ip == "SERVER_LINK") ip = "signal.chinmoydas.in"
 
-                // 3. Start Audio (Signaling is now handled inside startTalk)
                 if (!ip.isNullOrBlank()) {
                     if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                         vibrate()
@@ -219,7 +238,6 @@ class VoiceService : Service() {
                         Log.e(tag, "Headset PTT failed: Permission missing")
                     }
                 } else {
-                    // Even if we don't have an IP, try to signal the server
                     if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                         vibrate()
                         startTalk(if(ip != null) listOf(ip) else emptyList(), UDP_PORT)
@@ -243,11 +261,8 @@ class VoiceService : Service() {
 
                 triggerHeartbeat()
 
-                val ip = activeIpCache[target]
-                    ?: repository.getAllContacts().find { it.name == target }?.ip
-
+                val ip = activeIpCache[target] ?: repository.getAllContacts().find { it.name == target }?.ip
                 if (!ip.isNullOrBlank() && ip != "SERVER_LINK") {
-                    Log.d(tag, "Switching target to $target ($ip), sending aggressive ping")
                     sendPing(ip)
                 }
             }
@@ -303,7 +318,24 @@ class VoiceService : Service() {
         if (!multicastLock.isHeld) multicastLock.acquire()
 
         audioEngine.startPlayback()
-        val networkStarted = networkEngine.start { packet -> handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "") }
+
+        // [MODIFIED] Network Receiver with STUN Interception
+        val networkStarted = networkEngine.start { packet ->
+            // 1. Check for STUN Response FIRST
+            if (StunClient.isStunResponse(packet.data)) {
+                val result = StunClient.parseResponse(packet.data)
+                if (result != null && myPublicPort != result.publicPort) {
+                    Log.i(tag, "STUN Resolved: Public Port is ${result.publicPort}")
+                    myPublicPort = result.publicPort
+                    triggerHeartbeat() // Sync with server immediately
+                }
+                return@start // STOP here. Do not play this as audio.
+            }
+
+            // 2. Standard Audio Processing
+            handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
+        }
+
         if (!networkStarted) {
             _voiceServiceState.value = _voiceServiceState.value.copy(networkStatus = "Error: Network failed")
             stopSelf()
@@ -314,11 +346,10 @@ class VoiceService : Service() {
         localLinkManager?.startAdvertising(myUsername, UDP_PORT)
 
         startHeartbeatLoop()
-        startSignalLoop() // Ensure Signaling Loop is started!
+        startSignalLoop()
         return START_STICKY
     }
 
-    // --- SIGNALING LOOP FOR HOLE PUNCHING & INTERRUPTIONS ---
     private fun startSignalLoop() {
         signalingJob?.cancel()
         signalingJob = scope.launch {
@@ -329,45 +360,29 @@ class VoiceService : Service() {
                         val response = RetrofitClient.api.checkSignals("Bearer $token")
                         val callers = response.callers
                         if (!callers.isNullOrEmpty()) {
-
-                            // [NEW] CHECK FOR INTERRUPTIONS (Remote Hangup)
                             if (isSending) {
-                                // If I am talking, and I receive a signal from the person I am talking to,
-                                // they are pressing "Hang Up" to interrupt me.
                                 val interrupter = callers.firstOrNull { caller ->
                                     val ip = activeIpCache[caller]
-                                    // Check if this caller matches our target IP OR target username
-                                    (ip != null && activeTargets.contains(ip)) ||
-                                            (repository.getTargetUser() == caller)
+                                    (ip != null && activeTargets.contains(ip)) || (repository.getTargetUser() == caller)
                                 }
-
                                 if (interrupter != null) {
-                                    Log.w(tag, "Remote Hangup Received from $interrupter")
-                                    stopTalk() // <--- KILL SWITCH
-
+                                    stopTalk()
                                     withContext(Dispatchers.Main) {
                                         Toast.makeText(applicationContext, "Call ended by $interrupter", Toast.LENGTH_SHORT).show()
                                     }
                                 }
                             }
-
-                            // Normal Hole Punch Logic (Only if receiving or idle)
                             val contacts = repository.getAllContacts()
                             callers.forEach { caller ->
-                                val ip = activeIpCache[caller]
-                                    ?: contacts.find { it.name == caller }?.ip
-
+                                val ip = activeIpCache[caller] ?: contacts.find { it.name == caller }?.ip
                                 if (!ip.isNullOrBlank() && ip != "SERVER_LINK") {
-                                    Log.d(tag, "Hole Punch triggered for caller: $caller at $ip")
                                     sendPing(ip)
                                 }
                             }
                         }
-                    } catch (e: Exception) {
-                        // Ignore harmless poll errors
-                    }
+                    } catch (e: Exception) { }
                 }
-                delay(2000) // Polling every 2s for better interrupt responsiveness
+                delay(2000)
             }
         }
     }
@@ -500,25 +515,17 @@ class VoiceService : Service() {
         }
     }
 
-    // [NEW] FUNCTION TO SEND A REMOTE HANGUP SIGNAL
     fun sendRemoteHangup() {
         val target = _voiceServiceState.value.incomingCall
-
-        // Always stop receiving locally first
         stopReceiving()
-
         if (!target.isNullOrBlank() && !target.startsWith("group:")) {
             scope.launch(Dispatchers.IO) {
                 try {
                     val token = repository.getToken()
                     if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
-                        Log.d(tag, "Sending Remote Hangup to $target")
-                        // Fire 'hangup' signal to server (requires updated signal.php)
                         RetrofitClient.api.sendSignal("Bearer $token", "hangup", target)
                     }
-                } catch (e: Exception) {
-                    Log.e(tag, "Failed to send remote hangup", e)
-                }
+                } catch (e: Exception) { }
             }
         }
     }
@@ -528,18 +535,14 @@ class VoiceService : Service() {
         if (isSending) return
 
         val targetUser = repository.getTargetUser()
-
         if (targetUser.isNotBlank() && !targetUser.startsWith("group:")) {
             scope.launch(Dispatchers.IO) {
                 try {
                     val token = repository.getToken()
                     if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
-                        Log.d(tag, "Signaling: Sending call request to $targetUser")
                         RetrofitClient.api.sendSignal("Bearer $token", "call_request", targetUser)
                     }
-                } catch (e: Exception) {
-                    Log.e(tag, "Signaling failed", e)
-                }
+                } catch (e: Exception) { }
             }
         }
 
@@ -548,15 +551,22 @@ class VoiceService : Service() {
         currentSequenceNumber = 0
         activeTargets = ips
         lastPort = port
-
         updateState()
+
+        // [MODIFIED] SMART LOGIC:
+        // Compress if: NOT on WiFi AND Data Saver is ON
+        // Otherwise (WiFi or Saver OFF), use High Quality.
+        val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
+        dataSaverEnabled = prefs.getBoolean("data_saver", false)
+        val shouldCompress = !isOnWifi && dataSaverEnabled
 
         scope.launch { repository.insertLog(if (ips.size > 1) "Group Broadcast" else "PTT Call", false) }
 
         val nameBytes = myUsername.toByteArray()
         val headerLen = 1 + nameBytes.size + 4
 
-        audioEngine.startRecording { rawBuffer ->
+        // [MODIFIED] Pass detection result to AudioEngine
+        audioEngine.startRecording(shouldCompress) { rawBuffer ->
             val payload = rawBuffer
             val sendBuf = ByteArray(headerLen + payload.size)
             sendBuf[0] = nameBytes.size.toByte()
@@ -572,9 +582,7 @@ class VoiceService : Service() {
     fun stopTalk() {
         if (!isSending) return
         isSending = false
-
         updateState()
-
         audioEngine.stopRecording()
         scope.launch {
             val endNameBytes = END_STREAM_SIGNAL.toByteArray()
@@ -653,7 +661,7 @@ class VoiceService : Service() {
         try {
             val effect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE) else null
             if (effect != null) vibrator.vibrate(effect) else vibrator.vibrate(100)
-        } catch (e: Exception) { Log.w(tag, "Vibration failed", e) }
+        } catch (e: Exception) { }
     }
 
     private fun getLocalIpAddress(): String {
@@ -663,7 +671,7 @@ class VoiceService : Service() {
                     if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) return addr.hostAddress ?: ""
                 }
             }
-        } catch (e: Exception) { Log.e(tag, "Failed to get local IP address", e) }
+        } catch (e: Exception) { }
         return ""
     }
 
@@ -672,16 +680,25 @@ class VoiceService : Service() {
         heartbeatJob = scope.launch {
             while (isActive) {
                 triggerHeartbeat()
-                delay(25000) // Tuned for carrier CGNAT stability
+                // [MODIFIED] 25 Seconds for Shared Hosting Safety
+                delay(25000)
             }
         }
     }
 
+    // [MODIFIED] Uses STUN & Public Port
     fun triggerHeartbeat(status: String = "online") {
         scope.launch {
+            // 1. Send STUN Request
+            val stunReq = StunClient.createBindRequest()
+            if (stunReq != null) networkEngine.sendRawPacket(stunReq)
+
+            // 2. Send Heartbeat with CORRECT Port
             val token = repository.getToken()
             if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
-                try { RetrofitClient.api.sendHeartbeat("Bearer $token", UDP_PORT, getLocalIpAddress(), currentChannel, currentChannelKey, status) } catch (e: Exception) { Log.e(tag, "Heartbeat failed", e) }
+                try {
+                    RetrofitClient.api.sendHeartbeat("Bearer $token", myPublicPort, getLocalIpAddress(), currentChannel, currentChannelKey, status)
+                } catch (e: Exception) { Log.e(tag, "Heartbeat failed", e) }
             }
         }
     }
@@ -723,7 +740,6 @@ class VoiceService : Service() {
 
         val headsetIntent = Intent(this, VoiceService::class.java).apply { action = "TOGGLE_HEADSET" }
         val headsetPendingIntent = PendingIntent.getService(this, 777, headsetIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-
         val headsetIcon = if (isHeadsetLinked) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
         val headsetLabel = if (isHeadsetLinked) "Detach Keys" else "Grab Keys"
         val headsetAction = NotificationCompat.Action.Builder(headsetIcon, headsetLabel, headsetPendingIntent).build()
@@ -731,9 +747,7 @@ class VoiceService : Service() {
         return NotificationCompat.Builder(this, "VoiceChannel")
             .setContentTitle("CD Signal").setContentText(text).setSmallIcon(R.mipmap.ic_launcher_foreground).setContentIntent(pendingIntent)
             .setOnlyAlertOnce(true).setOngoing(true)
-            .addAction(muteAction)
-            .addAction(headsetAction)
-            .addAction(exitAction)
+            .addAction(muteAction).addAction(headsetAction).addAction(exitAction)
             .setStyle(androidx.media.app.NotificationCompat.MediaStyle().setShowActionsInCompactView(0, 1, 2)).build()
     }
 
