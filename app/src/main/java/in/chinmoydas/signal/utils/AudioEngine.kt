@@ -23,7 +23,6 @@ class AudioEngine(context: Context) {
     @Volatile private var audioTrack: AudioTrack? = null
     @Volatile private var audioRecord: AudioRecord? = null
 
-    // [NEW] Flag for session compression
     @Volatile var isCompressionEnabled: Boolean = false
 
     private var aec: AcousticEchoCanceler? = null
@@ -91,15 +90,20 @@ class AudioEngine(context: Context) {
         }, "AudioPlaybackThread").apply { start() }
     }
 
+    // [FIXED] Smart Detection Logic
     fun writeAudio(seq: Int, data: ByteArray) {
         if (!isPlaying.get()) return
 
-        // [MODIFIED] SMART AUTO-DETECTION
-        // 640 bytes = Compressed (G.711). 1280 bytes = Raw (PCM).
-        val pcmData = if (data.size == FRAME_SIZE) {
-            G711.decode(data, data.size)
+        // FIX: Allow for Network Padding (Garbage bytes added by carrier).
+        // Compressed (640) + Padding (up to 100 bytes) -> Treat as Compressed.
+        // Raw (1280) -> Treat as Raw.
+
+        val pcmData = if (data.size >= FRAME_SIZE && data.size < FRAME_SIZE + 100) {
+            // It IS compressed, but might have garbage at the end.
+            // G711.decode only reads the first 'length' bytes, so we pass FRAME_SIZE (640).
+            G711.decode(data, FRAME_SIZE)
         } else {
-            data // Treat as Raw
+            data // Treat as Raw (1280 bytes)
         }
 
         synchronized(jitterBuffer) {
@@ -148,13 +152,11 @@ class AudioEngine(context: Context) {
                         }
 
                         if (maxAmplitude > NOISE_GATE_THRESHOLD) {
-                            // [CORRECT] Passing 'pcmBuffer' (Shorts) directly to G711
                             val finalData = if (isCompressionEnabled) {
                                 G711.encode(pcmBuffer, readSize)
                             } else {
                                 ShortToByte(pcmBuffer, readSize)
                             }
-
                             onDataReady(finalData)
                         }
                     }

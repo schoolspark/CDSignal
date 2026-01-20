@@ -22,7 +22,7 @@ data class LoginResponse(
 data class PeerResponse(
     val status: String,
     val ip: String?,
-    val local_ip: String?, // <--- CRITICAL FIX: Added this field
+    val local_ip: String?,
     val port: Int?
 )
 
@@ -42,9 +42,20 @@ data class ResetResponse(
     val new_code: String?
 )
 
-data class SignalResponse(
-    val callers: List<String>?
+// [CRITICAL UPDATE START]
+// This new model holds the IP address sent by the server.
+// Without this, the app receives the signal but doesn't know where to connect.
+data class IncomingSignal(
+    val sender: String,
+    val public_ip: String?,
+    val public_port: Int? // <--- NEW FIELD
 )
+
+data class SignalResponse(
+    val callers: List<String>?,        // Legacy support (Old Server)
+    val signals: List<IncomingSignal>? // New robust support (Smart Server)
+)
+// [CRITICAL UPDATE END]
 
 // --- API INTERFACE ---
 interface ApiService {
