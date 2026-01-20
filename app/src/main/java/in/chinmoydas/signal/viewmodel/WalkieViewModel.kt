@@ -33,6 +33,8 @@ enum class ConnectionStatus {
     IDLE, CHECKING, READY, OFFLINE
 }
 
+// [DELETED] sealed class UiState is removed from here because it is now in UiState.kt
+
 class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
     private val _uiState = MutableStateFlow<UiState>(UiState.Ready)
@@ -71,8 +73,12 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                 if (_uiState.value is UiState.Ready || _uiState.value is UiState.Connected) {
                     _uiState.value = if (newTarget.isEmpty()) UiState.Ready else UiState.Connected(newTarget)
                 }
-                // Reset status when target changes
-                if (newTarget.isNotEmpty()) connectionStatus = ConnectionStatus.CHECKING else connectionStatus = ConnectionStatus.IDLE
+                // [FIX] Reset status when target changes
+                if (newTarget.isNotEmpty()) {
+                    connectionStatus = ConnectionStatus.CHECKING
+                } else {
+                    connectionStatus = ConnectionStatus.IDLE
+                }
             }
         }
         loadData()
@@ -131,23 +137,23 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         }
     }
 
-    // --- UPDATED: Load + Auto-Cleanup ---
+    // Auto-Cleanup Recordings
     fun loadRecordings(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
             val dir = context.cacheDir
             val sevenDaysAgo = System.currentTimeMillis() - (7 * 24 * 60 * 60 * 1000)
 
-            // 1. Run Cleanup Task (Delete files older than 7 days)
+            // 1. Cleanup
             dir.listFiles { _, name -> name.endsWith(".wav") }?.forEach { file ->
                 if (file.lastModified() < sevenDaysAgo) {
                     try { file.delete() } catch (e: Exception) { Log.e("WalkieViewModel", "Cleanup failed for ${file.name}", e) }
                 }
             }
 
-            // 2. Load Remaining Files
+            // 2. Load
             val files = dir.listFiles { _, name -> name.endsWith(".wav") }
 
-            // 3. Update UI on Main Thread
+            // 3. Update UI
             withContext(Dispatchers.Main) {
                 recordedMessages.clear()
                 files?.sortedByDescending { it.lastModified() }?.let { recordedMessages.addAll(it) }
@@ -155,7 +161,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         }
     }
 
-    // --- NEW: Manual Delete Functions ---
     fun deleteRecording(file: File) {
         try {
             if (file.exists()) file.delete()
@@ -174,7 +179,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
             }
         }
     }
-    // ------------------------------------
 
     fun playAndBurnMessage(file: File) {
         try {
@@ -199,6 +203,9 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         val contact = savedContacts.find { it.name == name }
         val key = contact?.savedCode ?: ""
         repository.saveChannelKey(key)
+
+        // [FIX] Trigger immediate check when setting target
+        connectionStatus = ConnectionStatus.CHECKING
     }
 
     fun addContact(name: String, ip: String, code: String) {
@@ -357,7 +364,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         onStop()
     }
 
-    // [UPDATED] REMOTE HANGUP LOGIC
     fun hangUp(service: VoiceService?) {
         _uiState.value = if (targetUser.isNotEmpty()) UiState.Connected(targetUser) else UiState.Ready
 
@@ -366,13 +372,10 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         val state = service.voiceServiceState.value
 
         if (state.isTransmitting) {
-            // If I am talking, just stop talking
             service.stopTalk()
         } else if (state.incomingCall != null) {
-            // If I am listening, SEND A SIGNAL to shut them up!
             service.sendRemoteHangup()
         } else {
-            // Default cleanup
             service.stopReceiving()
         }
     }

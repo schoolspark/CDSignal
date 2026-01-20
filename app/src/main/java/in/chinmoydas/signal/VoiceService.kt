@@ -41,6 +41,7 @@ import kotlinx.coroutines.flow.update
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import javax.crypto.spec.SecretKeySpec
 
 data class VoiceServiceState(
     val incomingCall: String? = null,
@@ -73,10 +74,9 @@ class VoiceService : Service() {
     private val PONG_SIGNAL = "__PONG__"
 
     private val UDP_PORT = 50005
-    // [NEW] Stores Public Port from STUN (Defaults to 50005)
     @Volatile private var myPublicPort: Int = UDP_PORT
 
-    // [NEW] Smart Network Flags
+    // Smart Network Flags
     @Volatile private var isOnWifi = false
     @Volatile private var dataSaverEnabled = false
 
@@ -118,6 +118,12 @@ class VoiceService : Service() {
     private val sequenceMap = ConcurrentHashMap<String, Int>()
     private val activeIpCache = ConcurrentHashMap<String, String>()
     private val blockedCache = ConcurrentHashMap.newKeySet<String>()
+
+    // [UPGRADE 1] Key Caches
+    private val contactKeyCache = ConcurrentHashMap<String, String>()
+    private val derivedKeyCache = ConcurrentHashMap<String, SecretKeySpec>()
+    private var lastDecryptionErrorTime = 0L
+
     @Volatile private var ignoredSender: String? = null
     @Volatile private var activeTargets: List<String> = emptyList()
     @Volatile private var lastPort: Int = UDP_PORT
@@ -144,10 +150,11 @@ class VoiceService : Service() {
     private val activeCalls = AtomicInteger(0)
     private var heartbeatJob: Job? = null
     private var signalingJob: Job? = null
-    private var currentSequenceNumber = 0
+
+    // [UPGRADE 2] Random Sequence Start
+    private var currentSequenceNumber = kotlin.random.Random.nextInt()
     private var localLinkManager: LocalLinkManager? = null
 
-    // [MODIFIED] Network Callback to detect WiFi status
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
             super.onCapabilitiesChanged(network, networkCapabilities)
@@ -175,7 +182,6 @@ class VoiceService : Service() {
         repository = MainRepository(applicationContext)
         observeRepositoryFlows()
 
-        // Load Preference on startup
         val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
         dataSaverEnabled = prefs.getBoolean("data_saver", false)
 
@@ -235,8 +241,6 @@ class VoiceService : Service() {
                     if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                         vibrate()
                         startTalk(listOf(ip), UDP_PORT)
-                    } else {
-                        Log.e(tag, "Headset PTT failed: Permission missing")
                     }
                 } else {
                     if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
@@ -270,9 +274,18 @@ class VoiceService : Service() {
         }
         scope.launch {
             repository.configTrigger.collect {
+                // 1. Blocked List
                 val blocked = repository.getBlockedContacts()
                 blockedCache.clear()
                 blockedCache.addAll(blocked.map { it.name })
+
+                // [UPGRADE 3] Update Key Cache & Clear Derived Cache
+                contactKeyCache.clear()
+                derivedKeyCache.clear()
+                val contacts = repository.getAllContacts()
+                contacts.forEach {
+                    if (it.savedCode.isNotEmpty()) contactKeyCache[it.name] = it.savedCode
+                }
             }
         }
         scope.launch {
@@ -320,20 +333,16 @@ class VoiceService : Service() {
 
         audioEngine.startPlayback()
 
-        // [MODIFIED] Network Receiver with STUN Interception
         val networkStarted = networkEngine.start { packet ->
-            // 1. Check for STUN Response FIRST
             if (StunClient.isStunResponse(packet.data)) {
                 val result = StunClient.parseResponse(packet.data)
                 if (result != null && myPublicPort != result.publicPort) {
                     Log.i(tag, "STUN Resolved: Public Port is ${result.publicPort}")
                     myPublicPort = result.publicPort
-                    triggerHeartbeat() // Sync with server immediately
+                    triggerHeartbeat()
                 }
-                return@start // STOP here. Do not play this as audio.
+                return@start
             }
-
-            // 2. Standard Audio Processing
             handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
         }
 
@@ -383,7 +392,9 @@ class VoiceService : Service() {
                         }
                     } catch (e: Exception) { }
                 }
-                delay(2000)
+                // delay(2000)
+                // Check every 2s if screen is on, otherwise every 6s to save battery/data
+                delay(if (activeCalls.get() > 0) 2000 else 6000)
             }
         }
     }
@@ -413,6 +424,13 @@ class VoiceService : Service() {
             buf[0] = signalBytes.size.toByte()
             System.arraycopy(signalBytes, 0, buf, 1, signalBytes.size)
             networkEngine.send(buf, listOf(ip), UDP_PORT)
+        }
+    }
+
+    // [UPGRADE 4] Helper to get Cached KeySpec
+    private fun getCachedKeySpec(passcode: String): SecretKeySpec {
+        return derivedKeyCache.getOrPut(passcode) {
+            CryptoEngine.deriveKey(passcode)
         }
     }
 
@@ -475,23 +493,37 @@ class VoiceService : Service() {
             if (payloadLen > 0) {
                 var payload = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
 
-                // --- DECRYPTION BLOCK ---
+                // --- [UPGRADE 5] ROBUST DECRYPTION ---
                 val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
                 val isSecureMode = prefs.getBoolean("secure_mode", false)
 
                 if (isSecureMode) {
-                    val secretKey = CryptoEngine.deriveKey(currentChannelKey)
-                    // Attempt to decrypt using the Packet's Sequence Number
-                    val decrypted = CryptoEngine.decrypt(payload, seqNum, secretKey)
+                    // 1. Try Specific Contact Key
+                    val specificKey = contactKeyCache[senderName]
+                    val primaryKey = specificKey ?: currentChannelKey ?: ""
+
+                    var decrypted = CryptoEngine.decrypt(payload, seqNum, getCachedKeySpec(primaryKey))
+
+                    // 2. Fallback for Strangers (Offline/LAN Default Key)
+                    if (decrypted == null && primaryKey.isNotEmpty()) {
+                        decrypted = CryptoEngine.decrypt(payload, seqNum, getCachedKeySpec(""))
+                    }
 
                     if (decrypted != null) {
-                        payload = decrypted // Success! Play clear audio.
+                        payload = decrypted
+                    } else {
+                        // 3. FAIL: Drop packet. Warn user occasionally.
+                        val now = System.currentTimeMillis()
+                        if (now - lastDecryptionErrorTime > 5000) {
+                            lastDecryptionErrorTime = now
+                            scope.launch(Dispatchers.Main) {
+                                Toast.makeText(applicationContext, "Cannot decrypt $senderName. Check Keys!", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                        return
                     }
-                    // If 'decrypted' is null, we play the original 'payload'.
-                    // Since it is encrypted, it will sound like STATIC noise.
-                    // This tells the user: "Encrypted signal received but I can't read it."
                 }
-                // ------------------------
+                // ------------------------------------------
 
                 if (!isSilenced) { try { audioEngine.writeAudio(seqNum, payload) } catch (e: Exception) {} }
                 if (isRecordingEnabled) { synchronized(bufferLock) { try { incomingBuffer.write(payload) } catch (t: Throwable) {} } }
@@ -568,23 +600,20 @@ class VoiceService : Service() {
 
         acquireResources(forceAudio = true)
         isSending = true
-        currentSequenceNumber = 0
+        // [UPGRADE 6] Randomize Seq (Security)
         activeTargets = ips
         lastPort = port
         updateState()
 
-        // --- OPTION 1 & 3: CONFIGURATION ---
         val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
 
-        // 1. Smart Compression Logic
         dataSaverEnabled = prefs.getBoolean("data_saver", false)
         val isGroupCall = ips.size > 1
         val shouldCompress = isGroupCall || (!isOnWifi && dataSaverEnabled)
 
-        // 2. Secure Mode Logic
         val isSecureMode = prefs.getBoolean("secure_mode", false)
-        // If Secure Mode is ON, generate the key from the Channel Password
-        val secretKey = if (isSecureMode) CryptoEngine.deriveKey(currentChannelKey) else null
+        // [UPGRADE 7] Use Cached Key for Sending
+        val keyString = if (isSecureMode) currentChannelKey ?: "" else null
 
         if (isSecureMode) Log.i(tag, "Starting SECURE transmission")
 
@@ -594,14 +623,11 @@ class VoiceService : Service() {
         val headerLen = 1 + nameBytes.size + 4
 
         audioEngine.startRecording(shouldCompress) { rawBuffer ->
-            // --- ENCRYPTION BLOCK ---
-            // If Secure Mode is ON, try to encrypt. If it fails, fallback to raw.
-            val payloadToSend = if (isSecureMode && secretKey != null) {
-                CryptoEngine.encrypt(rawBuffer, currentSequenceNumber, secretKey) ?: rawBuffer
+            val payloadToSend = if (isSecureMode && keyString != null) {
+                CryptoEngine.encrypt(rawBuffer, currentSequenceNumber, getCachedKeySpec(keyString)) ?: rawBuffer
             } else {
                 rawBuffer
             }
-            // ------------------------
 
             val sendBuf = ByteArray(headerLen + payloadToSend.size)
             sendBuf[0] = nameBytes.size.toByte()
@@ -715,20 +741,16 @@ class VoiceService : Service() {
         heartbeatJob = scope.launch {
             while (isActive) {
                 triggerHeartbeat()
-                // [MODIFIED] 25 Seconds for Shared Hosting Safety
                 delay(25000)
             }
         }
     }
 
-    // [MODIFIED] Uses STUN & Public Port
     fun triggerHeartbeat(status: String = "online") {
         scope.launch {
-            // 1. Send STUN Request
             val stunReq = StunClient.createBindRequest()
             if (stunReq != null) networkEngine.sendRawPacket(stunReq)
 
-            // 2. Send Heartbeat with CORRECT Port
             val token = repository.getToken()
             if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
                 try {

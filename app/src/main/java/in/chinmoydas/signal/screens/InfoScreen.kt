@@ -65,7 +65,7 @@ fun InfoScreen(navController: NavController) {
                 .padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // --- FIX: Use Image + Box Container (Same as LoginScreen) ---
+            // App Icon Container
             Box(
                 Modifier
                     .size(100.dp)
@@ -79,12 +79,11 @@ fun InfoScreen(navController: NavController) {
                     modifier = Modifier.size(72.dp)
                 )
             }
-            // ------------------------------------------------------------
 
             Spacer(Modifier.height(16.dp))
 
             Text("CD Signal", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-            Text("Version $versionName", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
+            Text("Version $versionName ($versionCode)", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
 
             Spacer(Modifier.height(32.dp))
 
@@ -97,22 +96,27 @@ fun InfoScreen(navController: NavController) {
 
             Spacer(Modifier.height(24.dp))
 
-            // Data Safety Badge
+            // [UPDATED] Data Safety Badge
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
                 Column(Modifier.padding(16.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.Security, null, tint = Color(0xFF4CAF50)) // Green Security Icon
                         Spacer(Modifier.width(8.dp))
-                        Text("Data Safety Declaration", fontWeight = FontWeight.Bold)
+                        Text("Security & Data Safety", fontWeight = FontWeight.Bold)
                     }
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "• Audio Processing: All voice data is processed locally or transmitted directly to peers (P2P). No audio is stored on external servers.",
+                        "• Encryption: When Secure Channel is ON, voice packets are encrypted using AES-GCM-256 (Government Grade) directly on your device.",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "• Location/IP: IP addresses are used strictly for establishing direct connections.",
+                        "• Peer-to-Peer: Audio is transmitted directly between users. No voice data is ever stored on our servers.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "• Local Only: Your 'Pairing Keys' are stored locally on this phone and never uploaded to the cloud.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }

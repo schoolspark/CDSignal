@@ -2,6 +2,8 @@ package `in`.chinmoydas.signal.data
 
 import androidx.room.*
 
+// --- ENTITIES ---
+
 @Entity(tableName = "call_logs")
 data class CallLog(
     @PrimaryKey(autoGenerate = true) val id: Int = 0,
@@ -17,6 +19,8 @@ data class ContactEntity(
     val savedCode: String = "",
     val isBlocked: Boolean = false
 )
+
+// --- DAOs ---
 
 @Dao
 interface CallLogDao {
@@ -41,6 +45,7 @@ interface ContactDao {
     @Query("SELECT * FROM contacts WHERE isBlocked = 1")
     suspend fun getBlockedContacts(): List<ContactEntity>
 
+    // Helper to preserve blocked status when re-saving a contact
     @Query("SELECT EXISTS(SELECT 1 FROM contacts WHERE name = :name AND isBlocked = 1)")
     suspend fun isBlocked(name: String): Boolean
 
@@ -50,10 +55,13 @@ interface ContactDao {
     @Query("UPDATE contacts SET isBlocked = :blocked WHERE name = :name")
     suspend fun setBlockedStatus(name: String, blocked: Boolean)
 
-    // --- NEW: Background IP Updater ---
+    // [CRITICAL FIX] Silent IP Update
+    // This allows VoiceService to update IPs in the background without triggering a full UI refresh
     @Query("UPDATE contacts SET ip = :newIp WHERE name = :name")
     suspend fun updateIp(name: String, newIp: String)
 }
+
+// --- DATABASE ---
 
 @Database(entities = [CallLog::class, ContactEntity::class], version = 3)
 abstract class AppDatabase : RoomDatabase() {

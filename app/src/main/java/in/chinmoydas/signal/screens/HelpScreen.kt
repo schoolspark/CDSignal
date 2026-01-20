@@ -7,17 +7,14 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -43,121 +40,112 @@ fun HelpScreen(navController: NavController) {
                 .verticalScroll(rememberScrollState())
                 .padding(16.dp)
         ) {
-            // --- SECTION 1: INSTANT CHANNEL JOINING ---
+            // --- SECTION 1: SECURE P2P PAIRING ---
             HelpCard(
-                title = "📲 INSTANT CHANNELS",
+                title = "🔐 SECURE P2P PAIRING",
                 icon = Icons.Default.QrCodeScanner,
                 color = MaterialTheme.colorScheme.secondaryContainer
             ) {
-                Text("Joining a frequency is now easier than ever!", fontWeight = FontWeight.Bold)
+                Text("For private, encrypted calls between two people:", fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
                 Step(1, "Go to 'Connect' tab and tap 'Scan QR Code'.")
-                Step(2, "Scan another user's Channel QR to join instantly.")
-                Step(3, "To share: find your Channel in 'My Contacts', tap the arrow, and select 'Share Channel QR'.")
+                Step(2, "Scan your friend's Personal QR to save their 'Key'.")
+                Step(3, "IMPORTANT:", isBold = true)
+                Text("Pairing is one-way! Your friend MUST scan you back, or they won't be able to decrypt your voice.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
             }
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 2: STATUS INDICATORS ---
+            // --- SECTION 2: JOINING CHANNELS (Restored) ---
             HelpCard(
-                title = "🚦 STATUS LIGHTS & INDICATORS",
+                title = "📢 JOINING GROUP CHANNELS",
+                icon = Icons.Default.Groups,
+                color = MaterialTheme.colorScheme.tertiaryContainer
+            ) {
+                Text("To join a Frequency or Team Channel:", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                Step(1, "Ask the Team Leader to show their 'Channel QR'.")
+                Step(2, "Scan it using the same scanner on the 'Connect' tab.")
+                Step(3, "You will instantly join the group (e.g., 'Security Team').")
+                Step(4, "To share a channel: Find it in 'My Contacts', tap the arrow, and select 'Share Channel QR'.")
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // --- SECTION 3: STATUS INDICATORS ---
+            HelpCard(
+                title = "🚦 STATUS LIGHTS",
                 icon = Icons.Default.Info,
                 color = MaterialTheme.colorScheme.surfaceVariant
             ) {
-                Text("Understand exactly what is happening:", fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(12.dp))
-
                 StatusDotRow(Color.Green, "Green Dot", "Connected. Audio Received & Path Open.")
-                StatusDotRow(Color.Yellow, "Yellow Dot", "Signaling. Waking up the peer...")
-                StatusDotRow(Color.Red, "Red Dot", "Standby. Press PTT to wake up.")
+                StatusDotRow(Color.Yellow, "Yellow Dot", "Checking Health / Waking up peer...")
+                StatusDotRow(Color.Gray, "Gray Dot", "Idle / Offline. Select a user to ping.")
 
                 Spacer(Modifier.height(8.dp))
                 HorizontalDivider(thickness = 1.dp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.2f))
                 Spacer(Modifier.height(8.dp))
 
                 StatusDotRow(MaterialTheme.colorScheme.primary, "Blue Button", "Ready. Hold to Talk.")
-                StatusDotRow(MaterialTheme.colorScheme.error, "Red Button (ON AIR)", "Transmitting. You are live.")
-
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 4.dp)) {
-                    Icon(Icons.Default.Lock, null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(12.dp))
-                    Column {
-                        Text("Handsfree Mode", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyMedium)
-                        Text("Tap 'Handsfree' to switch modes. Tap once to talk, tap again to stop.", style = MaterialTheme.typography.bodySmall)
-                    }
-                }
+                StatusDotRow(MaterialTheme.colorScheme.error, "Red Button", "Transmitting (ON AIR).")
             }
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 3: VOICE PAGER & POCKET MODE ---
+            // --- SECTION 4: VOICE PAGER ---
             HelpCard(
-                title = "📟 VOICE PAGER & POCKET MODE",
+                title = "📟 VOICE PAGER MODE",
                 icon = Icons.Default.NotificationsOff,
-                color = MaterialTheme.colorScheme.tertiaryContainer
+                color = MaterialTheme.colorScheme.surfaceVariant
             ) {
-                Text("Never miss a message even when you're busy.", fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(8.dp))
-                Step(1, "Tap the 'Silent Mode' (Bell) icon on the Radio screen.")
-                Step(2, "When someone talks, the app stays silent but RECORDS the message.")
-                Step(3, "Go to the 'History' tab to see missed messages in RED.")
-                Spacer(Modifier.height(8.dp))
-                Text("🎧 Pocket Mode:", fontWeight = FontWeight.Bold)
-                Step(4, "Click your Wired or Bluetooth Headset button to talk, even if the phone is in your pocket.")
-                Step(5, "Tip: Use 'Detach Keys' in the notification to let your music app take back control.")
+                Text("Tap the 'Silent Mode' (Bell) icon on the Radio screen.", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(4.dp))
+                Text("When active, incoming audio is SILENCED but RECORDED. Check 'History' tab to listen later.")
             }
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 4: EVENT / OFFLINE MODE ---
+            // --- SECTION 5: OFFLINE / LAN MODE ---
             HelpCard(
-                title = "📢 EVENT / OFFLINE MODE",
+                title = "📡 OFFLINE / LAN MODE",
                 icon = Icons.Default.Wifi,
                 color = MaterialTheme.colorScheme.errorContainer
             ) {
                 Text("Use this when you have a Router but NO Internet.", fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
-                Step(1, "Connect all phones to the same WiFi/Router.")
-                Step(2, "Do NOT Log in. Tap 'Offline Mode' on the login screen.")
-                Step(3, "Enter your name (e.g., 'Stage Left') and enter.")
-                Step(4, "Wait a few seconds for others to appear in 'Nearby Devices'.")
-                Step(5, "CRITICAL STEP:", isBold = true)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Tap the ")
-                    Icon(Icons.Default.Groups, null, tint = MaterialTheme.colorScheme.primary)
-                    Text(" (Group Icon) at the top right.")
-                }
-                Text("The text must say 'BROADCAST MODE' in RED.", color = Color.Red, fontWeight = FontWeight.Bold)
-                Step(6, "Hold the big button to talk to everyone.")
+                Step(1, "Connect all phones to the same WiFi.")
+                Step(2, "Tap 'Offline Mode' on the login screen.")
+                Step(3, "Tap the Group Icon (Top Right) to broadcast to everyone.")
+                Step(4, "Security Note:", isBold = true)
+                Text("Unpaired users can be heard on the Public Channel. For privacy in Offline Mode, Scan their QR Code.", style = MaterialTheme.typography.bodySmall)
             }
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 5: INDIVIDUAL CALLS & CONNECTION ---
+            // --- SECTION 6: MAKING CALLS ---
             HelpCard(
-                title = "👤 INDIVIDUAL CALLS (The 'Double Punch')",
+                title = "👤 MAKING CALLS (INTERNET)",
                 icon = Icons.Default.Person,
                 color = MaterialTheme.colorScheme.surfaceVariant
             ) {
-                Text("How to connect instantly on mobile networks (Jio/Airtel):", fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(8.dp))
                 Step(1, "Select a person from your contacts.")
-                Step(2, "The 'Double Punch' Rule:", isBold = true)
-                Text("For the fastest connection, BOTH users should press the Talk button once.", modifier = Modifier.padding(start = 24.dp))
-                Step(3, "This 'wakes up' the connection instantly on strict firewalls.")
-                Step(4, "As soon as you hear audio, the status light will turn GREEN.")
+                Step(2, "Wait for the Status Dot to turn GREEN or YELLOW.")
+                Step(3, "The 'Double Punch':", isBold = true)
+                Text("If the dot stays Gray, BOTH users should press the Talk button once to wake up the connection.", modifier = Modifier.padding(start = 24.dp))
             }
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 6: TROUBLESHOOTING ---
+            // --- SECTION 7: TROUBLESHOOTING ---
             Text("Troubleshooting", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
-            Text("• Status stays Red? Just press the Talk button! It sends a wake-up signal to your peer.")
-            Text("• Screeching? The app has built-in feedback suppression, but try to keep phones 2-3 meters apart.")
-            Text("• Light stuck on Yellow? Tap the Sync (Refresh) icon at the top left to force a connection check.")
-            Text("• No devices found? Ensure 'AP Isolation' is OFF in your Router settings.")
-            Text("• Sound clear on one side only? Check the noisy device's mic for dust or cases blocking the secondary mic.")
+
+            Text("• Incoming call but NO SOUND? You are missing their Key. Scan their QR Code.", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(4.dp))
+
+            Text("• Status stays Gray? Press the Talk button once to wake up the peer.")
+            Text("• Screeching? Keep phones 2-3 meters apart.")
+            Text("• No devices found? Ensure 'AP Isolation' is OFF in your Router.")
 
             Spacer(Modifier.height(32.dp))
         }

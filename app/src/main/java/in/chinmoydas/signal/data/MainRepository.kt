@@ -15,8 +15,10 @@ class MainRepository(context: Context) {
 
     private val _targetUser = MutableStateFlow(prefs.getString("current_target", "") ?: "")
     val targetUser: StateFlow<String> = _targetUser.asStateFlow()
+
     private val _channelKey = MutableStateFlow(prefs.getString("channel_key", "") ?: "")
     val channelKey: StateFlow<String> = _channelKey.asStateFlow()
+
     private val _myUsername = MutableStateFlow(prefs.getString("username", "User") ?: "User")
     val myUsername: StateFlow<String> = _myUsername.asStateFlow()
 
@@ -43,20 +45,16 @@ class MainRepository(context: Context) {
     suspend fun getAllContacts() = contactDao.getAllContacts()
     suspend fun getBlockedContacts() = contactDao.getBlockedContacts()
 
-    // --- FIX: Preserve "Blocked" status when updating a contact ---
     suspend fun saveContact(name: String, ip: String, code: String) {
-        val isBlocked = contactDao.isBlocked(name) // Check if already blocked
+        val isBlocked = contactDao.isBlocked(name) // Preserve Block Status
         contactDao.insert(ContactEntity(name, ip, code, isBlocked = isBlocked))
-        triggerConfigRefresh()
+        triggerConfigRefresh() // Normal save triggers a refresh
     }
-    // -------------------------------------------------------------
 
-    // --- NEW: Efficient Background Update ---
-    // Called by VoiceService to silently update IP without redrawing UI
+    // [CRITICAL FIX] Silent Update
+    // Uses the specific DAO method to update IP without triggering config refresh
     suspend fun updateContactIp(name: String, ip: String) {
         contactDao.updateIp(name, ip)
-        // Note: We do NOT trigger config refresh here.
-        // This prevents the UI from flickering while you are talking.
     }
 
     suspend fun deleteContact(name: String) {

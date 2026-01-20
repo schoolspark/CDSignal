@@ -1,5 +1,7 @@
 package `in`.chinmoydas.signal.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
@@ -22,6 +24,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.automirrored.filled.Help
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -501,26 +504,65 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
     var showBlockedDialog by remember { mutableStateOf(false) }
     val myCode by viewModel.myPairingCode.collectAsState()
 
-    // [NEW] Data Saver State
+    // Data Saver State
     var isDataSaver by remember {
         mutableStateOf(context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE).getBoolean("data_saver", false))
+    }
+
+    // Secure Mode State
+    var isSecureMode by remember {
+        mutableStateOf(context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE).getBoolean("secure_mode", false))
+    }
+
+    // [NEW] Get App Version
+    val appVersion = remember {
+        try {
+            val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            "v${pInfo.versionName} (${pInfo.versionCode})"
+        } catch (e: Exception) { "Unknown Version" }
     }
 
     LaunchedEffect(myCode) { if (myCode.isNotBlank()) viewModel.qrBitmap = viewModel.generateQr("$myName|$myCode") }
 
     Column(modifier = modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Top) {
+
+        // --- 1. ID CARD ---
         Card(elevation = CardDefaults.cardElevation(8.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
             Column(Modifier.padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("MY FREQUENCY ID", style = MaterialTheme.typography.labelSmall, color = Color.Gray); Text(myName, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold); Spacer(Modifier.height(16.dp))
-                Text("PAIRING PIN", style = MaterialTheme.typography.labelSmall, color = Color.Gray); Text(myCode, style = MaterialTheme.typography.displayMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary, letterSpacing = 4.sp)
-                TextButton(onClick = { viewModel.resetPairingCode(myName) }) { Icon(Icons.Default.Refresh, null, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(4.dp)); Text("Reset PIN") }
-                Spacer(Modifier.height(16.dp)); viewModel.qrBitmap?.let { Image(bitmap = it.asImageBitmap(), contentDescription = "QR", modifier = Modifier.size(180.dp)) }
+                Text("MY FREQUENCY ID", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                Text(myName, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(16.dp))
+
+                Text("PAIRING PIN", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+
+                // [UPGRADE] Row with Copy Button
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(myCode, style = MaterialTheme.typography.displayMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary, letterSpacing = 4.sp)
+                    IconButton(onClick = {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        val clip = ClipData.newPlainText("Pairing PIN", myCode)
+                        clipboard.setPrimaryClip(clip)
+                        Toast.makeText(context, "PIN Copied", Toast.LENGTH_SHORT).show()
+                    }) {
+                        Icon(Icons.Default.ContentCopy, "Copy PIN", tint = MaterialTheme.colorScheme.primary)
+                    }
+                }
+
+                TextButton(onClick = { viewModel.resetPairingCode(myName) }) {
+                    Icon(Icons.Default.Refresh, null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Reset PIN")
+                }
+                Spacer(Modifier.height(16.dp))
+                viewModel.qrBitmap?.let { Image(bitmap = it.asImageBitmap(), contentDescription = "QR", modifier = Modifier.size(180.dp)) }
             }
         }
 
         Spacer(Modifier.height(16.dp))
 
-        // [NEW] Data Saver Toggle Card
+        // --- 2. SETTINGS TOGGLES ---
+
+        // Data Saver
         Card(
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha=0.5f)),
             modifier = Modifier.fillMaxWidth()
@@ -549,14 +591,9 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
             }
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(8.dp))
 
-        // [NEW] Secure Channel Toggle
-        // Reads/Writes "secure_mode" to SharedPrefs
-        var isSecureMode by remember {
-            mutableStateOf(context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE).getBoolean("secure_mode", false))
-        }
-
+        // Secure Channel
         Card(
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha=0.5f)),
             modifier = Modifier.fillMaxWidth()
@@ -570,10 +607,10 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.Security, null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
                         Spacer(Modifier.width(8.dp))
-                        Text("Secure Channel (Encryption)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                        Text("Secure Channel", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
                     }
                     Text(
-                        if (isSecureMode) "Audio is encrypted using your Channel Key." else "Standard transmission (Raw Audio).",
+                        if (isSecureMode) "Encrypted. Only paired users can hear." else "Raw Audio. Fastest, but public.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -589,25 +626,54 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
             }
         }
 
+        Spacer(Modifier.height(24.dp))
+
+        // --- 3. ACTIONS ---
+
+        OutlinedButton(onClick = { showBlockedDialog = true }, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Default.PrivacyTip, null); Spacer(Modifier.width(8.dp)); Text("Blocked Users")
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        OutlinedButton(onClick = { navController.navigate("diagnostics") }, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Default.Build, null); Spacer(Modifier.width(8.dp)); Text("Run System Diagnostics")
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        OutlinedButton(onClick = { navController.navigate("info") }, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Default.Info, null); Spacer(Modifier.width(8.dp)); Text("About & Legal Info")
+        }
+
+        Spacer(Modifier.height(32.dp))
+
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            OutlinedButton(onClick = onLogout, modifier = Modifier.weight(1f)) {
+                Icon(Icons.AutoMirrored.Filled.ExitToApp, null); Spacer(Modifier.width(8.dp)); Text("Logout")
+            }
+            Button(onClick = onExit, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) {
+                Icon(Icons.Default.PowerSettingsNew, null); Spacer(Modifier.width(8.dp)); Text("Exit App")
+            }
+        }
+
         Spacer(Modifier.height(16.dp))
 
-        OutlinedButton(onClick = { showBlockedDialog = true }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.PrivacyTip, null); Spacer(Modifier.width(8.dp)); Text("Privacy: Blocked Users") }
-        Spacer(Modifier.height(16.dp))
-        OutlinedButton(onClick = { navController.navigate("diagnostics") }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Build, null); Spacer(Modifier.width(8.dp)); Text("Run System Diagnostics") }
-        Spacer(Modifier.height(16.dp))
-        OutlinedButton(onClick = { navController.navigate("info") }, modifier = Modifier.fillMaxWidth()) {
-            Icon(Icons.Default.Info, null)
-            Spacer(Modifier.width(8.dp))
-            Text("About & Legal Info")
-        }
-        Spacer(Modifier.height(32.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            OutlinedButton(onClick = onLogout, modifier = Modifier.weight(1f)) { Icon(Icons.AutoMirrored.Filled.ExitToApp, null); Spacer(Modifier.width(8.dp)); Text("Logout") }
-            Button(onClick = onExit, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Icon(Icons.Default.PowerSettingsNew, null); Spacer(Modifier.width(8.dp)); Text("Exit App") }
-        }
+        // [UPGRADE] Version Display
+        Text(appVersion, style = MaterialTheme.typography.labelMedium, color = Color.Gray)
+
         Spacer(Modifier.height(50.dp))
     }
+
     if (showBlockedDialog) {
-        AlertDialog(onDismissRequest = { showBlockedDialog = false }, title = { Text("Blocked Users") }, text = { if (viewModel.blockedContacts.isEmpty()) Text("No blocked users.") else LazyColumn { items(viewModel.blockedContacts) { contact -> Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text(contact.name); TextButton(onClick = { viewModel.unblockContact(contact.name) }) { Text("Unblock") } } } } }, confirmButton = { TextButton(onClick = { showBlockedDialog = false }) { Text("Close") } })
+        AlertDialog(
+            onDismissRequest = { showBlockedDialog = false },
+            title = { Text("Blocked Users") },
+            text = {
+                if (viewModel.blockedContacts.isEmpty()) Text("No blocked users.")
+                else LazyColumn { items(viewModel.blockedContacts) { contact -> Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text(contact.name); TextButton(onClick = { viewModel.unblockContact(contact.name) }) { Text("Unblock") } } } }
+            },
+            confirmButton = { TextButton(onClick = { showBlockedDialog = false }) { Text("Close") } }
+        )
     }
 }

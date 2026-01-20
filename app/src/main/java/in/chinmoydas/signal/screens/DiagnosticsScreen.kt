@@ -43,14 +43,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.navigation.NavController
+import `in`.chinmoydas.signal.utils.StunClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.HttpURLConnection
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.net.SocketTimeoutException
 import java.net.URL
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -68,6 +72,11 @@ fun DiagnosticsScreen(navController: NavController) {
     var serverStatus by remember { mutableStateOf("Checking...") }
     var storageStatus by remember { mutableStateOf(checkStorage(context)) }
     var audioFxStatus by remember { mutableStateOf(checkAudioEffects()) }
+
+    // [NEW] Additional Diagnostics States
+    var stunStatus by remember { mutableStateOf("Checking...") }
+    var portStatus by remember { mutableStateOf(checkPort50005()) }
+    var volumeStatus by remember { mutableStateOf(checkVolume(context)) }
 
     // Audio Output State
     var audioRouteInfo by remember { mutableStateOf(getAudioRoute(context)) }
@@ -95,6 +104,11 @@ fun DiagnosticsScreen(navController: NavController) {
         localIp = getLocalIpAddress()
         serverStatus = checkServer()
         audioRouteInfo = getAudioRoute(context)
+
+        // [NEW] Run Async Checks
+        stunStatus = checkStunConnectivity()
+        volumeStatus = checkVolume(context)
+        portStatus = checkPort50005()
     }
 
     fun copyReport() {
@@ -105,8 +119,11 @@ fun DiagnosticsScreen(navController: NavController) {
             Permissions: $permStatus
             Battery: $batteryStatus
             Network: $netStatus
+            NAT/STUN: $stunStatus
             Local IP: $localIp
             Server: $serverStatus
+            Port 50005: $portStatus
+            Voice Vol: $volumeStatus
             Storage: $storageStatus
             Audio HW: $audioFxStatus
             Audio Route: ${audioRouteInfo.displayText.replace("\n", " | ")}
@@ -126,17 +143,26 @@ fun DiagnosticsScreen(navController: NavController) {
                 actions = {
                     IconButton(onClick = { copyReport() }) { Icon(Icons.Default.ContentCopy, "Copy Report") }
                     IconButton(onClick = {
+                        // Reset statuses to "Checking..." for visuals
+                        netStatus = "Checking..."
+                        serverStatus = "Checking..."
+                        stunStatus = "Checking..."
+
+                        // Reload synchronous checks
                         permStatus = checkPermissions(context)
                         batteryStatus = checkBattery(context)
                         storageStatus = checkStorage(context)
                         audioFxStatus = checkAudioEffects()
                         audioRouteInfo = getAudioRoute(context)
                         localIp = getLocalIpAddress()
+                        portStatus = checkPort50005()
+                        volumeStatus = checkVolume(context)
+
+                        // Reload async checks
                         scope.launch {
-                            netStatus = "Checking..."
-                            serverStatus = "Checking..."
                             netStatus = checkNetwork(context)
                             serverStatus = checkServer()
+                            stunStatus = checkStunConnectivity()
                         }
                     }) { Icon(Icons.Default.Refresh, "Refresh") }
                 }
@@ -145,7 +171,7 @@ fun DiagnosticsScreen(navController: NavController) {
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
 
-            // 0. DEVICE INFO (New)
+            // 0. DEVICE INFO
             Text(deviceInfo, style = MaterialTheme.typography.labelSmall, color = Color.Gray, modifier = Modifier.padding(bottom = 16.dp))
 
             // 1. SYSTEM HEALTH
@@ -154,8 +180,11 @@ fun DiagnosticsScreen(navController: NavController) {
             DiagnosticRow("Permissions", permStatus)
             DiagnosticRow("Battery Opt", batteryStatus)
             DiagnosticRow("Network", netStatus)
-            DiagnosticRow("Local IP", localIp) // NEW: Shows IP address
-            DiagnosticRow("Server API", serverStatus) // NEW: Shows Latency
+            DiagnosticRow("NAT/STUN", stunStatus) // [NEW]
+            DiagnosticRow("Local IP", localIp)
+            DiagnosticRow("Server API", serverStatus)
+            DiagnosticRow("Port 50005", portStatus) // [NEW]
+            DiagnosticRow("Voice Vol", volumeStatus) // [NEW]
             DiagnosticRow("Storage", storageStatus)
             DiagnosticRow("Audio HW", audioFxStatus)
 
@@ -291,9 +320,16 @@ fun toggleSpeakerTest(context: Context, on: Boolean) {
 // --- DIAGNOSTIC HELPERS ---
 @Composable
 fun DiagnosticRow(label: String, status: String) {
-    val isPass = status.startsWith("OK") || status.startsWith("Yes") || status.startsWith("Connected") || status.contains("✓")
+    val isPass = status.startsWith("OK") || status.startsWith("Yes") || status.startsWith("Connected") || status.startsWith("Free") || status.contains("✓")
+    // "Active" for port status is also okay if service is running
+    val isWarning = status.startsWith("Active") || status.contains("Muted")
+
     val icon = if (isPass) Icons.Default.CheckCircle else if (status.contains("Checking")) Icons.Default.Refresh else Icons.Default.Warning
-    val color = if (isPass) Color(0xFF4CAF50) else if (status.contains("Checking")) Color.Gray else MaterialTheme.colorScheme.error
+
+    val color = if (isPass) Color(0xFF4CAF50)
+    else if (isWarning) Color(0xFFFF9800) // Orange for warnings
+    else if (status.contains("Checking")) Color.Gray
+    else MaterialTheme.colorScheme.error
 
     Row(
         Modifier.fillMaxWidth().padding(vertical = 8.dp).background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp)).padding(12.dp),
@@ -393,6 +429,54 @@ suspend fun checkServer(): String = withContext(Dispatchers.IO) {
         if (code in 200..405) "OK ($duration ms)" else "Fail (Error $code)"
     } catch (e: Exception) {
         "Fail (Offline)"
+    }
+}
+
+// [NEW] Call Volume Check
+fun checkVolume(context: Context): String {
+    val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    val current = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+    val max = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+    val pct = (current.toFloat() / max * 100).toInt()
+    return if (current == 0) "Muted (0%)" else "$pct% ($current/$max)"
+}
+
+// [NEW] Port Check
+fun checkPort50005(): String {
+    return try {
+        val socket = DatagramSocket(50005)
+        socket.close()
+        "Free (Service Stopped)"
+    } catch (e: java.net.BindException) {
+        "Active (Service Running)"
+    } catch (e: Exception) {
+        "Fail (${e.message})"
+    }
+}
+
+// [NEW] UDP/STUN Check
+suspend fun checkStunConnectivity(): String = withContext(Dispatchers.IO) {
+    try {
+        val socket = DatagramSocket()
+        socket.soTimeout = 2500
+
+        val request = StunClient.createBindRequest()
+            ?: return@withContext "Fail (Gen Request)"
+
+        socket.send(request)
+
+        val buf = ByteArray(1024)
+        val p = DatagramPacket(buf, buf.size)
+        socket.receive(p)
+
+        val res = StunClient.parseResponse(p.data)
+        socket.close()
+
+        if (res != null) "OK (Public IP Resolved)" else "Fail (Parse Error)"
+    } catch (e: SocketTimeoutException) {
+        "Fail (UDP Blocked/Timeout)"
+    } catch (e: Exception) {
+        "Fail (${e.message})"
     }
 }
 
