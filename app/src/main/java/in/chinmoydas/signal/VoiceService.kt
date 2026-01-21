@@ -78,7 +78,7 @@ class VoiceService : Service() {
     @Volatile private var isOnWifi = false
     @Volatile private var dataSaverEnabled = false
 
-    // [NEW] Smart Memoization for Keys (Prevents CPU Lag)
+    // Cache for keys
     @Volatile private var activeKeySpec: javax.crypto.spec.SecretKeySpec? = null
     @Volatile private var activeKeySource: String? = null
 
@@ -93,8 +93,14 @@ class VoiceService : Service() {
     @Volatile private var myUsername: String = "User"
     @Volatile private var myLocalIp: String = ""
 
+    // [FIXED] Restored currentChannelKey for Heartbeat usage
     @Volatile private var currentChannel: String? = null
     @Volatile private var currentChannelKey: String? = null
+
+    // [NEW] Encryption Keys
+    @Volatile private var targetContactKey: String? = null // Key to encrypt OUTGOING (Their PIN)
+    @Volatile private var myIdentityKey: String? = null    // Key to decrypt INCOMING (My PIN)
+
     @Volatile private var currentSpeakerName: String? = null
 
     var isSilenced: Boolean = false
@@ -248,6 +254,10 @@ class VoiceService : Service() {
 
     private fun observeRepositoryFlows() {
         scope.launch { repository.myUsername.collect { myUsername = it; localLinkManager?.startAdvertising(it, UDP_PORT) } }
+
+        // [FIX] Always keep MY PIN ready for decryption
+        scope.launch { repository.myPairingCode.collect { myIdentityKey = it } }
+
         scope.launch {
             repository.targetUser.collect { target ->
                 if (target.startsWith("group:", ignoreCase = true)) {
@@ -256,7 +266,17 @@ class VoiceService : Service() {
                         val parts = raw.split(":", limit = 2)
                         currentChannel = parts[0]
                     } else { currentChannel = raw }
-                } else { currentChannel = null; currentChannelKey = null }
+                } else {
+                    currentChannel = null
+
+                    // [FIX] Load the Target's specific PIN from DB for ENCRYPTION
+                    val savedContact = repository.getAllContacts().find { it.name == target }
+                    if (savedContact != null) {
+                        targetContactKey = savedContact.savedCode
+                    } else {
+                        targetContactKey = null // Unknown/Unsaved user = Raw Audio
+                    }
+                }
 
                 triggerHeartbeat()
 
@@ -273,23 +293,33 @@ class VoiceService : Service() {
                 blockedCache.addAll(blocked.map { it.name })
             }
         }
+        // [FIX] Handle Group Keys and Channel Key for Heartbeat
         scope.launch {
             repository.channelKey.collect { key ->
-                currentChannelKey = key
-                triggerHeartbeat()
+                currentChannelKey = key // Used for Heartbeat
+                if (currentChannel != null) {
+                    targetContactKey = key // For groups, target key IS the channel key
+                }
             }
         }
     }
 
-    // [NEW] Smart Key Retrieval - Uses Cache to avoid CPU overhead
-    private fun getSmartKey(): javax.crypto.spec.SecretKeySpec? {
-        val dbKey = currentChannelKey
-        if (dbKey == activeKeySource && activeKeySpec != null) {
-            return activeKeySpec
-        }
-        activeKeySource = dbKey
-        activeKeySpec = CryptoEngine.deriveKey(dbKey)
+    // [FIX] Helper to get key for ENCRYPTION (Sending)
+    private fun getEncryptionKey(): javax.crypto.spec.SecretKeySpec? {
+        val keyToUse = targetContactKey
+        if (keyToUse.isNullOrBlank()) return null
+
+        if (keyToUse == activeKeySource && activeKeySpec != null) return activeKeySpec
+        activeKeySource = keyToUse
+        activeKeySpec = CryptoEngine.deriveKey(keyToUse)
         return activeKeySpec
+    }
+
+    // [FIX] Helper to get key for DECRYPTION (Receiving)
+    private fun getDecryptionKey(isGroupPacket: Boolean): javax.crypto.spec.SecretKeySpec? {
+        val keyToUse = if (isGroupPacket) targetContactKey else myIdentityKey
+        if (keyToUse.isNullOrBlank()) return null
+        return CryptoEngine.deriveKey(keyToUse)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -330,7 +360,6 @@ class VoiceService : Service() {
         audioEngine.startPlayback()
 
         val networkStarted = networkEngine.start { packet ->
-            // [STUN] Check for STUN response to find our public port
             if (StunClient.isStunResponse(packet.data)) {
                 val result = StunClient.parseResponse(packet.data)
                 if (result != null && myPublicPort != result.publicPort) {
@@ -340,7 +369,6 @@ class VoiceService : Service() {
                 }
                 return@start
             }
-            // Standard Audio/Signal Packet
             handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
         }
 
@@ -358,7 +386,6 @@ class VoiceService : Service() {
         return START_STICKY
     }
 
-    // [CRITICAL] AUTOMATED HOLE PUNCHING (Auto-Connect)
     private fun startSignalLoop() {
         signalingJob?.cancel()
         signalingJob = scope.launch {
@@ -367,8 +394,6 @@ class VoiceService : Service() {
                 if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
                     try {
                         val response = RetrofitClient.api.checkSignals("Bearer $token")
-
-                        // 1. Process Smart Signals (With IP)
                         val smartSignals = response.signals
                         if (!smartSignals.isNullOrEmpty()) {
                             smartSignals.forEach { signal ->
@@ -377,14 +402,11 @@ class VoiceService : Service() {
                                 if (!ip.isNullOrBlank()) {
                                     activeIpCache[signal.sender] = ip
                                     repository.updateContactIp(signal.sender, ip)
-                                    // SEND KNOCK IMMEDIATELY
                                     sendPing(ip, port)
                                     Log.i(tag, "Auto-Knock sent to ${signal.sender} at $ip")
                                 }
                             }
-                        }
-                        // 2. Legacy Fallback (Without IP)
-                        else if (!response.callers.isNullOrEmpty()) {
+                        } else if (!response.callers.isNullOrEmpty()) {
                             val contacts = repository.getAllContacts()
                             response.callers.forEach { caller ->
                                 val ip = activeIpCache[caller] ?: contacts.find { it.name == caller }?.ip
@@ -412,7 +434,6 @@ class VoiceService : Service() {
             val buf = ByteArray(1 + signalBytes.size + 4)
             buf[0] = signalBytes.size.toByte()
             System.arraycopy(signalBytes, 0, buf, 1, signalBytes.size)
-            // Send to the specific port (hole punching)
             repeat(3) { networkEngine.send(buf, listOf(ip), port); delay(20) }
         }
     }
@@ -486,20 +507,15 @@ class VoiceService : Service() {
             if (payloadLen > 0) {
                 var payload = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
 
-                // --- SMART ENCRYPTION & MOBILE DATA FIX ---
                 val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
                 val isSecureMode = prefs.getBoolean("secure_mode", false)
 
                 if (isSecureMode) {
-                    val secretKey = getSmartKey()
+                    val isGroup = senderName.startsWith("group:")
+                    val secretKey = getDecryptionKey(isGroup)
 
                     if (secretKey != null) {
-                        // 1. Try Standard Decryption
                         var decrypted = CryptoEngine.decrypt(payload, seqNum, secretKey)
-
-                        // 2. RETRY: If failed, check for Carrier Padding (Garbage Bytes)
-                        // Standard G.711 encrypted packet is 656 bytes.
-                        // Carriers sometimes pad to 660+. We trim and try again.
                         if (decrypted == null && payload.size > 656 && payload.size < 700) {
                             try {
                                 val trimmedPayload = payload.copyOfRange(0, 656)
@@ -508,16 +524,12 @@ class VoiceService : Service() {
                         }
 
                         if (decrypted != null) {
-                            payload = decrypted // Success!
+                            payload = decrypted
                         } else {
-                            // 3. FALLBACK (Mixed Mode):
-                            // If still failed, check if it's Raw Audio (640 or 1280).
-                            // If yes, playing unencrypted audio. If no, assume bad encrypted packet.
                             if (payload.size != 640 && payload.size != 1280) return
                         }
                     }
                 }
-                // ------------------------------------------
 
                 if (!isSilenced) { try { audioEngine.writeAudio(seqNum, payload) } catch (e: Exception) {} }
                 if (isRecordingEnabled) { synchronized(bufferLock) { try { incomingBuffer.write(payload) } catch (t: Throwable) {} } }
@@ -605,9 +617,10 @@ class VoiceService : Service() {
         val shouldCompress = isGroupCall || (!isOnWifi && dataSaverEnabled)
 
         val isSecureMode = prefs.getBoolean("secure_mode", false)
-        val secretKey = if (isSecureMode) getSmartKey() else null
+        val secretKey = if (isSecureMode) getEncryptionKey() else null
 
-        if (isSecureMode) Log.i(tag, "Starting SECURE transmission")
+        if (isSecureMode && secretKey != null) Log.i(tag, "Starting SECURE transmission")
+        else Log.i(tag, "Starting RAW transmission")
 
         scope.launch { repository.insertLog(if (isGroupCall) "Group Broadcast" else "PTT Call", false) }
 
