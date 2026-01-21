@@ -16,6 +16,9 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.PowerManager
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.speech.tts.TextToSpeech
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -25,13 +28,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.filled.Hearing
-import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -56,6 +53,7 @@ import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.SocketTimeoutException
 import java.net.URL
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -73,10 +71,14 @@ fun DiagnosticsScreen(navController: NavController) {
     var storageStatus by remember { mutableStateOf(checkStorage(context)) }
     var audioFxStatus by remember { mutableStateOf(checkAudioEffects()) }
 
-    // [NEW] Additional Diagnostics States
+    // Connectivity
     var stunStatus by remember { mutableStateOf("Checking...") }
     var portStatus by remember { mutableStateOf(checkPort50005()) }
     var volumeStatus by remember { mutableStateOf(checkVolume(context)) }
+
+    // [NEW] TTS State
+    var ttsStatus by remember { mutableStateOf("Initializing...") }
+    var ttsEngine: TextToSpeech? by remember { mutableStateOf(null) }
 
     // Audio Output State
     var audioRouteInfo by remember { mutableStateOf(getAudioRoute(context)) }
@@ -90,12 +92,28 @@ fun DiagnosticsScreen(navController: NavController) {
     val player = remember { mutableStateOf<MediaPlayer?>(null) }
     val testFile = File(context.cacheDir, "audio_test.3gp")
 
-    // Safety: Reset Audio Mode when leaving this screen
+    // Initialize TTS
     DisposableEffect(Unit) {
+        val tts = TextToSpeech(context) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                val result = ttsEngine?.setLanguage(Locale.US)
+                ttsStatus = if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    "Fail (Lang Missing)"
+                } else {
+                    "OK (Ready)"
+                }
+            } else {
+                ttsStatus = "Fail (Init Error)"
+            }
+        }
+        ttsEngine = tts
+
         onDispose {
             val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             am.mode = AudioManager.MODE_NORMAL
             am.isSpeakerphoneOn = false
+            tts.stop()
+            tts.shutdown()
         }
     }
 
@@ -104,8 +122,6 @@ fun DiagnosticsScreen(navController: NavController) {
         localIp = getLocalIpAddress()
         serverStatus = checkServer()
         audioRouteInfo = getAudioRoute(context)
-
-        // [NEW] Run Async Checks
         stunStatus = checkStunConnectivity()
         volumeStatus = checkVolume(context)
         portStatus = checkPort50005()
@@ -124,6 +140,7 @@ fun DiagnosticsScreen(navController: NavController) {
             Server: $serverStatus
             Port 50005: $portStatus
             Voice Vol: $volumeStatus
+            TTS Engine: $ttsStatus
             Storage: $storageStatus
             Audio HW: $audioFxStatus
             Audio Route: ${audioRouteInfo.displayText.replace("\n", " | ")}
@@ -143,12 +160,12 @@ fun DiagnosticsScreen(navController: NavController) {
                 actions = {
                     IconButton(onClick = { copyReport() }) { Icon(Icons.Default.ContentCopy, "Copy Report") }
                     IconButton(onClick = {
-                        // Reset statuses to "Checking..." for visuals
+                        // Reset statuses
                         netStatus = "Checking..."
                         serverStatus = "Checking..."
                         stunStatus = "Checking..."
 
-                        // Reload synchronous checks
+                        // Reload checks
                         permStatus = checkPermissions(context)
                         batteryStatus = checkBattery(context)
                         storageStatus = checkStorage(context)
@@ -158,7 +175,6 @@ fun DiagnosticsScreen(navController: NavController) {
                         portStatus = checkPort50005()
                         volumeStatus = checkVolume(context)
 
-                        // Reload async checks
                         scope.launch {
                             netStatus = checkNetwork(context)
                             serverStatus = checkServer()
@@ -180,17 +196,44 @@ fun DiagnosticsScreen(navController: NavController) {
             DiagnosticRow("Permissions", permStatus)
             DiagnosticRow("Battery Opt", batteryStatus)
             DiagnosticRow("Network", netStatus)
-            DiagnosticRow("NAT/STUN", stunStatus) // [NEW]
+            DiagnosticRow("NAT/STUN", stunStatus)
             DiagnosticRow("Local IP", localIp)
             DiagnosticRow("Server API", serverStatus)
-            DiagnosticRow("Port 50005", portStatus) // [NEW]
-            DiagnosticRow("Voice Vol", volumeStatus) // [NEW]
+            DiagnosticRow("Port 50005", portStatus)
+            DiagnosticRow("Voice Vol", volumeStatus)
+            DiagnosticRow("TTS Engine", ttsStatus) // [NEW]
             DiagnosticRow("Storage", storageStatus)
             DiagnosticRow("Audio HW", audioFxStatus)
 
             HorizontalDivider(Modifier.padding(vertical = 24.dp))
 
-            // 2. AUDIO OUTPUT CHECK
+            // 2. [NEW] TTS & HAPTICS CHECK
+            Text("Alerts & Feedback", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.height(8.dp))
+
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant), modifier = Modifier.fillMaxWidth()) {
+                Row(Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Button(onClick = {
+                        ttsEngine?.speak("Signal Strength Maximum", TextToSpeech.QUEUE_FLUSH, null, null)
+                    }, enabled = ttsStatus.startsWith("OK")) {
+                        Icon(Icons.Default.RecordVoiceOver, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Test Voice")
+                    }
+
+                    OutlinedButton(onClick = {
+                        testVibration(context)
+                    }) {
+                        Icon(Icons.Default.Vibration, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Vibrate")
+                    }
+                }
+            }
+
+            HorizontalDivider(Modifier.padding(vertical = 24.dp))
+
+            // 3. AUDIO OUTPUT CHECK
             Text("Audio Output Check", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(8.dp))
 
@@ -222,7 +265,7 @@ fun DiagnosticsScreen(navController: NavController) {
 
             HorizontalDivider(Modifier.padding(vertical = 24.dp))
 
-            // 3. MIC LOOPBACK TEST
+            // 4. MIC LOOPBACK TEST
             Text("Mic & Speaker Loopback", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
             Text("Record 3s then play back.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
             Spacer(Modifier.height(16.dp))
@@ -317,18 +360,34 @@ fun toggleSpeakerTest(context: Context, on: Boolean) {
     }
 }
 
+fun testVibration(context: Context) {
+    val v = if (Build.VERSION.SDK_INT >= 31) {
+        val manager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as android.os.VibratorManager
+        manager.defaultVibrator
+    } else {
+        @Suppress("DEPRECATION")
+        context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+    }
+
+    if (Build.VERSION.SDK_INT >= 26) {
+        v.vibrate(VibrationEffect.createOneShot(200, VibrationEffect.DEFAULT_AMPLITUDE))
+    } else {
+        @Suppress("DEPRECATION")
+        v.vibrate(200)
+    }
+}
+
 // --- DIAGNOSTIC HELPERS ---
 @Composable
 fun DiagnosticRow(label: String, status: String) {
     val isPass = status.startsWith("OK") || status.startsWith("Yes") || status.startsWith("Connected") || status.startsWith("Free") || status.contains("✓")
-    // "Active" for port status is also okay if service is running
-    val isWarning = status.startsWith("Active") || status.contains("Muted")
+    val isWarning = status.startsWith("Active") || status.contains("Muted") || status.contains("Restricted")
 
-    val icon = if (isPass) Icons.Default.CheckCircle else if (status.contains("Checking")) Icons.Default.Refresh else Icons.Default.Warning
+    val icon = if (isPass) Icons.Default.CheckCircle else if (status.contains("Checking") || status.contains("Initializing")) Icons.Default.Refresh else Icons.Default.Warning
 
     val color = if (isPass) Color(0xFF4CAF50)
-    else if (isWarning) Color(0xFFFF9800) // Orange for warnings
-    else if (status.contains("Checking")) Color.Gray
+    else if (isWarning) Color(0xFFFF9800)
+    else if (status.contains("Checking") || status.contains("Initializing")) Color.Gray
     else MaterialTheme.colorScheme.error
 
     Row(
@@ -432,7 +491,6 @@ suspend fun checkServer(): String = withContext(Dispatchers.IO) {
     }
 }
 
-// [NEW] Call Volume Check
 fun checkVolume(context: Context): String {
     val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     val current = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
@@ -441,7 +499,6 @@ fun checkVolume(context: Context): String {
     return if (current == 0) "Muted (0%)" else "$pct% ($current/$max)"
 }
 
-// [NEW] Port Check
 fun checkPort50005(): String {
     return try {
         val socket = DatagramSocket(50005)
@@ -454,7 +511,6 @@ fun checkPort50005(): String {
     }
 }
 
-// [NEW] UDP/STUN Check
 suspend fun checkStunConnectivity(): String = withContext(Dispatchers.IO) {
     try {
         val socket = DatagramSocket()

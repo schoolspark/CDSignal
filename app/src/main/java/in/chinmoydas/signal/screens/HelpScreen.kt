@@ -13,6 +13,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
@@ -56,18 +57,19 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 2: JOINING CHANNELS (Restored) ---
+            // --- SECTION 2: SILENT TEXT MESSAGES (NEW) ---
             HelpCard(
-                title = "📢 JOINING GROUP CHANNELS",
-                icon = Icons.Default.Groups,
+                title = "💬 SILENT TEXT MESSAGES",
+                icon = Icons.Default.Keyboard,
                 color = MaterialTheme.colorScheme.tertiaryContainer
             ) {
-                Text("To join a Frequency or Team Channel:", fontWeight = FontWeight.Bold)
+                Text("Send encrypted text over UDP without speaking:", fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
-                Step(1, "Ask the Team Leader to show their 'Channel QR'.")
-                Step(2, "Scan it using the same scanner on the 'Connect' tab.")
-                Step(3, "You will instantly join the group (e.g., 'Security Team').")
-                Step(4, "To share a channel: Find it in 'My Contacts', tap the arrow, and select 'Share Channel QR'.")
+                Step(1, "Tap the Keyboard Icon (⌨️) on the Radio screen.")
+                Step(2, "Type your message and tap SEND.")
+                Step(3, "Receiver Behavior:", isBold = true)
+                Text("• If Receiver is LOUD: Phone speaks the text (TTS).", style = MaterialTheme.typography.bodySmall)
+                Text("• If Receiver is SILENT: Message saves to Voice Pager.", style = MaterialTheme.typography.bodySmall)
             }
 
             Spacer(Modifier.height(16.dp))
@@ -94,13 +96,13 @@ fun HelpScreen(navController: NavController) {
 
             // --- SECTION 4: VOICE PAGER ---
             HelpCard(
-                title = "📟 VOICE PAGER MODE",
+                title = "📟 VOICE PAGER (LOGS)",
                 icon = Icons.Default.NotificationsOff,
                 color = MaterialTheme.colorScheme.surfaceVariant
             ) {
-                Text("Tap the 'Silent Mode' (Bell) icon on the Radio screen.", fontWeight = FontWeight.Bold)
+                Text("Tap the 'Silent Mode' (Bell) icon to mute live audio.", fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(4.dp))
-                Text("When active, incoming audio is SILENCED but RECORDED. Check 'History' tab to listen later.")
+                Text("Incoming Audio & Text will be saved to the Pager List below the PTT button. Tap any item to Play/Speak it. Items vanish after playing (Burn-on-Read).")
             }
 
             Spacer(Modifier.height(16.dp))
@@ -153,7 +155,7 @@ fun HelpScreen(navController: NavController) {
 }
 
 @Composable
-fun HelpCard(title: String, icon: androidx.compose.ui.graphics.vector.ImageVector, color: Color, content: @Composable ColumnScope.() -> Unit) {
+fun HelpCard(title: String, icon: ImageVector, color: Color, content: @Composable ColumnScope.() -> Unit) {
     Card(
         colors = CardDefaults.cardColors(containerColor = color),
         modifier = Modifier.fillMaxWidth()

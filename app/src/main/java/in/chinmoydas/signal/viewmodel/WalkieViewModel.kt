@@ -16,6 +16,7 @@ import com.google.zxing.qrcode.QRCodeWriter
 import `in`.chinmoydas.signal.VoiceService
 import `in`.chinmoydas.signal.data.CallLog
 import `in`.chinmoydas.signal.data.MainRepository
+import `in`.chinmoydas.signal.data.PagerEntry
 import `in`.chinmoydas.signal.utils.LocalLinkManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -26,14 +27,18 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import android.graphics.Color as AndroidColor
 
-data class Contact(val name: String, var ip: String, val isTrusted: Boolean = false, val savedCode: String = "")
+// [FIXED] Updated Contact Data Class to include 'isPriority'
+data class Contact(
+    val name: String,
+    var ip: String,
+    val isTrusted: Boolean = false,
+    val savedCode: String = "",
+    val isPriority: Boolean = false
+)
 
-// Connection Health Enum
 enum class ConnectionStatus {
     IDLE, CHECKING, READY, OFFLINE
 }
-
-// [DELETED] sealed class UiState is removed from here because it is now in UiState.kt
 
 class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
@@ -41,10 +46,12 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
     val myPairingCode: StateFlow<String> = repository.myPairingCode
 
+    val pagerEntries: StateFlow<List<PagerEntry>> = repository.pagerEntries
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     var targetUser by mutableStateOf("")
         private set
 
-    // Connection Status State
     var connectionStatus by mutableStateOf(ConnectionStatus.IDLE)
         private set
     private var pingJob: Job? = null
@@ -60,7 +67,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     var savedContacts = mutableStateListOf<Contact>()
     var blockedContacts = mutableStateListOf<Contact>()
 
-    var recordedMessages = mutableStateListOf<File>()
     private var mediaPlayer: android.media.MediaPlayer? = null
     private val _callLogs = MutableStateFlow<List<CallLog>>(emptyList())
     val callLogs: StateFlow<List<CallLog>> = _callLogs.asStateFlow()
@@ -73,7 +79,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                 if (_uiState.value is UiState.Ready || _uiState.value is UiState.Connected) {
                     _uiState.value = if (newTarget.isEmpty()) UiState.Ready else UiState.Connected(newTarget)
                 }
-                // [FIX] Reset status when target changes
                 if (newTarget.isNotEmpty()) {
                     connectionStatus = ConnectionStatus.CHECKING
                 } else {
@@ -84,11 +89,18 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         loadData()
     }
 
-    // --- PING/PONG LOGIC ---
+    // [NEW] Toggle Priority Logic
+    fun togglePriority(name: String) {
+        val contact = savedContacts.find { it.name == name } ?: return
+        viewModelScope.launch {
+            repository.setContactPriority(name, !contact.isPriority)
+            loadData()
+        }
+    }
+
     fun observeServicePing(service: VoiceService?) {
         viewModelScope.launch {
             service?.voiceServiceState?.collect { state ->
-                // If we get a fresh PONG (< 2s ago), set status to READY
                 val diff = System.currentTimeMillis() - state.lastPingResponse
                 if (state.lastPingResponse > 0 && diff < 2000) {
                     connectionStatus = ConnectionStatus.READY
@@ -125,62 +137,68 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
             connectionStatus = ConnectionStatus.OFFLINE
         }
     }
-    // -----------------------
 
     fun loadData() {
         viewModelScope.launch {
             savedContacts.clear()
-            savedContacts.addAll(repository.getAllContacts().map { Contact(it.name, it.ip, true, it.savedCode) })
+            // [FIXED] Now mapping the 5th argument 'isPriority' correctly
+            savedContacts.addAll(repository.getAllContacts().map {
+                Contact(it.name, it.ip, true, it.savedCode, it.isPriority)
+            })
+
             blockedContacts.clear()
-            blockedContacts.addAll(repository.getBlockedContacts().map { Contact(it.name, it.ip, true, it.savedCode) })
+            blockedContacts.addAll(repository.getBlockedContacts().map {
+                Contact(it.name, it.ip, true, it.savedCode, it.isPriority)
+            })
+
             _callLogs.value = repository.getAllLogs()
         }
     }
 
-    // Auto-Cleanup Recordings
-    fun loadRecordings(context: Context) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val dir = context.cacheDir
-            val sevenDaysAgo = System.currentTimeMillis() - (7 * 24 * 60 * 60 * 1000)
-
-            // 1. Cleanup
-            dir.listFiles { _, name -> name.endsWith(".wav") }?.forEach { file ->
-                if (file.lastModified() < sevenDaysAgo) {
-                    try { file.delete() } catch (e: Exception) { Log.e("WalkieViewModel", "Cleanup failed for ${file.name}", e) }
-                }
-            }
-
-            // 2. Load
-            val files = dir.listFiles { _, name -> name.endsWith(".wav") }
-
-            // 3. Update UI
-            withContext(Dispatchers.Main) {
-                recordedMessages.clear()
-                files?.sortedByDescending { it.lastModified() }?.let { recordedMessages.addAll(it) }
-            }
+    fun deletePagerEntry(entry: PagerEntry) {
+        viewModelScope.launch {
+            repository.deletePagerEntry(entry)
         }
     }
 
-    fun deleteRecording(file: File) {
-        try {
-            if (file.exists()) file.delete()
-            recordedMessages.remove(file)
-        } catch (e: Exception) { Log.e("WalkieViewModel", "Delete failed", e) }
+    fun clearPagerHistory() {
+        viewModelScope.launch { repository.clearPagerHistory() }
     }
 
-    fun deleteAllRecordings(context: Context) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val dir = context.cacheDir
-            dir.listFiles { _, name -> name.endsWith(".wav") }?.forEach {
-                try { it.delete() } catch (e: Exception) {}
+    fun sendTextPayload(service: VoiceService?, text: String) {
+        if (text.isBlank()) return
+
+        val target = targetUser
+        if (target.isEmpty()) {
+            _uiState.value = UiState.Error("Select a Target")
+            return
+        }
+
+        val contact = savedContacts.find { it.name == target } ?: nearbyUsers.find { it.name == target }
+        val ip = contact?.ip
+
+        if (ip != null && ip != "SERVER_LINK") {
+            service?.sendTextMessage(ip, text)
+            viewModelScope.launch {
+                repository.insertPagerEntry(
+                    PagerEntry(sender = "Me", type = "TEXT", content = text, isRead = true)
+                )
             }
-            withContext(Dispatchers.Main) {
-                recordedMessages.clear()
-            }
+        } else {
+            _uiState.value = UiState.Error("Target Offline")
         }
     }
 
-    fun playAndBurnMessage(file: File) {
+    fun playEntry(context: Context, entry: PagerEntry, service: VoiceService?) {
+        if (entry.type == "AUDIO") {
+            val file = File(entry.content)
+            playAndBurnMessage(file)
+        } else {
+            service?.speakText(entry.content)
+        }
+    }
+
+    private fun playAndBurnMessage(file: File) {
         try {
             mediaPlayer?.release()
             mediaPlayer = android.media.MediaPlayer().apply {
@@ -190,9 +208,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                 setOnCompletionListener { mp ->
                     mp.release()
                     mediaPlayer = null
-                    if (file.exists()) file.delete()
-                    viewModelScope.launch { recordedMessages.remove(file) }
-                    Log.d("WalkieViewModel", "Message played and deleted: ${file.name}")
                 }
             }
         } catch (e: Exception) { Log.e("WalkieViewModel", "Playback failed", e) }
@@ -203,8 +218,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         val contact = savedContacts.find { it.name == name }
         val key = contact?.savedCode ?: ""
         repository.saveChannelKey(key)
-
-        // [FIX] Trigger immediate check when setting target
         connectionStatus = ConnectionStatus.CHECKING
     }
 
@@ -396,7 +409,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
                 val saved = savedContacts.find { it.name == from }
                 if (saved != null && saved.ip != ip) {
-                    Log.d("WalkieViewModel", "Auto-updating Contact IP: $from -> $ip")
                     repository.saveContact(from, ip, saved.savedCode)
                     val idx = savedContacts.indexOf(saved)
                     if (idx != -1) savedContacts[idx] = saved.copy(ip = ip)

@@ -1,6 +1,7 @@
 package `in`.chinmoydas.signal.data
 
 import androidx.room.*
+import kotlinx.coroutines.flow.Flow
 
 // --- ENTITIES ---
 
@@ -17,7 +18,19 @@ data class ContactEntity(
     @PrimaryKey val name: String,
     val ip: String,
     val savedCode: String = "",
-    val isBlocked: Boolean = false
+    val isBlocked: Boolean = false,
+    val isPriority: Boolean = false // [NEW] Priority Flag
+)
+
+// Entity for Silent Comms (Voice Pager)
+@Entity(tableName = "pager_entries")
+data class PagerEntry(
+    @PrimaryKey(autoGenerate = true) val id: Int = 0,
+    val sender: String,
+    val timestamp: Long = System.currentTimeMillis(),
+    val type: String,    // "AUDIO" or "TEXT"
+    val content: String, // File path (for Audio) OR Message body (for Text)
+    val isRead: Boolean = false
 )
 
 // --- DAOs ---
@@ -45,6 +58,10 @@ interface ContactDao {
     @Query("SELECT * FROM contacts WHERE isBlocked = 1")
     suspend fun getBlockedContacts(): List<ContactEntity>
 
+    // [MOVED HERE] Get VIPs
+    @Query("SELECT * FROM contacts WHERE isPriority = 1")
+    suspend fun getPrincipalContacts(): List<ContactEntity>
+
     // Helper to preserve blocked status when re-saving a contact
     @Query("SELECT EXISTS(SELECT 1 FROM contacts WHERE name = :name AND isBlocked = 1)")
     suspend fun isBlocked(name: String): Boolean
@@ -55,18 +72,39 @@ interface ContactDao {
     @Query("UPDATE contacts SET isBlocked = :blocked WHERE name = :name")
     suspend fun setBlockedStatus(name: String, blocked: Boolean)
 
-    // [CRITICAL FIX] Silent IP Update
-    // This allows VoiceService to update IPs in the background without triggering a full UI refresh
+    // [MOVED HERE] Set Priority
+    @Query("UPDATE contacts SET isPriority = :isPriority WHERE name = :name")
+    suspend fun setPriority(name: String, isPriority: Boolean)
+
+    // Silent IP Update helper
     @Query("UPDATE contacts SET ip = :newIp WHERE name = :name")
     suspend fun updateIp(name: String, newIp: String)
 }
 
+// DAO for Pager Logic
+@Dao
+interface PagerDao {
+    @Insert
+    suspend fun insert(entry: PagerEntry)
+
+    // Returns a Flow so the UI updates instantly when a new message arrives
+    @Query("SELECT * FROM pager_entries ORDER BY timestamp DESC")
+    fun getAllEntries(): Flow<List<PagerEntry>>
+
+    @Delete
+    suspend fun delete(entry: PagerEntry)
+
+    @Query("DELETE FROM pager_entries")
+    suspend fun clearAll()
+}
+
 // --- DATABASE ---
 
-@Database(entities = [CallLog::class, ContactEntity::class], version = 3)
+@Database(entities = [CallLog::class, ContactEntity::class, PagerEntry::class], version = 5)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun callLogDao(): CallLogDao
     abstract fun contactDao(): ContactDao
+    abstract fun pagerDao(): PagerDao
 
     companion object {
         @Volatile private var instance: AppDatabase? = null
@@ -77,7 +115,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "cd_signal_db"
                 )
-                    .fallbackToDestructiveMigration(false)
+                    .fallbackToDestructiveMigration()
                     .build().also { instance = it }
             }
         }

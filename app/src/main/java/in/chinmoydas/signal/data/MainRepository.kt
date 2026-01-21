@@ -3,14 +3,17 @@ package `in`.chinmoydas.signal.data
 import android.content.Context
 import android.content.SharedPreferences
 import `in`.chinmoydas.signal.RetrofitClient
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.io.File
 
 class MainRepository(context: Context) {
     private val db = AppDatabase.getDatabase(context)
     private val contactDao = db.contactDao()
     private val callLogDao = db.callLogDao()
+    private val pagerDao = db.pagerDao() // [NEW] Pager DAO
     private val prefs: SharedPreferences = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
 
     private val _targetUser = MutableStateFlow(prefs.getString("current_target", "") ?: "")
@@ -28,6 +31,9 @@ class MainRepository(context: Context) {
     private val _configTrigger = MutableStateFlow(0)
     val configTrigger: StateFlow<Int> = _configTrigger.asStateFlow()
 
+    // [NEW] Expose Pager Entries as a Flow for Real-time UI updates
+    val pagerEntries: Flow<List<PagerEntry>> = pagerDao.getAllEntries()
+
     private val prefsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         when (key) {
             "current_target" -> _targetUser.value = prefs.getString("current_target", "") ?: ""
@@ -42,8 +48,39 @@ class MainRepository(context: Context) {
         prefs.registerOnSharedPreferenceChangeListener(prefsListener)
     }
 
+    // --- PAGER / SILENT COMMS METHODS ---
+
+    suspend fun insertPagerEntry(entry: PagerEntry) {
+        pagerDao.insert(entry)
+    }
+
+    suspend fun deletePagerEntry(entry: PagerEntry) {
+        // If it's an audio file, delete the actual file from storage to save space
+        if (entry.type == "AUDIO") {
+            try {
+                val file = File(entry.content)
+                if (file.exists()) file.delete()
+            } catch (e: Exception) { e.printStackTrace() }
+        }
+        // Then delete the database record
+        pagerDao.delete(entry)
+    }
+
+    suspend fun clearPagerHistory() {
+        // Note: For a true cleanup, you might want to iterate and delete files first,
+        // but for speed, clearing the DB is usually sufficient for the UI.
+        pagerDao.clearAll()
+    }
+
+    // --- CONTACTS ---
+
     suspend fun getAllContacts() = contactDao.getAllContacts()
     suspend fun getBlockedContacts() = contactDao.getBlockedContacts()
+
+    // Helper used by VoiceService for encryption lookups
+    suspend fun findContactByIp(ip: String): ContactEntity? {
+        return contactDao.getAllContacts().find { it.ip == ip }
+    }
 
     suspend fun saveContact(name: String, ip: String, code: String) {
         val isBlocked = contactDao.isBlocked(name) // Preserve Block Status
@@ -51,8 +88,7 @@ class MainRepository(context: Context) {
         triggerConfigRefresh() // Normal save triggers a refresh
     }
 
-    // [CRITICAL FIX] Silent Update
-    // Uses the specific DAO method to update IP without triggering config refresh
+    // Silent Update: Updates IP without triggering UI refresh
     suspend fun updateContactIp(name: String, ip: String) {
         contactDao.updateIp(name, ip)
     }
@@ -72,11 +108,15 @@ class MainRepository(context: Context) {
         prefs.edit().putInt("config_refresh_trigger", current + 1).apply()
     }
 
+    // --- CALL LOGS ---
+
     suspend fun getAllLogs() = callLogDao.getAllLogs()
     suspend fun insertLog(name: String, isIncoming: Boolean) {
         callLogDao.insert(CallLog(callerName = name, isIncoming = isIncoming))
     }
     suspend fun clearLogs() = callLogDao.clearAll()
+
+    // --- PREFS HELPERS ---
 
     fun getTargetUser(): String = targetUser.value
     fun setTargetUser(name: String) {
@@ -93,6 +133,8 @@ class MainRepository(context: Context) {
 
     fun getToken(): String? = prefs.getString("jwt_token", null)
 
+    // --- NETWORK API ---
+
     suspend fun findPeer(token: String, name: String, code: String) =
         RetrofitClient.api.findPeer("Bearer $token", name, code)
 
@@ -101,4 +143,11 @@ class MainRepository(context: Context) {
 
     suspend fun resetCode(token: String) =
         RetrofitClient.api.resetCode("Bearer $token")
+
+    suspend fun setContactPriority(name: String, isPriority: Boolean) {
+        contactDao.setPriority(name, isPriority)
+        triggerConfigRefresh()
+    }
+
+    suspend fun getPrincipalContacts() = contactDao.getPrincipalContacts()
 }

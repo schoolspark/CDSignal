@@ -19,27 +19,34 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.*
+import android.speech.tts.TextToSpeech
 import android.support.v4.media.session.MediaSessionCompat
 import android.view.KeyEvent
 import android.util.Log
-import android.widget.Toast
 import androidx.annotation.RequiresPermission
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.media.session.MediaButtonReceiver
+import `in`.chinmoydas.signal.data.AppDatabase
+import `in`.chinmoydas.signal.data.PagerEntry
 import `in`.chinmoydas.signal.data.MainRepository
 import `in`.chinmoydas.signal.utils.AudioEngine
 import `in`.chinmoydas.signal.utils.CryptoEngine
 import `in`.chinmoydas.signal.utils.G711
 import `in`.chinmoydas.signal.utils.LocalLinkManager
 import `in`.chinmoydas.signal.utils.NetworkEngine
+import `in`.chinmoydas.signal.RetrofitClient
 import `in`.chinmoydas.signal.utils.StunClient
 import `in`.chinmoydas.signal.utils.WavUtils
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.nio.ByteBuffer
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -54,7 +61,7 @@ data class VoiceServiceState(
     val isTransmitting: Boolean = false
 )
 
-class VoiceService : Service() {
+class VoiceService : Service(), TextToSpeech.OnInitListener {
     private val tag = "VoiceService"
     private val binder = LocalBinder()
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -65,6 +72,9 @@ class VoiceService : Service() {
     private lateinit var audioEngine: AudioEngine
     private lateinit var networkEngine: NetworkEngine
     private lateinit var repository: MainRepository
+
+    private var tts: TextToSpeech? = null
+    private var isTtsReady = false
 
     private lateinit var mediaSession: MediaSessionCompat
     private var isHeadsetLinked = true
@@ -79,7 +89,6 @@ class VoiceService : Service() {
     @Volatile private var isOnWifi = false
     @Volatile private var dataSaverEnabled = false
 
-    // Cache for keys
     @Volatile private var activeKeySpec: javax.crypto.spec.SecretKeySpec? = null
     @Volatile private var activeKeySource: String? = null
 
@@ -94,13 +103,11 @@ class VoiceService : Service() {
     @Volatile private var myUsername: String = "User"
     @Volatile private var myLocalIp: String = ""
 
-    // [FIXED] Restored currentChannelKey for Heartbeat usage
     @Volatile private var currentChannel: String? = null
     @Volatile private var currentChannelKey: String? = null
 
-    // [NEW] Encryption Keys
-    @Volatile private var targetContactKey: String? = null // Key to encrypt OUTGOING (Their PIN)
-    @Volatile private var myIdentityKey: String? = null    // Key to decrypt INCOMING (My PIN)
+    @Volatile private var targetContactKey: String? = null
+    @Volatile private var myIdentityKey: String? = null
 
     @Volatile private var currentSpeakerName: String? = null
 
@@ -127,6 +134,10 @@ class VoiceService : Service() {
     private val sequenceMap = ConcurrentHashMap<String, Int>()
     private val activeIpCache = ConcurrentHashMap<String, String>()
     private val blockedCache = ConcurrentHashMap.newKeySet<String>()
+
+    // VIP Cache for Principal Override
+    private val principalCache = ConcurrentHashMap.newKeySet<String>()
+
     @Volatile private var ignoredSender: String? = null
     @Volatile private var activeTargets: List<String> = emptyList()
     @Volatile private var lastPort: Int = UDP_PORT
@@ -160,10 +171,7 @@ class VoiceService : Service() {
         override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
             super.onCapabilitiesChanged(network, networkCapabilities)
             val isWifiNow = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
-            if (isOnWifi != isWifiNow) {
-                isOnWifi = isWifiNow
-                Log.d(tag, "Network Changed. WiFi: $isOnWifi")
-            }
+            if (isOnWifi != isWifiNow) isOnWifi = isWifiNow
         }
 
         override fun onAvailable(network: Network) {
@@ -187,12 +195,24 @@ class VoiceService : Service() {
         dataSaverEnabled = prefs.getBoolean("data_saver", false)
 
         initMediaSession()
+        tts = TextToSpeech(this, this)
 
         multicastLock.setReferenceCounted(false)
         wakeLock.setReferenceCounted(false)
         wifiLock.setReferenceCounted(false)
         val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         connectivityManager.registerNetworkCallback(NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), networkCallback)
+    }
+
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            val result = tts?.setLanguage(Locale.US)
+            isTtsReady = result != TextToSpeech.LANG_MISSING_DATA && result != TextToSpeech.LANG_NOT_SUPPORTED
+        }
+    }
+
+    fun speakText(text: String) {
+        if (isTtsReady) tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, null)
     }
 
     private fun initMediaSession() {
@@ -255,8 +275,6 @@ class VoiceService : Service() {
 
     private fun observeRepositoryFlows() {
         scope.launch { repository.myUsername.collect { myUsername = it; localLinkManager?.startAdvertising(it, UDP_PORT) } }
-
-        // [FIX] Always keep MY PIN ready for decryption
         scope.launch { repository.myPairingCode.collect { myIdentityKey = it } }
 
         scope.launch {
@@ -269,22 +287,12 @@ class VoiceService : Service() {
                     } else { currentChannel = raw }
                 } else {
                     currentChannel = null
-
-                    // [FIX] Load the Target's specific PIN from DB for ENCRYPTION
                     val savedContact = repository.getAllContacts().find { it.name == target }
-                    if (savedContact != null) {
-                        targetContactKey = savedContact.savedCode
-                    } else {
-                        targetContactKey = null // Unknown/Unsaved user = Raw Audio
-                    }
+                    if (savedContact != null) targetContactKey = savedContact.savedCode else targetContactKey = null
                 }
-
                 triggerHeartbeat()
-
                 val ip = activeIpCache[target] ?: repository.getAllContacts().find { it.name == target }?.ip
-                if (!ip.isNullOrBlank() && ip != "SERVER_LINK") {
-                    sendPing(ip)
-                }
+                if (!ip.isNullOrBlank() && ip != "SERVER_LINK") sendPing(ip)
             }
         }
         scope.launch {
@@ -292,31 +300,30 @@ class VoiceService : Service() {
                 val blocked = repository.getBlockedContacts()
                 blockedCache.clear()
                 blockedCache.addAll(blocked.map { it.name })
+
+                // VIP Cache refresh
+                val principals = repository.getPrincipalContacts()
+                principalCache.clear()
+                principalCache.addAll(principals.map { it.name })
             }
         }
-        // [FIX] Handle Group Keys and Channel Key for Heartbeat
         scope.launch {
             repository.channelKey.collect { key ->
-                currentChannelKey = key // Used for Heartbeat
-                if (currentChannel != null) {
-                    targetContactKey = key // For groups, target key IS the channel key
-                }
+                currentChannelKey = key
+                if (currentChannel != null) targetContactKey = key
             }
         }
     }
 
-    // [FIX] Helper to get key for ENCRYPTION (Sending)
     private fun getEncryptionKey(): javax.crypto.spec.SecretKeySpec? {
         val keyToUse = targetContactKey
         if (keyToUse.isNullOrBlank()) return null
-
         if (keyToUse == activeKeySource && activeKeySpec != null) return activeKeySpec
         activeKeySource = keyToUse
         activeKeySpec = CryptoEngine.deriveKey(keyToUse)
         return activeKeySpec
     }
 
-    // [FIX] Helper to get key for DECRYPTION (Receiving)
     private fun getDecryptionKey(isGroupPacket: Boolean): javax.crypto.spec.SecretKeySpec? {
         val keyToUse = if (isGroupPacket) targetContactKey else myIdentityKey
         if (keyToUse.isNullOrBlank()) return null
@@ -354,36 +361,37 @@ class VoiceService : Service() {
         }
 
         createNotificationChannel()
-        startForegroundServiceNotification("Listening...")
+        try { startForegroundServiceNotification("Initializing...") } catch (e: Exception) { stopSelf(); return START_NOT_STICKY }
 
-        if (!multicastLock.isHeld) multicastLock.acquire()
-
-        audioEngine.startPlayback()
-
-        val networkStarted = networkEngine.start { packet ->
-            if (StunClient.isStunResponse(packet.data)) {
-                val result = StunClient.parseResponse(packet.data)
-                if (result != null && myPublicPort != result.publicPort) {
-                    Log.i(tag, "STUN Resolved: Public Port is ${result.publicPort}")
-                    myPublicPort = result.publicPort
-                    triggerHeartbeat()
+        scope.launch(Dispatchers.IO) {
+            if (!multicastLock.isHeld) multicastLock.acquire()
+            audioEngine.startPlayback()
+            val networkStarted = networkEngine.start { packet ->
+                if (StunClient.isStunResponse(packet.data)) {
+                    val result = StunClient.parseResponse(packet.data)
+                    if (result != null && myPublicPort != result.publicPort) {
+                        myPublicPort = result.publicPort
+                        triggerHeartbeat()
+                    }
+                    return@start
                 }
-                return@start
+                handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
             }
-            handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
+            if (!networkStarted) {
+                _voiceServiceState.update { it.copy(networkStatus = "Error: Network failed") }
+                stopSelf()
+                return@launch
+            }
+            updateNotification("Listening...", null)
+            startHeartbeatLoop()
+            startSignalLoop()
         }
 
-        if (!networkStarted) {
-            _voiceServiceState.value = _voiceServiceState.value.copy(networkStatus = "Error: Network failed")
-            stopSelf()
-            return START_NOT_STICKY
-        }
+        try {
+            if (localLinkManager == null) localLinkManager = LocalLinkManager(this, { _, _, _ -> }, { _ -> })
+            localLinkManager?.startAdvertising(myUsername, UDP_PORT)
+        } catch (e: Exception) { }
 
-        if (localLinkManager == null) localLinkManager = LocalLinkManager(this, { _, _, _ -> }, { _ -> })
-        localLinkManager?.startAdvertising(myUsername, UDP_PORT)
-
-        startHeartbeatLoop()
-        startSignalLoop()
         return START_STICKY
     }
 
@@ -404,7 +412,6 @@ class VoiceService : Service() {
                                     activeIpCache[signal.sender] = ip
                                     repository.updateContactIp(signal.sender, ip)
                                     sendPing(ip, port)
-                                    Log.i(tag, "Auto-Knock sent to ${signal.sender} at $ip")
                                 }
                             }
                         } else if (!response.callers.isNullOrEmpty()) {
@@ -449,6 +456,38 @@ class VoiceService : Service() {
         }
     }
 
+    fun sendTextMessage(targetIp: String, message: String) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val rawPayload = "TXT:$message".toByteArray(Charsets.UTF_8)
+                val seqNum = (System.currentTimeMillis() % 1000000).toInt()
+                val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
+                val isSecureMode = prefs.getBoolean("secure_mode", false)
+                val finalPayload = if (isSecureMode) {
+                    val contact = repository.findContactByIp(targetIp)
+                    val secretString = contact?.savedCode ?: "0000"
+                    val secretKeySpec = CryptoEngine.deriveKey(secretString)
+                    CryptoEngine.encrypt(rawPayload, seqNum, secretKeySpec) ?: rawPayload
+                } else { rawPayload }
+
+                val nameBytes = myUsername.toByteArray(Charsets.UTF_8)
+                val packetSize = 1 + nameBytes.size + 4 + finalPayload.size
+                val buffer = ByteBuffer.allocate(packetSize)
+                buffer.put(nameBytes.size.toByte())
+                buffer.put(nameBytes)
+                buffer.putInt(seqNum)
+                buffer.put(finalPayload)
+                val packetData = buffer.array()
+
+                val socket = DatagramSocket()
+                val address = InetAddress.getByName(targetIp)
+                val packet = DatagramPacket(packetData, packetData.size, address, 50005)
+                repeat(3) { socket.send(packet); delay(50) }
+                socket.close()
+            } catch (e: Exception) { e.printStackTrace() }
+        }
+    }
+
     private fun handleIncomingPacket(data: ByteArray, length: Int, senderIp: String) {
         if (isSending || senderIp == myLocalIp || length <= 5) return
         val nameLen = data[0].toInt() and 0xFF
@@ -456,21 +495,14 @@ class VoiceService : Service() {
         val senderName = String(data, 1, nameLen)
 
         if (senderName == PING_SIGNAL) { sendPong(senderIp); return }
-        if (senderName == PONG_SIGNAL) {
-            _voiceServiceState.update { it.copy(lastPingResponse = System.currentTimeMillis()) }
-            return
-        }
+        if (senderName == PONG_SIGNAL) { _voiceServiceState.update { it.copy(lastPingResponse = System.currentTimeMillis()) }; return }
 
         if (senderName == END_STREAM_SIGNAL) {
             if (isReceiving) {
                 isReceiving = false
                 if (isRecordingEnabled) {
                     val actualName = currentSpeakerName ?: "Unknown"
-                    val dataToSave = synchronized(bufferLock) {
-                        val bytes = incomingBuffer.toByteArray()
-                        incomingBuffer.reset()
-                        bytes
-                    }
+                    val dataToSave = synchronized(bufferLock) { val bytes = incomingBuffer.toByteArray(); incomingBuffer.reset(); bytes }
                     if (dataToSave.isNotEmpty()) saveIncomingMessage(actualName, dataToSave)
                 }
                 currentSpeakerName = null
@@ -484,7 +516,20 @@ class VoiceService : Service() {
 
         if (senderName.trim().equals(myUsername.trim(), ignoreCase = true) || blockedCache.contains(senderName) || senderIp == ignoredSender) return
 
-        currentSpeakerName = senderName
+        // [NEW] Ruthless Preemption (Principal Override)
+        val isPrincipal = principalCache.contains(senderName)
+
+        if (currentSpeakerName != null && currentSpeakerName != senderName) {
+            if (isPrincipal) {
+                currentSpeakerName = senderName
+                Log.w(tag, "Principal Override: $senderName taking over.")
+            } else {
+                return
+            }
+        } else {
+            currentSpeakerName = senderName
+        }
+
         val seqOffset = 1 + nameLen
         val seqNum = ByteBuffer.wrap(data, seqOffset, 4).int
         val payloadOffset = seqOffset + 4
@@ -503,22 +548,19 @@ class VoiceService : Service() {
             }
             sequenceMap[senderName] = seqNum
             lastIncomingIp = senderIp
-            handleIncomingSignal(senderName)
+            handleIncomingSignal(senderName, isPrincipal)
 
             if (payloadLen > 0) {
                 var payload = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
 
-                // 1. Decrypt first (if secure mode)
                 val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
                 val isSecureMode = prefs.getBoolean("secure_mode", false)
 
                 if (isSecureMode) {
                     val isGroup = senderName.startsWith("group:")
                     val secretKey = getDecryptionKey(isGroup)
-
                     if (secretKey != null) {
                         var decrypted = CryptoEngine.decrypt(payload, seqNum, secretKey)
-                        // Retry decryption with trimmed payload if padded
                         if (decrypted == null && payload.size > 656 && payload.size < 720) {
                             try {
                                 val trimmedPayload = payload.copyOfRange(0, 656)
@@ -529,33 +571,51 @@ class VoiceService : Service() {
                     }
                 }
 
-                // [CRITICAL FIX] -----------------------------------------------------------
-                // 2. Normalize to PCM immediately.
-                // Why?
-                // - AudioEngine needs PCM to avoid "Chipmunk Speed".
-                // - Voice Pager needs PCM because WavUtils writes a PCM Header.
-
-                // Detection: Standard G.711 frame is 640 bytes. Carriers might add padding (e.g. up to 700).
-                if (payload.size >= 640 && payload.size < 720) {
-                    // Use your G711 Object to decode.
-                    // We pass 640 as length to ignore any garbage padding at the end.
+                // Case A: Text Message
+                if (payload.size < 500) {
                     try {
-                        payload = G711.decode(payload, 640)
-                    } catch (e: Exception) {
-                        // Fallback: If decode fails, use payload as is (though unlikely)
-                    }
-                }
-                // Now 'payload' is guaranteed to be PCM (1280 bytes) if it was compressed.
-                // [FIX ENDS HERE] ----------------------------------------------------------
+                        val textData = String(payload, Charsets.UTF_8)
+                        if (textData.startsWith("TXT:")) {
+                            val cleanMessage = textData.substring(4)
 
-                // 3. Dispatch Valid PCM Data
-                if (!isSilenced) {
-                    // AudioEngine will receive 1280 bytes and play it as raw PCM (Correct Speed)
+                            // [NEW] Principal Text Override
+                            val shouldSpeak = !isSilenced || isPrincipal
+                            val notificationPrefix = if(isPrincipal) "⚠️ PRIORITY MSG" else "Message"
+                            val contentPrefix = if(isPrincipal) "Priority Message from $senderName" else "Message from $senderName"
+
+                            if (shouldSpeak) {
+                                if (isTtsReady) {
+                                    tts?.speak("$contentPrefix. $cleanMessage", TextToSpeech.QUEUE_FLUSH, null, null)
+                                }
+                                scope.launch {
+                                    val db = AppDatabase.getDatabase(applicationContext)
+                                    db.pagerDao().insert(PagerEntry(sender = senderName, type = "TEXT", content = cleanMessage, isRead = true))
+                                }
+                                // Ensure user sees notification even if spoken
+                                updateNotification("$notificationPrefix from $senderName", cleanMessage)
+                            } else {
+                                scope.launch {
+                                    val db = AppDatabase.getDatabase(applicationContext)
+                                    db.pagerDao().insert(PagerEntry(sender = senderName, type = "TEXT", content = cleanMessage, isRead = false))
+                                    updateNotification("$notificationPrefix from $senderName", cleanMessage)
+                                }
+                            }
+                            return
+                        }
+                    } catch (e: Exception) { }
+                }
+
+                // Case B: Audio
+                if (payload.size >= 640 && payload.size < 720) {
+                    try { payload = G711.decode(payload, 640) } catch (e: Exception) { }
+                }
+
+                // [NEW] Principal Audio Override
+                if (!isSilenced || isPrincipal) {
                     try { audioEngine.writeAudio(seqNum, payload) } catch (e: Exception) {}
                 }
 
                 if (isRecordingEnabled) {
-                    // Buffer will receive 1280 bytes PCM. When saved, it matches the WAV Header.
                     synchronized(bufferLock) { try { incomingBuffer.write(payload) } catch (t: Throwable) {} }
                 }
 
@@ -564,14 +624,20 @@ class VoiceService : Service() {
         }
     }
 
-    private fun handleIncomingSignal(callerName: String) {
+    private fun handleIncomingSignal(callerName: String, isPriority: Boolean = false) {
         val currentTime = System.currentTimeMillis()
-        if (!isReceiving || (currentTime - lastReceiveTime > 3000)) {
+        if (!isReceiving || (currentTime - lastReceiveTime > 3000) || isPriority) {
             acquireResources()
             isReceiving = true
-            val status = if(isSilenced) "Missed: $callerName" else "Incoming: $callerName"
+
+            // [UPDATED] Notification distinction for Principal Override
+            val status = if (isPriority) "⚠️ PRIORITY: $callerName"
+            else if (isSilenced) "Missed: $callerName"
+            else "Incoming: $callerName"
+
             updateNotification(status, callerName)
-            if (!isSilenced) vibrate()
+            if (!isSilenced || isPriority) vibrate()
+
             _voiceServiceState.update { it.copy(incomingCall = callerName, incomingIp = lastIncomingIp) }
         }
         lastReceiveTime = currentTime
@@ -594,6 +660,17 @@ class VoiceService : Service() {
                 val fileName = "${timestamp}_${sender}.wav"
                 val file = java.io.File(cacheDir, fileName)
                 WavUtils.saveWavFile(file, data)
+
+                val db = AppDatabase.getDatabase(applicationContext)
+                val entry = PagerEntry(
+                    sender = sender,
+                    timestamp = timestamp,
+                    type = "AUDIO",
+                    content = file.absolutePath,
+                    isRead = false
+                )
+                db.pagerDao().insert(entry)
+                updateNotification("New Voice Message", "From $sender")
             } catch (e: Exception) { Log.e(tag, "Failed to save message", e) }
         }
     }
@@ -643,9 +720,6 @@ class VoiceService : Service() {
 
         val isSecureMode = prefs.getBoolean("secure_mode", false)
         val secretKey = if (isSecureMode) getEncryptionKey() else null
-
-        if (isSecureMode && secretKey != null) Log.i(tag, "Starting SECURE transmission")
-        else Log.i(tag, "Starting RAW transmission")
 
         scope.launch { repository.insertLog(if (isGroupCall) "Group Broadcast" else "PTT Call", false) }
 
@@ -839,6 +913,11 @@ class VoiceService : Service() {
     }
 
     override fun onDestroy() {
+        if (tts != null) {
+            tts?.stop()
+            tts?.shutdown()
+            tts = null
+        }
         scope.launch { triggerHeartbeat("offline") }
         audioEngine.shutdown()
         networkEngine.stop()
