@@ -83,7 +83,7 @@ fun InfoScreen(navController: NavController) {
             Spacer(Modifier.height(16.dp))
 
             Text("CD Signal", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-            Text("Version $versionName ($versionCode)", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
+            Text("Version $versionName", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
 
             Spacer(Modifier.height(32.dp))
 

@@ -40,6 +40,8 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.navigation.NavController
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -518,7 +520,7 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
     val appVersion = remember {
         try {
             val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
-            "v${pInfo.versionName} (${pInfo.versionCode})"
+            "v${pInfo.versionName}"
         } catch (e: Exception) { "Unknown Version" }
     }
 
@@ -535,9 +537,28 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
 
                 Text("PAIRING PIN", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
 
-                // [UPGRADE] Row with Copy Button
+                // [UPGRADE] Row with Eye & Copy Button
+                // 1. Create state to track visibility
+                var isPinVisible by remember { mutableStateOf(false) }
+
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(myCode, style = MaterialTheme.typography.displayMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary, letterSpacing = 4.sp)
+                    // 2. Logic: Show Code OR Mask
+                    Text(
+                        text = if (isPinVisible) myCode else "••••",
+                        style = MaterialTheme.typography.displayMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary,
+                        letterSpacing = 4.sp
+                    )
+
+                    // 3. Eye Button (Toggle)
+                    IconButton(onClick = { isPinVisible = !isPinVisible }) {
+                        // Note: Ensure you import Icons.Default.Visibility and Icons.Default.VisibilityOff
+                        val icon = if (isPinVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility
+                        Icon(icon, contentDescription = "Toggle PIN", tint = MaterialTheme.colorScheme.primary)
+                    }
+
+                    // 4. Copy Button (Always copies real PIN)
                     IconButton(onClick = {
                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         val clip = ClipData.newPlainText("Pairing PIN", myCode)

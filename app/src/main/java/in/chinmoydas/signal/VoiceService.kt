@@ -516,6 +516,7 @@ class VoiceService : Service() {
 
                     if (secretKey != null) {
                         var decrypted = CryptoEngine.decrypt(payload, seqNum, secretKey)
+                        // Fix for Padded Encrypted Packets
                         if (decrypted == null && payload.size > 656 && payload.size < 700) {
                             try {
                                 val trimmedPayload = payload.copyOfRange(0, 656)
@@ -530,6 +531,17 @@ class VoiceService : Service() {
                         }
                     }
                 }
+
+                // [FIX STARTS HERE] -----------------------------------------------------------
+                // FIX FOR CHIPMUNK EFFECT (High Pitch / Fast Audio)
+                // Cause: Carriers add padding to small UDP packets.
+                // Symptom: 640-byte G.711 packet arrives as ~648 bytes.
+                // Result: AudioEngine thinks it is RAW PCM (2 bytes/sample) and plays it at 2x speed.
+                // Fix: If we see a packet slightly larger than 640, force trim it back to 640.
+                if (payload.size > 640 && payload.size < 720) {
+                    payload = payload.copyOfRange(0, 640)
+                }
+                // [FIX ENDS HERE] -------------------------------------------------------------
 
                 if (!isSilenced) { try { audioEngine.writeAudio(seqNum, payload) } catch (e: Exception) {} }
                 if (isRecordingEnabled) { synchronized(bufferLock) { try { incomingBuffer.write(payload) } catch (t: Throwable) {} } }
