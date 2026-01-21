@@ -30,6 +30,7 @@ import androidx.media.session.MediaButtonReceiver
 import `in`.chinmoydas.signal.data.MainRepository
 import `in`.chinmoydas.signal.utils.AudioEngine
 import `in`.chinmoydas.signal.utils.CryptoEngine
+import `in`.chinmoydas.signal.utils.G711
 import `in`.chinmoydas.signal.utils.LocalLinkManager
 import `in`.chinmoydas.signal.utils.NetworkEngine
 import `in`.chinmoydas.signal.utils.StunClient
@@ -507,6 +508,7 @@ class VoiceService : Service() {
             if (payloadLen > 0) {
                 var payload = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
 
+                // 1. Decrypt first (if secure mode)
                 val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
                 val isSecureMode = prefs.getBoolean("secure_mode", false)
 
@@ -516,35 +518,46 @@ class VoiceService : Service() {
 
                     if (secretKey != null) {
                         var decrypted = CryptoEngine.decrypt(payload, seqNum, secretKey)
-                        // Fix for Padded Encrypted Packets
-                        if (decrypted == null && payload.size > 656 && payload.size < 700) {
+                        // Retry decryption with trimmed payload if padded
+                        if (decrypted == null && payload.size > 656 && payload.size < 720) {
                             try {
                                 val trimmedPayload = payload.copyOfRange(0, 656)
                                 decrypted = CryptoEngine.decrypt(trimmedPayload, seqNum, secretKey)
                             } catch (e: Exception) { }
                         }
-
-                        if (decrypted != null) {
-                            payload = decrypted
-                        } else {
-                            if (payload.size != 640 && payload.size != 1280) return
-                        }
+                        if (decrypted != null) payload = decrypted
                     }
                 }
 
-                // [FIX STARTS HERE] -----------------------------------------------------------
-                // FIX FOR CHIPMUNK EFFECT (High Pitch / Fast Audio)
-                // Cause: Carriers add padding to small UDP packets.
-                // Symptom: 640-byte G.711 packet arrives as ~648 bytes.
-                // Result: AudioEngine thinks it is RAW PCM (2 bytes/sample) and plays it at 2x speed.
-                // Fix: If we see a packet slightly larger than 640, force trim it back to 640.
-                if (payload.size > 640 && payload.size < 720) {
-                    payload = payload.copyOfRange(0, 640)
-                }
-                // [FIX ENDS HERE] -------------------------------------------------------------
+                // [CRITICAL FIX] -----------------------------------------------------------
+                // 2. Normalize to PCM immediately.
+                // Why?
+                // - AudioEngine needs PCM to avoid "Chipmunk Speed".
+                // - Voice Pager needs PCM because WavUtils writes a PCM Header.
 
-                if (!isSilenced) { try { audioEngine.writeAudio(seqNum, payload) } catch (e: Exception) {} }
-                if (isRecordingEnabled) { synchronized(bufferLock) { try { incomingBuffer.write(payload) } catch (t: Throwable) {} } }
+                // Detection: Standard G.711 frame is 640 bytes. Carriers might add padding (e.g. up to 700).
+                if (payload.size >= 640 && payload.size < 720) {
+                    // Use your G711 Object to decode.
+                    // We pass 640 as length to ignore any garbage padding at the end.
+                    try {
+                        payload = G711.decode(payload, 640)
+                    } catch (e: Exception) {
+                        // Fallback: If decode fails, use payload as is (though unlikely)
+                    }
+                }
+                // Now 'payload' is guaranteed to be PCM (1280 bytes) if it was compressed.
+                // [FIX ENDS HERE] ----------------------------------------------------------
+
+                // 3. Dispatch Valid PCM Data
+                if (!isSilenced) {
+                    // AudioEngine will receive 1280 bytes and play it as raw PCM (Correct Speed)
+                    try { audioEngine.writeAudio(seqNum, payload) } catch (e: Exception) {}
+                }
+
+                if (isRecordingEnabled) {
+                    // Buffer will receive 1280 bytes PCM. When saved, it matches the WAV Header.
+                    synchronized(bufferLock) { try { incomingBuffer.write(payload) } catch (t: Throwable) {} }
+                }
 
                 _voiceServiceState.update { it.copy(lastPingResponse = System.currentTimeMillis()) }
             }
