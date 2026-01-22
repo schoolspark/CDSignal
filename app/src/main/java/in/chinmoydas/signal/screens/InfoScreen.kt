@@ -10,11 +10,11 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Policy
 import androidx.compose.material.icons.filled.Security
@@ -30,7 +30,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
 import `in`.chinmoydas.signal.R
 
@@ -40,9 +39,10 @@ fun InfoScreen(navController: NavController) {
     val context = LocalContext.current
     val (versionName, versionCode) = remember { getAppVersion(context) }
 
-    // REPLACE THESE WITH YOUR ACTUAL URLS BEFORE RELEASE
+    // LEGAL URLS
     val privacyPolicyUrl = "https://signal.chinmoydas.in/privacy-policy.php"
     val termsUrl = "https://signal.chinmoydas.in/terms-of-service.php"
+    val deleteAccountUrl = "https://signal.chinmoydas.in/delete-account.php"
 
     Scaffold(
         topBar = {
@@ -94,9 +94,12 @@ fun InfoScreen(navController: NavController) {
             InfoItem("Privacy Policy", Icons.Default.Policy) { openUrl(context, privacyPolicyUrl) }
             InfoItem("Terms of Service", Icons.Default.Info) { openUrl(context, termsUrl) }
 
+            // Delete Account Link (Mandatory for Play Store)
+            InfoItem("Delete Account", Icons.Default.Delete) { openUrl(context, deleteAccountUrl) }
+
             Spacer(Modifier.height(24.dp))
 
-            // [UPDATED] Data Safety Badge
+            // Data Safety Badge
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
                 Column(Modifier.padding(16.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -106,7 +109,7 @@ fun InfoScreen(navController: NavController) {
                     }
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "• Encryption: When Secure Channel is ON, voice packets are encrypted using AES-GCM-256 (Government Grade) directly on your device.",
+                        "• Encryption: When Secure Channel is ON, voice packets are encrypted using AES-GCM-256 (Military Grade) directly on your device.",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Spacer(Modifier.height(4.dp))
@@ -116,7 +119,7 @@ fun InfoScreen(navController: NavController) {
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "• Local Only: Your 'Pairing Keys' are stored locally on this phone and never uploaded to the cloud.",
+                        "• Burn-on-Read: Incoming messages (Voice Pager) are saved locally and automatically deleted immediately after playback.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }

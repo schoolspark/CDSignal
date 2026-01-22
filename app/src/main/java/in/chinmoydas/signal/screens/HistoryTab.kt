@@ -56,7 +56,12 @@ fun HistoryTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
                                         Icon(Icons.Default.Delete, "Delete", tint = MaterialTheme.colorScheme.onErrorContainer)
                                     }
                                     Spacer(Modifier.width(4.dp))
-                                    Button(onClick = { viewModel.playEntry(context, entry, null) }, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.onErrorContainer)) {
+
+                                    // [FIXED] Burn-on-Read: Auto-delete on play/read
+                                    Button(onClick = {
+                                        viewModel.playEntry(context, entry, null)
+                                        viewModel.deletePagerEntry(entry)
+                                    }, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.onErrorContainer)) {
                                         Icon(if(isText) Icons.Default.Message else Icons.Default.PlayArrow, "Play", tint = MaterialTheme.colorScheme.errorContainer)
                                     }
                                 }
@@ -72,7 +77,6 @@ fun HistoryTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
                     items(callLogs) { log ->
                         var showMenu by remember { mutableStateOf(false) }
 
-                        // [NEW] Logic: Check if contact is Principal
                         val isPrincipal = viewModel.savedContacts.find { it.name == log.callerName }?.isPriority == true
 
                         ListItem(
@@ -85,7 +89,6 @@ fun HistoryTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel) {
                                     DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
                                         DropdownMenuItem(text = { Text("Connect") }, onClick = { viewModel.setTarget(log.callerName); showMenu = false }, leadingIcon = { Icon(Icons.Default.Chat, null) })
                                         if (!log.callerName.startsWith("group:")) {
-                                            // [NEW] Toggle Principal in History
                                             DropdownMenuItem(
                                                 text = { Text(if(isPrincipal) "Unset Principal" else "Set as Principal") },
                                                 onClick = { viewModel.togglePriority(log.callerName); showMenu = false },

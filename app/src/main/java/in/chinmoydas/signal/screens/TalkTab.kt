@@ -280,7 +280,7 @@ fun TalkTab(
                     viewModel.sendTextPayload(service, textMessage)
                     textMessage = ""
                     showTextDialog = false
-                }) { Text("SEND (UDP)") }
+                }) { Text("SEND") }
             },
             dismissButton = { TextButton(onClick = { showTextDialog = false }) { Text("Cancel") } }
         )
