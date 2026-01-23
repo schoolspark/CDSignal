@@ -3,6 +3,9 @@ package `in`.chinmoydas.signal.screens
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -30,6 +33,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.ActivityCompat
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 import `in`.chinmoydas.signal.VoiceService
 import `in`.chinmoydas.signal.VoiceServiceState
 import `in`.chinmoydas.signal.data.PagerEntry
@@ -38,6 +44,7 @@ import `in`.chinmoydas.signal.viewmodel.UiState
 import `in`.chinmoydas.signal.viewmodel.WalkieViewModel
 import java.text.SimpleDateFormat
 import java.util.*
+import kotlinx.coroutines.delay
 
 @SuppressLint("MissingPermission")
 @Composable
@@ -57,6 +64,9 @@ fun TalkTab(
 
     var showTextDialog by remember { mutableStateOf(false) }
     var textMessage by remember { mutableStateOf("") }
+
+    // Location Client for Live Tracking
+    val fusedLocationClient = remember { LocationServices.getFusedLocationProviderClient(context) }
 
     val serviceState by service?.voiceServiceState?.collectAsState(initial = VoiceServiceState())
         ?: remember { mutableStateOf(VoiceServiceState()) }
@@ -78,11 +88,25 @@ fun TalkTab(
     var lastClickTime by remember { mutableLongStateOf(0L) }
 
     LaunchedEffect(Unit) {
-        val perms = mutableListOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.VIBRATE)
+        val perms = mutableListOf(
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.VIBRATE,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        )
         if (Build.VERSION.SDK_INT >= 34) perms.add(Manifest.permission.FOREGROUND_SERVICE_MICROPHONE)
         if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.POST_NOTIFICATIONS)
         if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
         permLauncher.launch(perms.toTypedArray())
+    }
+
+    // [UPDATED] SOS Cancel Dialog
+    // Controlled entirely by the Service state.
+    // The Service handles the actual timer logic in the background.
+    if (serviceState.isSosPending) {
+        SosDialog(
+            onCancel = { service?.cancelSos() },
+            onSend = { service?.confirmSos() }
+        )
     }
 
     Column(modifier = modifier.fillMaxSize().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -129,14 +153,31 @@ fun TalkTab(
             IconButton(onClick = { showTextDialog = true }) {
                 Icon(Icons.Default.Keyboard, "Type Message", tint = MaterialTheme.colorScheme.primary)
             }
+
+            // [NEW] Share Location (Drop Pin)
+            IconButton(onClick = {
+                if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                    fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
+                        .addOnSuccessListener { loc ->
+                            if (loc != null) {
+                                service?.sendLocationPing(loc.latitude, loc.longitude)
+                                Toast.makeText(context, "Location Sent", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(context, "Waiting for GPS...", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                } else {
+                    Toast.makeText(context, "Location Permission Missing", Toast.LENGTH_SHORT).show()
+                }
+            }) {
+                Icon(Icons.Default.LocationOn, "Share Location", tint = MaterialTheme.colorScheme.primary)
+            }
+
             IconButton(onClick = { viewModel.toggleSilence(service) }) {
                 Icon(if (serviceState.isSilenced) Icons.Default.NotificationsOff else Icons.Default.NotificationsActive, "Silent Mode", tint = if (serviceState.isSilenced) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
             }
             IconButton(onClick = { viewModel.toggleBroadcastMode() }) {
                 Icon(Icons.Default.Groups, "Broadcast", tint = if (viewModel.isBroadcastMode) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            IconButton(onClick = { viewModel.toggleSpeaker(service) }) {
-                Icon(if (serviceState.isSpeakerOn) Icons.AutoMirrored.Filled.VolumeUp else Icons.Default.Hearing, "Speaker", tint = if (serviceState.isSpeakerOn) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
 
@@ -218,7 +259,7 @@ fun TalkTab(
 
         Spacer(Modifier.height(16.dp))
 
-        // --- NEW SAFETY TOOLBAR (Public Version) ---
+        // --- SAFETY TOOLBAR (Branded) ---
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -227,36 +268,51 @@ fun TalkTab(
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 1. Theater Mode (Battery Saver / Stealth Lite)
-            var theaterEnabled by remember { mutableStateOf(false) }
+            // Stealth Mode (formerly Theater Mode)
+            val isTheater = serviceState.isTheaterMode
             IconButton(onClick = {
-                theaterEnabled = !theaterEnabled
-                service?.toggleTheaterMode(theaterEnabled)
-                Toast.makeText(context, if(theaterEnabled) "Theater Mode ON" else "Normal Mode", Toast.LENGTH_SHORT).show()
+                service?.toggleTheaterMode(!isTheater)
+                Toast.makeText(context, if(!isTheater) "Stealth Mode Active" else "Stealth Mode OFF", Toast.LENGTH_SHORT).show()
             }) {
-                Icon(Icons.Default.DarkMode, "Theater Mode", tint = if(theaterEnabled) MaterialTheme.colorScheme.primary else Color.Gray)
+                Icon(Icons.Default.DarkMode, "Stealth Mode", tint = if(isTheater) MaterialTheme.colorScheme.primary else Color.Gray)
             }
 
-            // 2. Crash Sensor (Biker Mode)
-            var sensorEnabled by remember { mutableStateOf(false) }
+            // VOX Pro
+            val isVox = serviceState.isVoxEnabled
             IconButton(onClick = {
-                sensorEnabled = !sensorEnabled
-                service?.toggleSensor(sensorEnabled)
-                Toast.makeText(context, if(sensorEnabled) "Crash Monitor ON" else "Crash Monitor OFF", Toast.LENGTH_SHORT).show()
+                service?.toggleVox(!isVox)
+                Toast.makeText(context, if(!isVox) "VOX Pro Active" else "VOX Off", Toast.LENGTH_SHORT).show()
             }) {
-                Icon(Icons.Default.DirectionsBike, "Crash Sensor", tint = if(sensorEnabled) MaterialTheme.colorScheme.primary else Color.Gray)
+                Icon(Icons.Default.RecordVoiceOver, "VOX Pro", tint = if(isVox) MaterialTheme.colorScheme.primary else Color.Gray)
             }
 
-            // 3. SOS Button (Panic)
-            Button(
-                onClick = { service?.sendPanicAlert() },
-                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                contentPadding = PaddingValues(horizontal = 12.dp),
-                shape = RoundedCornerShape(8.dp)
-            ) {
-                Icon(Icons.Default.Warning, null, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(4.dp))
-                Text("SOS", fontWeight = FontWeight.Bold)
+            // Impact Shield (formerly Fall Monitor)
+            val isSensor = serviceState.isSensorEnabled
+            IconButton(onClick = {
+                service?.toggleSensor(!isSensor)
+                Toast.makeText(context, if(!isSensor) "Impact Shield ON" else "Impact Shield OFF", Toast.LENGTH_SHORT).show()
+            }) {
+                Icon(Icons.Default.DirectionsBike, "Impact Shield", tint = if(isSensor) MaterialTheme.colorScheme.primary else Color.Gray)
+            }
+
+            // Signal Trace (formerly Share Location)
+            // Note: We use the LocationOn icon so users know what it does, but the tooltip is "Signal Trace"
+            IconButton(onClick = {
+                if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                    fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
+                        .addOnSuccessListener { loc ->
+                            if (loc != null) {
+                                service?.sendLocationPing(loc.latitude, loc.longitude)
+                                Toast.makeText(context, "Signal Trace Sent", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(context, "Acquiring Satellites...", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                } else {
+                    Toast.makeText(context, "Location Permission Missing", Toast.LENGTH_SHORT).show()
+                }
+            }) {
+                Icon(Icons.Default.LocationOn, "Signal Trace", tint = MaterialTheme.colorScheme.primary)
             }
         }
 
@@ -264,10 +320,10 @@ fun TalkTab(
         HorizontalDivider(color = Color.LightGray.copy(alpha=0.5f))
         Spacer(Modifier.height(8.dp))
 
-        // --- 4. PAGER LIST OR EMPTY STATE ---
+        // --- 4. PAGER LIST ---
         if (pagerEntries.isNotEmpty()) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text("INCOMING INTERCEPTS", style = MaterialTheme.typography.labelSmall, color = Color.Gray, letterSpacing = 2.sp)
+                Text("INCOMING MESSAGES", style = MaterialTheme.typography.labelSmall, color = Color.Gray, letterSpacing = 2.sp)
                 TextButton(onClick = { viewModel.clearPagerHistory() }) { Text("CLEAR ALL", fontSize = 10.sp) }
             }
 
@@ -276,8 +332,23 @@ fun TalkTab(
                     PagerItem(
                         entry = entry,
                         onPlay = {
-                            viewModel.playEntry(context, entry, service)
-                            viewModel.deletePagerEntry(entry)
+                            if (entry.type == "LOCATION") {
+                                // Open Map Intent
+                                val coords = entry.content.split(",")
+                                if (coords.size == 2) {
+                                    val uri = Uri.parse("geo:${coords[0]},${coords[1]}?q=${coords[0]},${coords[1]}(${entry.sender})")
+                                    val mapIntent = Intent(Intent.ACTION_VIEW, uri)
+                                    mapIntent.setPackage("com.google.android.apps.maps")
+                                    try {
+                                        context.startActivity(mapIntent)
+                                    } catch (e: Exception) {
+                                        context.startActivity(Intent(Intent.ACTION_VIEW, uri))
+                                    }
+                                }
+                            } else {
+                                viewModel.playEntry(context, entry, service)
+                                viewModel.deletePagerEntry(entry)
+                            }
                         },
                         onDelete = { viewModel.deletePagerEntry(entry) }
                     )
@@ -296,10 +367,10 @@ fun TalkTab(
                     modifier = Modifier.size(48.dp)
                 )
                 Spacer(Modifier.height(16.dp))
-                Text("Awaiting Signal...", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
+                Text("Ready to Talk", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    if (isSecureMode) "Secure Encryption Active" else "Public Channel Open",
+                    if (isSecureMode) "Encrypted Channel" else "Public Channel",
                     style = MaterialTheme.typography.labelSmall,
                     color = if (isSecureMode) MaterialTheme.colorScheme.primary else Color.Gray.copy(alpha = 0.5f)
                 )
@@ -315,7 +386,7 @@ fun TalkTab(
                 OutlinedTextField(
                     value = textMessage,
                     onValueChange = { textMessage = it },
-                    label = { Text("Type intel...") },
+                    label = { Text("Type message...") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -332,15 +403,56 @@ fun TalkTab(
     }
 }
 
-// Reusable UI Component for Pager Items
+// [UPDATED] Visual-Only SOS Countdown
+@Composable
+fun SosDialog(onCancel: () -> Unit, onSend: () -> Unit) {
+    var ticks by remember { mutableIntStateOf(5) }
+
+    LaunchedEffect(Unit) {
+        while(ticks > 0) {
+            delay(1000)
+            ticks--
+        }
+        // Do NOT auto-send here. The Service handles it.
+    }
+
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text("CRASH DETECTED!", color = Color.Red, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("Sending Emergency Alert in...", style = MaterialTheme.typography.bodyLarge)
+                Spacer(Modifier.height(16.dp))
+                Text("$ticks", style = MaterialTheme.typography.displayMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
+                Text("seconds", style = MaterialTheme.typography.bodySmall)
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onCancel,
+                colors = ButtonDefaults.buttonColors(containerColor = Color.Gray),
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("I'M OKAY (CANCEL)") }
+        },
+        dismissButton = {
+            TextButton(onClick = onSend) { Text("SEND NOW") }
+        }
+    )
+}
+
 @Composable
 fun PagerItem(entry: PagerEntry, onPlay: () -> Unit, onDelete: () -> Unit) {
     val dateFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
     val isText = entry.type == "TEXT"
+    val isLocation = entry.type == "LOCATION"
 
     Card(
         colors = CardDefaults.cardColors(
-            containerColor = if (isText) Color(0xFFFFF3E0) else Color(0xFFE3F2FD)
+            containerColor = when {
+                isLocation -> Color(0xFFE8F5E9) // Green for Location
+                isText -> Color(0xFFFFF3E0)     // Orange for Text
+                else -> Color(0xFFE3F2FD)       // Blue for Audio
+            }
         ),
         modifier = Modifier.fillMaxWidth().clickable { onPlay() }
     ) {
@@ -349,7 +461,11 @@ fun PagerItem(entry: PagerEntry, onPlay: () -> Unit, onDelete: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
-                imageVector = if (isText) Icons.Default.Message else Icons.Default.GraphicEq,
+                imageVector = when {
+                    isLocation -> Icons.Default.LocationOn
+                    isText -> Icons.Default.Message
+                    else -> Icons.Default.GraphicEq
+                },
                 contentDescription = null,
                 tint = Color.Black
             )
@@ -361,7 +477,11 @@ fun PagerItem(entry: PagerEntry, onPlay: () -> Unit, onDelete: () -> Unit) {
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = if (isText) entry.content else "Encrypted Voice Clip",
+                    text = when {
+                        isLocation -> "📍 Shared Location (Tap to View)"
+                        isText -> entry.content
+                        else -> "Voice Message"
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis

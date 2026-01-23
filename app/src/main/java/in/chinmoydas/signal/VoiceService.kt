@@ -2,6 +2,7 @@ package `in`.chinmoydas.signal
 
 import android.Manifest
 import android.app.AlarmManager
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -23,7 +24,6 @@ import android.speech.tts.TextToSpeech
 import android.support.v4.media.session.MediaSessionCompat
 import android.view.KeyEvent
 import android.util.Log
-import android.widget.Toast
 import androidx.annotation.RequiresPermission
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
@@ -39,7 +39,7 @@ import `in`.chinmoydas.signal.utils.NetworkEngine
 import `in`.chinmoydas.signal.RetrofitClient
 import `in`.chinmoydas.signal.utils.StunClient
 import `in`.chinmoydas.signal.utils.WavUtils
-import `in`.chinmoydas.signal.utils.VoxHelper // [NEW] Added Import
+import `in`.chinmoydas.signal.utils.VoxHelper
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -52,6 +52,7 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
+// [UPDATED] Added isSosPending
 data class VoiceServiceState(
     val incomingCall: String? = null,
     val incomingIp: String? = null,
@@ -60,7 +61,11 @@ data class VoiceServiceState(
     val isSpeakerOn: Boolean = true,
     val lastPingResponse: Long = 0L,
     val isHeadsetLinked: Boolean = true,
-    val isTransmitting: Boolean = false
+    val isTransmitting: Boolean = false,
+    val isVoxEnabled: Boolean = false,
+    val isTheaterMode: Boolean = false,
+    val isSensorEnabled: Boolean = false,
+    val isSosPending: Boolean = false // New State
 )
 
 class VoiceService : Service(), TextToSpeech.OnInitListener {
@@ -81,13 +86,16 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     private lateinit var mediaSession: MediaSessionCompat
     private var isHeadsetLinked = true
 
-    // [NEW] Public Safety Tools
+    // [Safety Tools State]
     private var sensorHelper: `in`.chinmoydas.signal.utils.SensorHelper? = null
     private var isTheaterMode = false
+    private var isSensorEnabled = false
 
-    // [NEW] VOX / Hands-Free Variables
+    // [VOX Variables]
     private var voxHelper: VoxHelper? = null
     private var isVoxEnabled = false
+
+    private var sosJob: Job? = null
 
     private val END_STREAM_SIGNAL = "__END_TX__"
     private val PING_SIGNAL = "__PING__"
@@ -125,7 +133,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         set(value) {
             field = value
             updateState()
-            updateNotification(if (value) "Silent Mode Active" else "Listening...", null)
+            refreshStatusNotification()
         }
 
     private var userPrefersSpeaker = true
@@ -136,7 +144,10 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 isSilenced = isSilenced,
                 isSpeakerOn = userPrefersSpeaker,
                 isHeadsetLinked = isHeadsetLinked,
-                isTransmitting = isSending
+                isTransmitting = isSending,
+                isVoxEnabled = isVoxEnabled,
+                isTheaterMode = isTheaterMode,
+                isSensorEnabled = isSensorEnabled
             )
         }
     }
@@ -144,8 +155,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     private val sequenceMap = ConcurrentHashMap<String, Int>()
     private val activeIpCache = ConcurrentHashMap<String, String>()
     private val blockedCache = ConcurrentHashMap.newKeySet<String>()
-
-    // VIP Cache for Principal Override
     private val principalCache = ConcurrentHashMap.newKeySet<String>()
 
     @Volatile private var ignoredSender: String? = null
@@ -213,9 +222,9 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         connectivityManager.registerNetworkCallback(NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), networkCallback)
 
-        // [NEW] Initialize Sensor Helper for Public Safety
+        // Sensor triggers the Service-side sequence
         sensorHelper = `in`.chinmoydas.signal.utils.SensorHelper(this) { reason ->
-            sendPanicAlert("AUTO-ALERT: $reason")
+            triggerSosSequence(reason)
         }
     }
 
@@ -315,8 +324,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 val blocked = repository.getBlockedContacts()
                 blockedCache.clear()
                 blockedCache.addAll(blocked.map { it.name })
-
-                // VIP Cache refresh
                 val principals = repository.getPrincipalContacts()
                 principalCache.clear()
                 principalCache.addAll(principals.map { it.name })
@@ -365,6 +372,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                     acquireResources()
                 }
             }
+            refreshStatusNotification()
             return START_STICKY
         }
         if (action == "TOGGLE_HEADSET") {
@@ -397,7 +405,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 stopSelf()
                 return@launch
             }
-            updateNotification("Listening...", null)
+            refreshStatusNotification()
             startHeartbeatLoop()
             startSignalLoop()
         }
@@ -471,6 +479,17 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
+    fun sendLocationPing(lat: Double, lng: Double) {
+        val message = "LOC:$lat,$lng"
+        scope.launch {
+            val target = repository.getTargetUser()
+            if (target.isNotBlank()) {
+                val ip = activeIpCache[target] ?: repository.getAllContacts().find { it.name == target }?.ip
+                if (!ip.isNullOrBlank()) sendTextMessage(ip, message)
+            }
+        }
+    }
+
     fun sendTextMessage(targetIp: String, message: String) {
         scope.launch(Dispatchers.IO) {
             try {
@@ -523,7 +542,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 currentSpeakerName = null
                 resetJob?.cancel()
                 _voiceServiceState.update { it.copy(incomingCall = null, networkStatus = "Listening...") }
-                updateNotification("Listening...", null)
+                refreshStatusNotification()
                 releaseResourcesIfNeeded()
             }
             return
@@ -531,7 +550,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
         if (senderName.trim().equals(myUsername.trim(), ignoreCase = true) || blockedCache.contains(senderName) || senderIp == ignoredSender) return
 
-        // [NEW] Ruthless Preemption (Principal Override)
         val isPrincipal = principalCache.contains(senderName)
 
         if (currentSpeakerName != null && currentSpeakerName != senderName) {
@@ -593,15 +611,30 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                         if (textData.startsWith("TXT:")) {
                             val cleanMessage = textData.substring(4)
 
-                            // Intercept Call Commands before they become chat messages
+                            // Handle Location Ping (Do NOT speak it)
+                            if (cleanMessage.startsWith("LOC:")) {
+                                scope.launch {
+                                    val db = AppDatabase.getDatabase(applicationContext)
+                                    db.pagerDao().insert(PagerEntry(
+                                        sender = senderName,
+                                        type = "LOCATION",
+                                        content = cleanMessage.substring(4),
+                                        isRead = false
+                                    ))
+                                }
+                                updateNotification("Location Pin", "From $senderName")
+                                return
+                            }
+
+                            // Intercept Call Commands
                             if (cleanMessage.startsWith("CMD:CALL")) {
                                 scope.launch {
                                     `in`.chinmoydas.signal.utils.CallSignaling.handlePacket(cleanMessage, senderIp)
                                 }
-                                return // STOP! Do not save to database or speak via TTS
+                                return
                             }
 
-                            // [NEW] Principal Text Override
+                            // Principal Text Override
                             val shouldSpeak = !isSilenced || isPrincipal
                             val notificationPrefix = if(isPrincipal) "⚠️ PRIORITY MSG" else "Message"
                             val contentPrefix = if(isPrincipal) "Priority Message from $senderName" else "Message from $senderName"
@@ -614,7 +647,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                                     val db = AppDatabase.getDatabase(applicationContext)
                                     db.pagerDao().insert(PagerEntry(sender = senderName, type = "TEXT", content = cleanMessage, isRead = true))
                                 }
-                                // Ensure user sees notification even if spoken
                                 updateNotification("$notificationPrefix from $senderName", cleanMessage)
                             } else {
                                 scope.launch {
@@ -633,7 +665,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                     try { payload = G711.decode(payload, 640) } catch (e: Exception) { }
                 }
 
-                // [NEW] Principal Audio Override
                 if (!isSilenced || isPrincipal) {
                     try { audioEngine.writeAudio(seqNum, payload) } catch (e: Exception) {}
                 }
@@ -653,7 +684,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             acquireResources()
             isReceiving = true
 
-            // [UPDATED] Notification distinction for Principal Override
             val status = if (isPriority) "⚠️ PRIORITY: $callerName"
             else if (isSilenced) "Missed: $callerName"
             else "Incoming: $callerName"
@@ -670,7 +700,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             if (isReceiving) {
                 isReceiving = false
                 releaseResourcesIfNeeded()
-                updateNotification("Listening...", null)
+                refreshStatusNotification()
                 _voiceServiceState.update { it.copy(incomingCall = null, networkStatus = "Listening...") }
             }
         }
@@ -750,7 +780,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         val headerLen = 1 + nameBytes.size + 4
 
         audioEngine.startRecording(shouldCompress) { rawBuffer ->
-            // [NEW] Feed Audio to VOX Analyzer
             if (isVoxEnabled) voxHelper?.process(rawBuffer)
 
             val payloadToSend = if (isSecureMode && secretKey != null) {
@@ -783,6 +812,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             repeat(3) { networkEngine.send(buf, activeTargets, lastPort); delay(20) }
             releaseResourcesIfNeeded()
         }
+        refreshStatusNotification()
     }
 
     fun stopReceiving() {
@@ -790,7 +820,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         isReceiving = false
         resetJob?.cancel()
         _voiceServiceState.update { it.copy(incomingCall = null, networkStatus = "Listening...") }
-        updateNotification("Listening...", null)
+        refreshStatusNotification()
         releaseResourcesIfNeeded()
         scope.launch { delay(IGNORE_SENDER_DELAY); ignoredSender = null }
     }
@@ -849,7 +879,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
     @Suppress("DEPRECATION")
     private fun vibrate() {
-        if (isTheaterMode) return // [NEW] Silence vibration in Theater Mode
+        if (isTheaterMode) return
         try {
             val effect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE) else null
             if (effect != null) vibrator.vibrate(effect) else vibrator.vibrate(100)
@@ -907,12 +937,25 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun refreshStatusNotification() {
+        val text = when {
+            isSending -> "ON AIR: Transmitting..."
+            isReceiving -> "Incoming: ${voiceServiceState.value.incomingCall ?: "Signal"}"
+            isSilenced -> "Silent Mode Active"
+            isVoxEnabled -> "VOX Standby (Hands-Free)"
+            isSensorEnabled -> "Crash Monitor Active"
+            isTheaterMode -> "Theater Mode Active"
+            else -> "Listening..."
+        }
+        updateNotification(text, null)
+    }
+
     private fun updateNotification(text: String, channelName: String?) {
         val notification = buildNotification(text, channelName)
         getSystemService(NotificationManager::class.java).notify(1, notification)
     }
 
-    private fun buildNotification(text: String, channelName: String? = null): android.app.Notification {
+    private fun buildNotification(text: String, channelName: String? = null): Notification {
         val intent = Intent(this, MainActivity::class.java).apply { if (channelName != null) putExtra("auto_connect_channel", channelName) }
         val pendingIntent = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
 
@@ -940,9 +983,8 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     }
 
     override fun onDestroy() {
-        sensorHelper?.stop() // [NEW] Stop sensor
-        voxHelper = null // [NEW] Clean VOX
-
+        sensorHelper?.stop()
+        voxHelper = null
         if (tts != null) {
             tts?.stop()
             tts?.shutdown()
@@ -961,10 +1003,12 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         super.onDestroy()
     }
 
-    // [NEW] Safety Feature Helpers called from UI
-
+    // [NEW] Exposed Safety Feature Helpers
     fun toggleSensor(enabled: Boolean) {
+        isSensorEnabled = enabled
         if (enabled) sensorHelper?.start() else sensorHelper?.stop()
+        updateState() // IMPORTANT: Update state for UI to see
+        refreshStatusNotification()
     }
 
     fun toggleTheaterMode(enabled: Boolean) {
@@ -975,6 +1019,8 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         } else {
             audioManager.isSpeakerphoneOn = userPrefersSpeaker
         }
+        updateState() // IMPORTANT
+        refreshStatusNotification()
     }
 
     fun sendPanicAlert(reason: String = "SOS: HELP ME! (Panic Button Pressed)") {
@@ -987,30 +1033,57 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    // [NEW] Fixed VOX Toggle Logic
+    private fun triggerSosSequence(reason: String) {
+        if (sosJob?.isActive == true) return // Already counting down
+
+        _voiceServiceState.update { it.copy(isSosPending = true) }
+
+        sosJob = scope.launch {
+            speakText("Impact Detected. SOS in 5 seconds.")
+            repeat(5) { i ->
+                if (!isActive) return@launch
+                delay(1000)
+            }
+            // Time is up! Send the alert if not cancelled
+            if (isActive) {
+                sendPanicAlert(reason)
+                _voiceServiceState.update { it.copy(isSosPending = false) }
+            }
+        }
+    }
+
+    // [NEW] SOS Cancel Methods
+    fun cancelSos() {
+        sosJob?.cancel()
+        sosJob = null
+        _voiceServiceState.update { it.copy(isSosPending = false) }
+        speakText("Emergency Alert Cancelled")
+    }
+
+    fun confirmSos() {
+        sosJob?.cancel() // Stop timer
+        sendPanicAlert("AUTO-ALERT: Hard Impact Detected!")
+        _voiceServiceState.update { it.copy(isSosPending = false) }
+    }
+
     fun toggleVox(enabled: Boolean) {
         isVoxEnabled = enabled
-
         if (!enabled) {
             if (isSending) stopTalk()
-            updateNotification("Listening...", null)
-            return
         }
 
-        if (voxHelper == null) {
+        if (isVoxEnabled && voxHelper == null) {
             voxHelper = VoxHelper(
                 onSpeechStart = {
-                    // FIX: Wrapped in scope.launch to handle suspend function call
                     scope.launch {
                         if (!isSending) {
                             val target = repository.getTargetUser()
                             val ip = activeIpCache[target] ?: repository.getAllContacts().find { it.name == target }?.ip
-
                             if (!ip.isNullOrBlank()) {
-                                // FIX: Check Permission before starting recording
                                 if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                                     startTalk(listOf(ip), UDP_PORT)
-                                    updateNotification("VOX: Transmitting...", target)
+                                    // Removed context-dependent updateNotification call here to avoid complexity
+                                    // The startTalk already sets isSending = true which updates notification via state flow
                                 }
                             }
                         }
@@ -1019,10 +1092,11 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 onSilence = {
                     if (isSending) {
                         stopTalk()
-                        updateNotification("VOX: Listening...", null)
                     }
                 }
             )
         }
+        updateState() // IMPORTANT
+        refreshStatusNotification()
     }
 }

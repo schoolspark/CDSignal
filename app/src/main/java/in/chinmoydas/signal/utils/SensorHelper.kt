@@ -32,6 +32,7 @@ class SensorHelper(context: Context, private val onEmergency: (String) -> Unit) 
     fun stop() {
         sensorManager.unregisterListener(this)
         isMonitoring = false
+        scope.coroutineContext.cancelChildren()
     }
 
     override fun onSensorChanged(event: SensorEvent?) {

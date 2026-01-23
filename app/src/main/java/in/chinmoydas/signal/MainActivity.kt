@@ -30,12 +30,9 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import `in`.chinmoydas.signal.data.MainRepository
-import `in`.chinmoydas.signal.screens.DiagnosticsScreen
-import `in`.chinmoydas.signal.screens.HelpScreen
-import `in`.chinmoydas.signal.screens.HomeScreen
-import `in`.chinmoydas.signal.screens.InfoScreen
-import `in`.chinmoydas.signal.screens.LoginScreen
+import `in`.chinmoydas.signal.screens.* // Imports CallOverlay and Screens
 import `in`.chinmoydas.signal.ui.theme.CDSignalTheme
+import `in`.chinmoydas.signal.utils.CallSignaling
 import `in`.chinmoydas.signal.viewmodel.ViewModelFactory
 import `in`.chinmoydas.signal.viewmodel.WalkieViewModel
 import kotlinx.coroutines.Dispatchers
@@ -45,11 +42,8 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
-    // Removed nullable state, we will control binding flow explicitly
     private var voiceService: VoiceService? = null
     private var isBound = false
-
-    // We will initialize this inside onCreate, but use it safely in Compose
     private lateinit var walkieViewModel: WalkieViewModel
 
     // State to pass to Compose triggers
@@ -69,7 +63,6 @@ class MainActivity : ComponentActivity() {
             val binder = service as VoiceService.LocalBinder
             voiceService = binder.getService()
             isBound = true
-            // UPDATE: Notify Compose that service is ready
             serviceBoundState.value = binder.getService()
         }
 
@@ -83,7 +76,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1. Register Receiver Securely (Fixes Screenshot Error)
+        // 1. Register Receiver Securely
         val filter = IntentFilter("in.chinmoydas.signal.ACTION_EXIT")
         ContextCompat.registerReceiver(
             this,
@@ -108,9 +101,6 @@ class MainActivity : ComponentActivity() {
             setContent {
                 CDSignalTheme {
                     var startDest by remember { mutableStateOf<String?>(null) }
-
-                    // Observe Service State HERE (Safe Zone)
-                    // This guarantees walkieViewModel is ready because it's in the same scope
                     val currentService by serviceBoundState
 
                     LaunchedEffect(Unit) {
@@ -122,18 +112,27 @@ class MainActivity : ComponentActivity() {
 
                     if (startDest != null) {
                         val navController = rememberNavController()
-
-                        // Initialize ViewModel immediately
                         walkieViewModel = ViewModelProvider(this@MainActivity, factory)[WalkieViewModel::class.java]
                         val currentName by repository.myUsername.collectAsState()
 
-                        // --- [UPDATED] Link Service & Observe State ---
+                        // --- [CRITICAL UPDATE] Service & Logic Linking ---
                         LaunchedEffect(currentService) {
                             currentService?.let { service ->
-                                // [NEW] 1. Link the Call Engine so it can send signals
+                                // A. Link Call System
                                 walkieViewModel.setupCallSupport(service)
 
-                                // 2. Existing State Observation
+                                // B. Audio Conflict Guard: Stop PTT if a Phone Call starts
+                                launch {
+                                    CallSignaling.callEvents.collect { event ->
+                                        if (event is CallSignaling.CallEvent.CallConnected) {
+                                            // Call Accepted! Kill PTT and VOX to free up Mic
+                                            service.stopTalk()
+                                            service.toggleVox(false)
+                                        }
+                                    }
+                                }
+
+                                // C. Observe Incoming PTT
                                 service.voiceServiceState.collectLatest { state ->
                                     if (state.incomingCall != null && state.incomingIp != null) {
                                         walkieViewModel.onReceptionStarted(state.incomingCall, state.incomingIp)
@@ -143,11 +142,9 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         }
-                        // ----------------------------------------------------------------
+                        // ------------------------------------------------
 
-                        LaunchedEffect(intent) {
-                            handleIntent(intent)
-                        }
+                        LaunchedEffect(intent) { handleIntent(intent) }
 
                         NavHost(navController = navController, startDestination = startDest!!) {
                             composable("login") { LoginScreen(navController, getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)) }
@@ -157,7 +154,7 @@ class MainActivity : ComponentActivity() {
                             composable("home") {
                                 HomeScreen(
                                     navController = navController,
-                                    service = currentService, // Pass the observable state
+                                    service = currentService,
                                     viewModel = walkieViewModel,
                                     myName = currentName,
                                     onPermissionsGranted = { startAndBindService() },
@@ -166,13 +163,12 @@ class MainActivity : ComponentActivity() {
                                         performExplicitExit()
                                         navController.navigate("login") { popUpTo("home") { inclusive = true } }
                                     },
-                                    onExit = {
-                                        performExplicitExit()
-                                    }
+                                    onExit = { performExplicitExit() }
                                 )
                             }
                         }
-                        `in`.chinmoydas.signal.screens.CallOverlay()
+                        // Render Call UI on top of everything
+                        CallOverlay()
                     } else {
                         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             CircularProgressIndicator()
@@ -185,11 +181,8 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIntent(intent: Intent?) {
         val autoChannel = intent?.getStringExtra("auto_connect_channel")
-        if (autoChannel != null) {
-            // Safe check, though flow above makes this robust
-            if (::walkieViewModel.isInitialized) {
-                walkieViewModel.setTarget(autoChannel)
-            }
+        if (autoChannel != null && ::walkieViewModel.isInitialized) {
+            walkieViewModel.setTarget(autoChannel)
             intent.removeExtra("auto_connect_channel")
         }
     }
@@ -245,9 +238,7 @@ class MainActivity : ComponentActivity() {
         try { unregisterReceiver(exitReceiver) } catch (e: Exception) {}
 
         if (isBound) {
-            try {
-                unbindService(connection)
-            } catch (e: Exception) {
+            try { unbindService(connection) } catch (e: Exception) {
                 Log.e("MainActivity", "Failed to unbind service", e)
             }
             isBound = false
