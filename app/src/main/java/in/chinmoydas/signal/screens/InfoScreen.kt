@@ -103,7 +103,7 @@ fun InfoScreen(navController: NavController) {
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
                 Column(Modifier.padding(16.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Security, null, tint = Color(0xFF4CAF50)) // Green Security Icon
+                        Icon(Icons.Default.Security, null, tint = Color(0xFF4CAF50))
                         Spacer(Modifier.width(8.dp))
                         Text("Security & Data Safety", fontWeight = FontWeight.Bold)
                     }
@@ -118,8 +118,10 @@ fun InfoScreen(navController: NavController) {
                         style = MaterialTheme.typography.bodySmall
                     )
                     Spacer(Modifier.height(4.dp))
+
+                    // [UPDATED] "Auto-Delete" instead of "Burn-on-Read"
                     Text(
-                        "• Burn-on-Read: Incoming messages (Voice Pager) are saved locally and automatically deleted immediately after playback.",
+                        "• Auto-Delete: Incoming Voice Pager messages are stored locally and automatically removed immediately after playback.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
