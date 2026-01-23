@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
@@ -213,6 +214,50 @@ fun TalkTab(
             Icon(if(viewModel.isHandsFree) Icons.Default.Lock else Icons.Default.LockOpen, null, modifier = Modifier.size(16.dp))
             Spacer(Modifier.width(8.dp))
             Text(if(viewModel.isHandsFree) "HANDSFREE ON" else "HANDSFREE OFF", fontSize = 12.sp)
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        // --- NEW SAFETY TOOLBAR (Public Version) ---
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha=0.3f), RoundedCornerShape(12.dp))
+                .padding(8.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // 1. Theater Mode (Battery Saver / Stealth Lite)
+            var theaterEnabled by remember { mutableStateOf(false) }
+            IconButton(onClick = {
+                theaterEnabled = !theaterEnabled
+                service?.toggleTheaterMode(theaterEnabled)
+                Toast.makeText(context, if(theaterEnabled) "Theater Mode ON" else "Normal Mode", Toast.LENGTH_SHORT).show()
+            }) {
+                Icon(Icons.Default.DarkMode, "Theater Mode", tint = if(theaterEnabled) MaterialTheme.colorScheme.primary else Color.Gray)
+            }
+
+            // 2. Crash Sensor (Biker Mode)
+            var sensorEnabled by remember { mutableStateOf(false) }
+            IconButton(onClick = {
+                sensorEnabled = !sensorEnabled
+                service?.toggleSensor(sensorEnabled)
+                Toast.makeText(context, if(sensorEnabled) "Crash Monitor ON" else "Crash Monitor OFF", Toast.LENGTH_SHORT).show()
+            }) {
+                Icon(Icons.Default.DirectionsBike, "Crash Sensor", tint = if(sensorEnabled) MaterialTheme.colorScheme.primary else Color.Gray)
+            }
+
+            // 3. SOS Button (Panic)
+            Button(
+                onClick = { service?.sendPanicAlert() },
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                contentPadding = PaddingValues(horizontal = 12.dp),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Icon(Icons.Default.Warning, null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("SOS", fontWeight = FontWeight.Bold)
+            }
         }
 
         Spacer(Modifier.height(24.dp))

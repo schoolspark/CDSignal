@@ -1,0 +1,48 @@
+package `in`.chinmoydas.signal.utils
+
+import kotlin.math.sqrt
+
+class VoxHelper(
+    private val onSpeechStart: () -> Unit,
+    private val onSilence: () -> Unit
+) {
+    private var isTalking = false
+    private var silenceStart = 0L
+
+    // Config for Public Version (Sensitivity)
+    // 300 is sensitive (whisper), 1000 is loud (shout)
+    var sensitivity = 500
+
+    // Hold the line open for 1.2 seconds after speaking stops
+    private val HOLD_TIME = 1200L
+
+    fun process(buffer: ByteArray) {
+        val amplitude = calculateRMS(buffer)
+
+        if (amplitude > sensitivity) {
+            silenceStart = 0
+            if (!isTalking) {
+                isTalking = true
+                onSpeechStart()
+            }
+        } else if (isTalking) {
+            if (silenceStart == 0L) silenceStart = System.currentTimeMillis()
+
+            if (System.currentTimeMillis() - silenceStart > HOLD_TIME) {
+                isTalking = false
+                onSilence()
+            }
+        }
+    }
+
+    private fun calculateRMS(buffer: ByteArray): Double {
+        var sum = 0.0
+        // Parse 16-bit PCM data
+        for (i in 0 until buffer.size step 2) {
+            if (i+1 >= buffer.size) break
+            val sample = (buffer[i].toInt() and 0xFF) or (buffer[i+1].toInt() shl 8)
+            sum += sample * sample
+        }
+        return sqrt(sum / (buffer.size / 2))
+    }
+}

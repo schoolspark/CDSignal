@@ -23,6 +23,7 @@ import android.speech.tts.TextToSpeech
 import android.support.v4.media.session.MediaSessionCompat
 import android.view.KeyEvent
 import android.util.Log
+import android.widget.Toast
 import androidx.annotation.RequiresPermission
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
@@ -38,6 +39,7 @@ import `in`.chinmoydas.signal.utils.NetworkEngine
 import `in`.chinmoydas.signal.RetrofitClient
 import `in`.chinmoydas.signal.utils.StunClient
 import `in`.chinmoydas.signal.utils.WavUtils
+import `in`.chinmoydas.signal.utils.VoxHelper // [NEW] Added Import
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -78,6 +80,14 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
     private lateinit var mediaSession: MediaSessionCompat
     private var isHeadsetLinked = true
+
+    // [NEW] Public Safety Tools
+    private var sensorHelper: `in`.chinmoydas.signal.utils.SensorHelper? = null
+    private var isTheaterMode = false
+
+    // [NEW] VOX / Hands-Free Variables
+    private var voxHelper: VoxHelper? = null
+    private var isVoxEnabled = false
 
     private val END_STREAM_SIGNAL = "__END_TX__"
     private val PING_SIGNAL = "__PING__"
@@ -202,6 +212,11 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         wifiLock.setReferenceCounted(false)
         val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         connectivityManager.registerNetworkCallback(NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), networkCallback)
+
+        // [NEW] Initialize Sensor Helper for Public Safety
+        sensorHelper = `in`.chinmoydas.signal.utils.SensorHelper(this) { reason ->
+            sendPanicAlert("AUTO-ALERT: $reason")
+        }
     }
 
     override fun onInit(status: Int) {
@@ -735,6 +750,9 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         val headerLen = 1 + nameBytes.size + 4
 
         audioEngine.startRecording(shouldCompress) { rawBuffer ->
+            // [NEW] Feed Audio to VOX Analyzer
+            if (isVoxEnabled) voxHelper?.process(rawBuffer)
+
             val payloadToSend = if (isSecureMode && secretKey != null) {
                 CryptoEngine.encrypt(rawBuffer, currentSequenceNumber, secretKey) ?: rawBuffer
             } else {
@@ -831,6 +849,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
     @Suppress("DEPRECATION")
     private fun vibrate() {
+        if (isTheaterMode) return // [NEW] Silence vibration in Theater Mode
         try {
             val effect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE) else null
             if (effect != null) vibrator.vibrate(effect) else vibrator.vibrate(100)
@@ -921,6 +940,9 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     }
 
     override fun onDestroy() {
+        sensorHelper?.stop() // [NEW] Stop sensor
+        voxHelper = null // [NEW] Clean VOX
+
         if (tts != null) {
             tts?.stop()
             tts?.shutdown()
@@ -937,5 +959,70 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         if (wifiLock.isHeld) wifiLock.release()
         scope.cancel()
         super.onDestroy()
+    }
+
+    // [NEW] Safety Feature Helpers called from UI
+
+    fun toggleSensor(enabled: Boolean) {
+        if (enabled) sensorHelper?.start() else sensorHelper?.stop()
+    }
+
+    fun toggleTheaterMode(enabled: Boolean) {
+        isTheaterMode = enabled
+        if (enabled) {
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            audioManager.isSpeakerphoneOn = false
+        } else {
+            audioManager.isSpeakerphoneOn = userPrefersSpeaker
+        }
+    }
+
+    fun sendPanicAlert(reason: String = "SOS: HELP ME! (Panic Button Pressed)") {
+        scope.launch {
+            val target = repository.getTargetUser()
+            if (target.isNotBlank()) {
+                sendTextMessage(target, reason)
+                speakText("Distress Signal Sent")
+            }
+        }
+    }
+
+    // [NEW] Fixed VOX Toggle Logic
+    fun toggleVox(enabled: Boolean) {
+        isVoxEnabled = enabled
+
+        if (!enabled) {
+            if (isSending) stopTalk()
+            updateNotification("Listening...", null)
+            return
+        }
+
+        if (voxHelper == null) {
+            voxHelper = VoxHelper(
+                onSpeechStart = {
+                    // FIX: Wrapped in scope.launch to handle suspend function call
+                    scope.launch {
+                        if (!isSending) {
+                            val target = repository.getTargetUser()
+                            val ip = activeIpCache[target] ?: repository.getAllContacts().find { it.name == target }?.ip
+
+                            if (!ip.isNullOrBlank()) {
+                                // FIX: Check Permission before starting recording
+                                if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                                    startTalk(listOf(ip), UDP_PORT)
+                                    updateNotification("VOX: Transmitting...", target)
+                                }
+                            }
+                        }
+                    }
+                },
+                onSilence = {
+                    if (isSending) {
+                        stopTalk()
+                        updateNotification("VOX: Listening...", null)
+                    }
+                }
+            )
+        }
     }
 }
