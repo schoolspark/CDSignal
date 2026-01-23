@@ -3,11 +3,13 @@ package `in`.chinmoydas.signal.screens
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -16,6 +18,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
@@ -27,6 +30,7 @@ import androidx.compose.ui.unit.dp
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import `in`.chinmoydas.signal.viewmodel.WalkieViewModel
+import `in`.chinmoydas.signal.utils.CallSignaling // [NEW] Import for calling
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -38,9 +42,11 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
     var showChannelQrDialog by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
 
+    // [UPGRADE] Separate contacts for Speed Dial (Favorites) vs Directory
+    val allContacts = viewModel.savedContacts.toList()
     val filteredContacts = remember(searchQuery, viewModel.savedContacts) {
-        if (searchQuery.isBlank()) viewModel.savedContacts.toList()
-        else viewModel.savedContacts.filter { it.name.contains(searchQuery, ignoreCase = true) }
+        if (searchQuery.isBlank()) allContacts
+        else allContacts.filter { it.name.contains(searchQuery, ignoreCase = true) }
     }
 
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
@@ -75,11 +81,12 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
         verticalArrangement = Arrangement.spacedBy(24.dp)
     ) {
 
+        // 1. SEARCH BAR
         item {
             OutlinedTextField(
                 value = searchQuery,
                 onValueChange = { searchQuery = it },
-                placeholder = { Text("Search contacts...") },
+                placeholder = { Text("Search contacts or IP...") },
                 leadingIcon = { Icon(Icons.Default.Search, null) },
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
@@ -87,6 +94,7 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
             )
         }
 
+        // 2. SPEED DIAL (Horizontal List)
         if (filteredContacts.isNotEmpty()) {
             item {
                 Column {
@@ -97,6 +105,7 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                             val isGroup = contact.name.startsWith("group:")
                             val displayName = if (isGroup) contact.name.substringAfter(":") else contact.name
                             var showMenu by remember { mutableStateOf(false) }
+                            val isOnline = contact.ip.isNotEmpty() && contact.ip != "SERVER_LINK"
 
                             ElevatedCard(
                                 onClick = { viewModel.setTarget(contact.name); onConnected() },
@@ -108,7 +117,7 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                                     Box {
                                         Icon(if (isGroup) Icons.Default.Groups else Icons.Default.Person, null, modifier = Modifier.size(32.dp), tint = MaterialTheme.colorScheme.primary)
 
-                                        // [NEW] Principal Star Badge
+                                        // Principal Star Badge
                                         if (contact.isPriority) {
                                             Icon(
                                                 imageVector = Icons.Default.Star,
@@ -123,12 +132,26 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                                     Spacer(Modifier.height(8.dp))
                                     Text(displayName, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
 
+                                    // [UPGRADE] Enhanced Context Menu
                                     DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                                        // Voice Call Option (Top Priority)
+                                        DropdownMenuItem(
+                                            text = { Text("Voice Call", fontWeight = FontWeight.Bold) },
+                                            onClick = {
+                                                CallSignaling.startOutgoingCall(contact.ip)
+                                                showMenu = false
+                                            },
+                                            leadingIcon = { Icon(Icons.Default.Call, null, tint = if(isOnline) Color(0xFF43A047) else Color.Gray) },
+                                            enabled = isOnline
+                                        )
+                                        HorizontalDivider()
+
                                         DropdownMenuItem(text = { Text("Delete") }, onClick = { viewModel.deleteContact(contact.name); showMenu = false }, leadingIcon = { Icon(Icons.Default.Delete, null) })
+
                                         if (isGroup) {
                                             DropdownMenuItem(text = { Text("Share QR") }, onClick = { viewModel.generateChannelQr(contact.name, contact.savedCode); showChannelQrDialog = true; showMenu = false }, leadingIcon = { Icon(Icons.Default.QrCode, null) })
                                         } else {
-                                            // [NEW] Principal Toggle
+                                            // Principal Toggle
                                             DropdownMenuItem(
                                                 text = { Text(if(contact.isPriority) "Unset Principal" else "Set as Principal") },
                                                 onClick = { viewModel.togglePriority(contact.name); showMenu = false },
@@ -145,6 +168,7 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
             }
         }
 
+        // 3. ADD CONNECTION (Card)
         item {
             Column {
                 Text("Add New Connection", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
@@ -187,28 +211,49 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
             }
         }
 
+        // 4. NEARBY DEVICES (Updated with Tactical Row)
         item {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.WifiTethering, null, tint = MaterialTheme.colorScheme.secondary, modifier = Modifier.size(20.dp))
                 Spacer(Modifier.width(8.dp))
-                Text("Nearby Devices (Local Network)", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.secondary)
+                Text("Nearby Devices (Local)", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.secondary)
             }
         }
 
         if (viewModel.nearbyUsers.isNotEmpty()) {
             items(viewModel.nearbyUsers) { user ->
-                Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-                    Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                        Column { Text(user.name, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyLarge); Text(user.ip, style = MaterialTheme.typography.labelSmall, color = Color.Gray) }
-                        FilledTonalButton(onClick = { viewModel.addContact(user.name, user.ip, ""); onConnected() }) { Text("Connect") }
-                    }
-                }
+                TacticalUserRow(
+                    name = user.name,
+                    ip = user.ip,
+                    status = "Local Network",
+                    isOnline = true,
+                    onRadioClick = { viewModel.addContact(user.name, user.ip, ""); onConnected() },
+                    onCallClick = { CallSignaling.startOutgoingCall(user.ip) }
+                )
             }
         } else {
             item {
                 Box(Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) { CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp, color = Color.LightGray); Spacer(Modifier.height(8.dp)); Text("Scanning local network...", style = MaterialTheme.typography.bodySmall, color = Color.Gray) }
                 }
+            }
+        }
+
+        // 5. [NEW] SAVED DIRECTORY (For calling internet contacts)
+        if (filteredContacts.isNotEmpty()) {
+            item {
+                Text("Directory (Saved)", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.secondary)
+            }
+            items(filteredContacts) { contact ->
+                val isOnline = contact.ip.isNotEmpty() && contact.ip != "SERVER_LINK"
+                TacticalUserRow(
+                    name = contact.name,
+                    ip = if (isOnline) contact.ip else "Offline",
+                    status = if(contact.isPriority) "⭐ Principal" else "Saved",
+                    isOnline = isOnline,
+                    onRadioClick = { viewModel.setTarget(contact.name); onConnected() },
+                    onCallClick = { CallSignaling.startOutgoingCall(contact.ip) }
+                )
             }
         }
     }
@@ -220,5 +265,79 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
             text = { Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) { Text(viewModel.sharingChannelName, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Spacer(Modifier.height(16.dp)); viewModel.channelQrBitmap?.let { Image(bitmap = it.asImageBitmap(), contentDescription = "Channel QR", modifier = Modifier.size(200.dp)) } } },
             confirmButton = { TextButton(onClick = { showChannelQrDialog = false }) { Text("Close") } }
         )
+    }
+}
+
+// --- [NEW] REUSABLE TACTICAL ROW COMPONENT ---
+@Composable
+fun TacticalUserRow(
+    name: String,
+    ip: String,
+    status: String,
+    isOnline: Boolean,
+    onRadioClick: () -> Unit,
+    onCallClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp).fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Avatar
+            Box(
+                modifier = Modifier.size(40.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(name.take(1).uppercase(), fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimaryContainer)
+            }
+
+            Spacer(Modifier.width(12.dp))
+
+            // Info
+            Column(modifier = Modifier.weight(1f)) {
+                Text(name, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyLarge)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        if(isOnline) Icons.Default.Wifi else Icons.Default.WifiOff,
+                        null,
+                        modifier = Modifier.size(10.dp),
+                        tint = if(isOnline) Color(0xFF43A047) else Color.Gray
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(ip, style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                }
+            }
+
+            // [THE UPGRADE] SPLIT BUTTONS
+            Row {
+                // Radio (PTT)
+                FilledTonalIconButton(
+                    onClick = onRadioClick,
+                    modifier = Modifier.size(40.dp),
+                    colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Icon(Icons.Default.GraphicEq, "Radio", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+
+                Spacer(Modifier.width(8.dp))
+
+                // Phone (Call)
+                FilledTonalIconButton(
+                    onClick = onCallClick,
+                    enabled = isOnline,
+                    modifier = Modifier.size(40.dp),
+                    colors = IconButtonDefaults.filledTonalIconButtonColors(
+                        containerColor = if(isOnline) Color(0xFF43A047) else Color.Gray,
+                        contentColor = Color.White,
+                        disabledContainerColor = Color.LightGray
+                    )
+                ) {
+                    Icon(Icons.Default.Call, "Call")
+                }
+            }
+        }
     }
 }

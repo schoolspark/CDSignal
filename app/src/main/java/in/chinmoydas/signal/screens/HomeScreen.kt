@@ -31,6 +31,10 @@ fun HomeScreen(
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
 
+    // [UPGRADE] Live count of nearby devices for the Badge
+    // This automatically updates when new users are found
+    val nearbyCount = viewModel.nearbyUsers.size
+
     Scaffold(
         modifier = Modifier.navigationBarsPadding(),
         containerColor = MaterialTheme.colorScheme.surfaceVariant,
@@ -72,12 +76,25 @@ fun HomeScreen(
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 }
                 )
+
+                // [UPGRADE] Connect Tab with Notification Badge
                 NavigationBarItem(
-                    icon = { Icon(Icons.Default.Search, contentDescription = "Connect") },
+                    icon = {
+                        BadgedBox(
+                            badge = {
+                                if (nearbyCount > 0) {
+                                    Badge { Text("$nearbyCount") }
+                                }
+                            }
+                        ) {
+                            Icon(Icons.Default.Search, contentDescription = "Connect")
+                        }
+                    },
                     label = { Text("Connect") },
                     selected = selectedTab == 2,
                     onClick = { selectedTab = 2 }
                 )
+
                 NavigationBarItem(
                     icon = { Icon(Icons.Default.Person, contentDescription = "My ID") },
                     label = { Text("My ID") },

@@ -127,13 +127,19 @@ class MainActivity : ComponentActivity() {
                         walkieViewModel = ViewModelProvider(this@MainActivity, factory)[WalkieViewModel::class.java]
                         val currentName by repository.myUsername.collectAsState()
 
-                        // --- CRITICAL FIX: Observe Service ONLY when UI & VM are ready ---
+                        // --- [UPDATED] Link Service & Observe State ---
                         LaunchedEffect(currentService) {
-                            currentService?.voiceServiceState?.collectLatest { state ->
-                                if (state.incomingCall != null && state.incomingIp != null) {
-                                    walkieViewModel.onReceptionStarted(state.incomingCall, state.incomingIp)
-                                } else {
-                                    walkieViewModel.onReceptionEnded()
+                            currentService?.let { service ->
+                                // [NEW] 1. Link the Call Engine so it can send signals
+                                walkieViewModel.setupCallSupport(service)
+
+                                // 2. Existing State Observation
+                                service.voiceServiceState.collectLatest { state ->
+                                    if (state.incomingCall != null && state.incomingIp != null) {
+                                        walkieViewModel.onReceptionStarted(state.incomingCall, state.incomingIp)
+                                    } else {
+                                        walkieViewModel.onReceptionEnded()
+                                    }
                                 }
                             }
                         }
@@ -166,6 +172,7 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
                         }
+                        `in`.chinmoydas.signal.screens.CallOverlay()
                     } else {
                         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             CircularProgressIndicator()

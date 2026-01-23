@@ -578,6 +578,14 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                         if (textData.startsWith("TXT:")) {
                             val cleanMessage = textData.substring(4)
 
+                            // Intercept Call Commands before they become chat messages
+                            if (cleanMessage.startsWith("CMD:CALL")) {
+                                scope.launch {
+                                    `in`.chinmoydas.signal.utils.CallSignaling.handlePacket(cleanMessage, senderIp)
+                                }
+                                return // STOP! Do not save to database or speak via TTS
+                            }
+
                             // [NEW] Principal Text Override
                             val shouldSpeak = !isSilenced || isPrincipal
                             val notificationPrefix = if(isPrincipal) "⚠️ PRIORITY MSG" else "Message"

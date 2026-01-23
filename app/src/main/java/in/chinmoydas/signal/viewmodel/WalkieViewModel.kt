@@ -474,4 +474,24 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
             } catch (e: Exception) { Log.e("WalkieViewModel", "Pairing code reset failed", e) }
         }
     }
+
+    // [NEW] 1. Link the Sender
+    fun setupCallSupport(service: VoiceService) {
+        // Tells the Call System how to send data using your existing Service
+        `in`.chinmoydas.signal.utils.CallSignaling.sendUdpTextFunction = { command, ip ->
+            service.sendTextMessage(ip, command)
+        }
+    }
+
+    // [NEW] 2. Link the Receiver
+    // Returns TRUE if the packet was a Call Command (so you can skip saving it to history)
+    fun handleIncomingPacket(text: String, ip: String): Boolean {
+        if (text.startsWith("CMD:CALL")) {
+            viewModelScope.launch {
+                `in`.chinmoydas.signal.utils.CallSignaling.handlePacket(text, ip)
+            }
+            return true // Handled as Call
+        }
+        return false // Handled as Chat
+    }
 }
