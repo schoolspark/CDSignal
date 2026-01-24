@@ -31,8 +31,7 @@ fun HomeScreen(
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
 
-    // [UPGRADE] Live count of nearby devices for the Badge
-    // This automatically updates when new users are found
+    // Live count of nearby devices for the Badge
     val nearbyCount = viewModel.nearbyUsers.size
 
     Scaffold(
@@ -77,7 +76,6 @@ fun HomeScreen(
                     onClick = { selectedTab = 1 }
                 )
 
-                // [UPGRADE] Connect Tab with Notification Badge
                 NavigationBarItem(
                     icon = {
                         BadgedBox(
@@ -117,7 +115,8 @@ fun HomeScreen(
             )
             1 -> HistoryTab(
                 modifier = contentModifier,
-                viewModel = viewModel
+                viewModel = viewModel,
+                service = service // [FIXED] Now passing the required service parameter
             )
             2 -> ConnectTab(
                 modifier = contentModifier,

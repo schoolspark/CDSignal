@@ -109,17 +109,23 @@ fun InfoScreen(navController: NavController) {
                     }
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "• Encryption: When Secure Channel is ON, voice packets are encrypted using AES-GCM-256 (Military Grade) directly on your device.",
+                        "• Encryption: When Secure Channel is ON, all voice and text packets are encrypted using AES-GCM-256 (Military Grade).",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "• Peer-to-Peer: Audio is transmitted directly between users. No voice data is ever stored on our servers.",
+                        "• Peer-to-Peer: Audio and Location data is transmitted directly between users. We do not store your conversations.",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Spacer(Modifier.height(4.dp))
 
-                    // [UPDATED] "Auto-Delete" instead of "Burn-on-Read"
+                    // [NEW] Added Location Privacy Note
+                    Text(
+                        "• Location Privacy: 'Signal Trace' coordinates are sent directly to the peer. We do not track or log your location history.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Spacer(Modifier.height(4.dp))
+
                     Text(
                         "• Auto-Delete: Incoming Voice Pager messages are stored locally and automatically removed immediately after playback.",
                         style = MaterialTheme.typography.bodySmall

@@ -27,9 +27,16 @@ import `in`.chinmoydas.signal.utils.CallSignaling
 import kotlinx.coroutines.delay
 
 @Composable
-fun CallOverlay() {
+fun CallOverlay(
+    nameResolver: (String) -> String
+) {
     var callState by remember { mutableStateOf<CallState>(CallState.Idle) }
     var callerIp by remember { mutableStateOf("") }
+
+    // Resolve IP to Name whenever the IP changes
+    val displayName = remember(callerIp) {
+        if (callerIp.isNotEmpty()) nameResolver(callerIp) else "Unknown"
+    }
 
     LaunchedEffect(Unit) {
         CallSignaling.callEvents.collect { event ->
@@ -37,6 +44,10 @@ fun CallOverlay() {
                 is CallSignaling.CallEvent.IncomingCall -> {
                     callerIp = event.ip
                     callState = CallState.Ringing
+                }
+                is CallSignaling.CallEvent.OutgoingCall -> {
+                    callerIp = event.ip
+                    callState = CallState.Dialing
                 }
                 is CallSignaling.CallEvent.CallConnected -> {
                     callState = CallState.Active
@@ -55,23 +66,61 @@ fun CallOverlay() {
         enter = slideInVertically { it } + fadeIn(),
         exit = slideOutVertically { it } + fadeOut()
     ) {
-        if (callState == CallState.Ringing) {
-            IncomingCallDialog(
-                callerIp = callerIp,
-                onAccept = { CallSignaling.acceptCall() },
-                onDecline = { CallSignaling.declineCall() }
-            )
-        } else if (callState == CallState.Active) {
-            ActiveCallScreen(
-                callerIp = callerIp,
-                onEndCall = { CallSignaling.endCall() }
-            )
+        when (callState) {
+            CallState.Ringing -> {
+                IncomingCallDialog(
+                    callerName = displayName,
+                    onAccept = { CallSignaling.acceptCall() },
+                    onDecline = { CallSignaling.declineCall() }
+                )
+            }
+            CallState.Dialing -> {
+                DialingDialog(
+                    callerName = displayName,
+                    onCancel = { CallSignaling.endCall() }
+                )
+            }
+            CallState.Active -> {
+                ActiveCallScreen(
+                    callerName = displayName,
+                    onEndCall = { CallSignaling.endCall() }
+                )
+            }
+            else -> {}
         }
     }
 }
 
 @Composable
-fun IncomingCallDialog(callerIp: String, onAccept: () -> Unit, onDecline: () -> Unit) {
+fun DialingDialog(callerName: String, onCancel: () -> Unit) {
+    Dialog(
+        onDismissRequest = { onCancel() },
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Card(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text("CALLING...", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.height(8.dp))
+                Text(callerName, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(32.dp))
+
+                CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.height(32.dp))
+
+                CallButton(Icons.Default.CallEnd, Color(0xFFE53935), "CANCEL", onCancel)
+            }
+        }
+    }
+}
+
+@Composable
+fun IncomingCallDialog(callerName: String, onAccept: () -> Unit, onDecline: () -> Unit) {
     Dialog(
         onDismissRequest = { onDecline() },
         properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -86,7 +135,7 @@ fun IncomingCallDialog(callerIp: String, onAccept: () -> Unit, onDecline: () -> 
             ) {
                 Text("INCOMING SECURE CALL", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
                 Spacer(Modifier.height(8.dp))
-                Text(callerIp, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                Text(callerName, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(32.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                     CallButton(Icons.Default.CallEnd, Color(0xFFE53935), "DECLINE", onDecline)
@@ -98,7 +147,7 @@ fun IncomingCallDialog(callerIp: String, onAccept: () -> Unit, onDecline: () -> 
 }
 
 @Composable
-fun ActiveCallScreen(callerIp: String, onEndCall: () -> Unit) {
+fun ActiveCallScreen(callerName: String, onEndCall: () -> Unit) {
     Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         Column(
             Modifier.fillMaxSize(),
@@ -109,7 +158,7 @@ fun ActiveCallScreen(callerIp: String, onEndCall: () -> Unit) {
                 Icon(Icons.Default.Call, null, modifier = Modifier.size(64.dp), tint = MaterialTheme.colorScheme.primary)
             }
             Spacer(Modifier.height(24.dp))
-            Text(callerIp, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
+            Text(callerName, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
             CallTimer()
             Spacer(Modifier.height(64.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
@@ -149,4 +198,4 @@ fun CallTimer() {
     Text("%02d:%02d".format(seconds / 60, seconds % 60), style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary)
 }
 
-enum class CallState { Idle, Ringing, Active }
+enum class CallState { Idle, Ringing, Dialing, Active }

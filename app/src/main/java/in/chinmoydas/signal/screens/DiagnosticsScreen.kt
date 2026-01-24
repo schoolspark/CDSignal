@@ -5,6 +5,8 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.hardware.Sensor
+import android.hardware.SensorManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.MediaPlayer
@@ -71,12 +73,19 @@ fun DiagnosticsScreen(navController: NavController) {
     var storageStatus by remember { mutableStateOf(checkStorage(context)) }
     var audioFxStatus by remember { mutableStateOf(checkAudioEffects()) }
 
+    // [NEW] Sensor Check for Impact Shield
+    var sensorStatus by remember { mutableStateOf(checkSensors(context)) }
+
     // Connectivity
     var stunStatus by remember { mutableStateOf("Checking...") }
-    var portStatus by remember { mutableStateOf(checkPort50005()) }
+    var portStatus by remember { mutableStateOf(checkPort(50005)) }
+
+    // [NEW] Port 50006 Check for Secure Calls
+    var callPortStatus by remember { mutableStateOf(checkPort(50006)) }
+
     var volumeStatus by remember { mutableStateOf(checkVolume(context)) }
 
-    // [NEW] TTS State
+    // TTS State
     var ttsStatus by remember { mutableStateOf("Initializing...") }
     var ttsEngine: TextToSpeech? by remember { mutableStateOf(null) }
 
@@ -124,7 +133,8 @@ fun DiagnosticsScreen(navController: NavController) {
         audioRouteInfo = getAudioRoute(context)
         stunStatus = checkStunConnectivity()
         volumeStatus = checkVolume(context)
-        portStatus = checkPort50005()
+        portStatus = checkPort(50005)
+        callPortStatus = checkPort(50006)
     }
 
     fun copyReport() {
@@ -138,7 +148,9 @@ fun DiagnosticsScreen(navController: NavController) {
             NAT/STUN: $stunStatus
             Local IP: $localIp
             Server: $serverStatus
-            Port 50005: $portStatus
+            Port 50005 (PTT): $portStatus
+            Port 50006 (Call): $callPortStatus
+            Sensors: $sensorStatus
             Voice Vol: $volumeStatus
             TTS Engine: $ttsStatus
             Storage: $storageStatus
@@ -172,7 +184,9 @@ fun DiagnosticsScreen(navController: NavController) {
                         audioFxStatus = checkAudioEffects()
                         audioRouteInfo = getAudioRoute(context)
                         localIp = getLocalIpAddress()
-                        portStatus = checkPort50005()
+                        portStatus = checkPort(50005)
+                        callPortStatus = checkPort(50006)
+                        sensorStatus = checkSensors(context)
                         volumeStatus = checkVolume(context)
 
                         scope.launch {
@@ -199,15 +213,17 @@ fun DiagnosticsScreen(navController: NavController) {
             DiagnosticRow("NAT/STUN", stunStatus)
             DiagnosticRow("Local IP", localIp)
             DiagnosticRow("Server API", serverStatus)
-            DiagnosticRow("Port 50005", portStatus)
+            DiagnosticRow("Port 50005 (PTT)", portStatus)
+            DiagnosticRow("Port 50006 (Call)", callPortStatus) // [NEW]
+            DiagnosticRow("Sensors (Fall)", sensorStatus)       // [NEW]
             DiagnosticRow("Voice Vol", volumeStatus)
-            DiagnosticRow("TTS Engine", ttsStatus) // [NEW]
+            DiagnosticRow("TTS Engine", ttsStatus)
             DiagnosticRow("Storage", storageStatus)
             DiagnosticRow("Audio HW", audioFxStatus)
 
             HorizontalDivider(Modifier.padding(vertical = 24.dp))
 
-            // 2. [NEW] TTS & HAPTICS CHECK
+            // 2. TTS & HAPTICS CHECK
             Text("Alerts & Feedback", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(8.dp))
 
@@ -381,7 +397,7 @@ fun testVibration(context: Context) {
 @Composable
 fun DiagnosticRow(label: String, status: String) {
     val isPass = status.startsWith("OK") || status.startsWith("Yes") || status.startsWith("Connected") || status.startsWith("Free") || status.contains("✓")
-    val isWarning = status.startsWith("Active") || status.contains("Muted") || status.contains("Restricted")
+    val isWarning = status.startsWith("Active") || status.contains("Muted") || status.contains("Restricted") || status.contains("Denied")
 
     val icon = if (isPass) Icons.Default.CheckCircle else if (status.contains("Checking") || status.contains("Initializing")) Icons.Default.Refresh else Icons.Default.Warning
 
@@ -499,16 +515,24 @@ fun checkVolume(context: Context): String {
     return if (current == 0) "Muted (0%)" else "$pct% ($current/$max)"
 }
 
-fun checkPort50005(): String {
+// [UPDATED] Generic Port Checker
+fun checkPort(port: Int): String {
     return try {
-        val socket = DatagramSocket(50005)
+        val socket = DatagramSocket(port)
         socket.close()
-        "Free (Service Stopped)"
+        "Free (Ready)"
     } catch (e: java.net.BindException) {
-        "Active (Service Running)"
+        "Active (In Use)"
     } catch (e: Exception) {
         "Fail (${e.message})"
     }
+}
+
+// [NEW] Sensor Checker
+fun checkSensors(context: Context): String {
+    val sm = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    val accel = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+    return if (accel != null) "OK (Found)" else "Fail (Missing)"
 }
 
 suspend fun checkStunConnectivity(): String = withContext(Dispatchers.IO) {

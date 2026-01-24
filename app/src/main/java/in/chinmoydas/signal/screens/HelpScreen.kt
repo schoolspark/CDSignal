@@ -41,13 +41,62 @@ fun HelpScreen(navController: NavController) {
                 .verticalScroll(rememberScrollState())
                 .padding(16.dp)
         ) {
-            // --- SECTION 1: SECURE P2P PAIRING ---
+            // --- 1. NEW FEATURES (TOP PRIORITY) ---
+
+            // Safety Triad
             HelpCard(
-                title = "🔐 SECURE P2P PAIRING",
+                title = "🛡️ SAFETY TRIAD (TACTICAL)",
+                icon = Icons.Default.Shield,
+                color = MaterialTheme.colorScheme.errorContainer
+            ) {
+                Text("Located at the bottom of the Radio Screen:", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                StatusDotRow(Color.Red, "SOS Button", "Broadcasts an immediate 'Distress Signal' to your target.")
+                StatusDotRow(Color.Gray, "Impact Shield", "Sensors detect crashes/falls. Starts 5s countdown before auto-SOS.")
+                StatusDotRow(MaterialTheme.colorScheme.primary, "Signal Trace", "Sends your current static location pin (Lat/Long).")
+                StatusDotRow(Color.Black, "Stealth Mode", "Disables Speaker & Vibration. Audio -> Earpiece only.")
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // Secure Calls
+            HelpCard(
+                title = "📞 SECURE VOICE CALLS",
+                icon = Icons.Default.Call,
+                color = MaterialTheme.colorScheme.tertiaryContainer
+            ) {
+                Text("Full-Duplex (Phone Style) vs. Radio (PTT):", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                Step(1, "Go to the 'Connect' Tab.")
+                Step(2, "Tap the PHONE ICON next to a user.")
+                Step(3, "This starts a private call.")
+                Text("Note: PTT is disabled during a phone call.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // VOX Pro
+            HelpCard(
+                title = "🎙️ VOX PRO (HANDS-FREE)",
+                icon = Icons.Default.RecordVoiceOver,
+                color = MaterialTheme.colorScheme.surfaceVariant
+            ) {
+                Text("Transmit without pressing buttons:", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(4.dp))
+                Text("Tap the 'VOX' icon in the Safety Toolbar. The app monitors mic levels and transmits when you speak. Best used with a headset.")
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // --- 2. CORE FEATURES (PRESERVED) ---
+
+            // Secure P2P
+            HelpCard(
+                title = "🔐 SECURE KEY EXCHANGE",
                 icon = Icons.Default.QrCodeScanner,
                 color = MaterialTheme.colorScheme.secondaryContainer
             ) {
-                Text("For private, encrypted calls between two people:", fontWeight = FontWeight.Bold)
+                Text("For private, encrypted communication:", fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
                 Step(1, "Go to 'Connect' tab and tap 'Scan QR Code'.")
                 Step(2, "Scan your friend's Personal QR to save their 'Key'.")
@@ -57,7 +106,7 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 2: SILENT TEXT MESSAGES (NEW) ---
+            // Silent Text
             HelpCard(
                 title = "💬 SILENT TEXT MESSAGES",
                 icon = Icons.Default.Keyboard,
@@ -67,47 +116,46 @@ fun HelpScreen(navController: NavController) {
                 Spacer(Modifier.height(8.dp))
                 Step(1, "Tap the Keyboard Icon (⌨️) on the Radio screen.")
                 Step(2, "Type your message and tap SEND.")
-                Step(3, "Receiver Behavior:", isBold = true)
                 Text("• If Receiver is LOUD: Phone speaks the text (TTS).", style = MaterialTheme.typography.bodySmall)
-                Text("• If Receiver is SILENT: Message saves to Voice Pager.", style = MaterialTheme.typography.bodySmall)
+                Text("• If Receiver is SILENT: Message saves to History.", style = MaterialTheme.typography.bodySmall)
             }
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 3: STATUS INDICATORS ---
+            // Status Indicators
             HelpCard(
                 title = "🚦 STATUS LIGHTS",
                 icon = Icons.Default.Info,
                 color = MaterialTheme.colorScheme.surfaceVariant
             ) {
                 StatusDotRow(Color.Green, "Green Dot", "Connected. Audio Received & Path Open.")
-                StatusDotRow(Color.Yellow, "Yellow Dot", "Checking Health / Waking up peer...")
+                StatusDotRow(Color.Yellow, "Yellow Dot", "Checking Health / Waking up peer.")
                 StatusDotRow(Color.Gray, "Gray Dot", "Idle / Offline. Select a user to ping.")
-
                 Spacer(Modifier.height(8.dp))
                 HorizontalDivider(thickness = 1.dp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.2f))
                 Spacer(Modifier.height(8.dp))
-
                 StatusDotRow(MaterialTheme.colorScheme.primary, "Blue Button", "Ready. Hold to Talk.")
                 StatusDotRow(MaterialTheme.colorScheme.error, "Red Button", "Transmitting (ON AIR).")
             }
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 4: VOICE PAGER ---
+            // History & Pager (Merged)
             HelpCard(
-                title = "📟 VOICE PAGER (LOGS)",
-                icon = Icons.Default.NotificationsOff,
+                title = "📜 HISTORY & CALLBACK",
+                icon = Icons.Default.History,
                 color = MaterialTheme.colorScheme.surfaceVariant
             ) {
-                Text("Tap the 'Silent Mode' (Bell) icon to mute live audio.", fontWeight = FontWeight.Bold)
+                Text("Review past activity and messages:", fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(4.dp))
-                Text("Incoming Audio & Text will be saved to the Pager List below the PTT button. Tap any item to Play/Speak it. Items vanish after playing (Burn-on-Read).")
+                Step(1, "Go to 'History' Tab.")
+                Step(2, "Tap 'Play' on messages to listen. They auto-delete after playing (Burn-on-Read).")
+                Step(3, "Tap the 'Three Dots' on a log to Call Back or Connect via PTT.")
             }
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 5: OFFLINE / LAN MODE ---
+            // Offline Mode
             HelpCard(
                 title = "📡 OFFLINE / LAN MODE",
                 icon = Icons.Default.Wifi,
@@ -118,33 +166,17 @@ fun HelpScreen(navController: NavController) {
                 Step(1, "Connect all phones to the same WiFi.")
                 Step(2, "Tap 'Offline Mode' on the login screen.")
                 Step(3, "Tap the Group Icon (Top Right) to broadcast to everyone.")
-                Step(4, "Security Note:", isBold = true)
-                Text("Unpaired users can be heard on the Public Channel. For privacy in Offline Mode, Scan their QR Code.", style = MaterialTheme.typography.bodySmall)
             }
 
             Spacer(Modifier.height(16.dp))
 
-            // --- SECTION 6: MAKING CALLS ---
-            HelpCard(
-                title = "👤 MAKING CALLS (INTERNET)",
-                icon = Icons.Default.Person,
-                color = MaterialTheme.colorScheme.surfaceVariant
-            ) {
-                Step(1, "Select a person from your contacts.")
-                Step(2, "Wait for the Status Dot to turn GREEN or YELLOW.")
-                Step(3, "The 'Double Punch':", isBold = true)
-                Text("If the dot stays Gray, BOTH users should press the Talk button once to wake up the connection.", modifier = Modifier.padding(start = 24.dp))
-            }
-
-            Spacer(Modifier.height(16.dp))
-
-            // --- SECTION 7: TROUBLESHOOTING ---
+            // --- 3. TROUBLESHOOTING (MERGED) ---
             Text("Troubleshooting", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
 
             Text("• Incoming call but NO SOUND? You are missing their Key. Scan their QR Code.", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(4.dp))
-
+            Text("• Call Fails? Ensure the user is Online (Green/Yellow dot).")
             Text("• Status stays Gray? Press the Talk button once to wake up the peer.")
             Text("• Screeching? Keep phones 2-3 meters apart.")
             Text("• No devices found? Ensure 'AP Isolation' is OFF in your Router.")
@@ -153,6 +185,8 @@ fun HelpScreen(navController: NavController) {
         }
     }
 }
+
+// --- HELPER COMPONENTS (PRESERVED) ---
 
 @Composable
 fun HelpCard(title: String, icon: ImageVector, color: Color, content: @Composable ColumnScope.() -> Unit) {

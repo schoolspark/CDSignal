@@ -168,7 +168,22 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         // Render Call UI on top of everything
-                        CallOverlay()
+                        CallOverlay(
+                            nameResolver = { ip ->
+                                // [FIX] Look up the name from saved contacts!
+                                val contact = walkieViewModel.savedContacts.find { it.ip == ip }
+                                if (contact != null) {
+                                    contact.name
+                                } else {
+                                    // Fallback: Check if it's the target user
+                                    if (walkieViewModel.getCurrentTargetIp() == ip) {
+                                        walkieViewModel.targetUser
+                                    } else {
+                                        ip // No name found, show IP
+                                    }
+                                }
+                            }
+                        )
                     } else {
                         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             CircularProgressIndicator()

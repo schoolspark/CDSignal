@@ -39,7 +39,9 @@ import `in`.chinmoydas.signal.utils.NetworkEngine
 import `in`.chinmoydas.signal.RetrofitClient
 import `in`.chinmoydas.signal.utils.StunClient
 import `in`.chinmoydas.signal.utils.WavUtils
-import `in`.chinmoydas.signal.utils.VoxHelper
+import `in`.chinmoydas.signal.utils.CallSignaling
+import `in`.chinmoydas.signal.utils.VoxHelper // [NEW]
+import `in`.chinmoydas.signal.utils.SensorHelper // [NEW]
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -52,7 +54,7 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
-// [UPDATED] Added isSosPending
+// [UPDATED] State now includes Safety Flags for UI
 data class VoiceServiceState(
     val incomingCall: String? = null,
     val incomingIp: String? = null,
@@ -62,10 +64,11 @@ data class VoiceServiceState(
     val lastPingResponse: Long = 0L,
     val isHeadsetLinked: Boolean = true,
     val isTransmitting: Boolean = false,
+    // New Feature Flags
     val isVoxEnabled: Boolean = false,
     val isTheaterMode: Boolean = false,
     val isSensorEnabled: Boolean = false,
-    val isSosPending: Boolean = false // New State
+    val isSosPending: Boolean = false
 )
 
 class VoiceService : Service(), TextToSpeech.OnInitListener {
@@ -86,15 +89,16 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     private lateinit var mediaSession: MediaSessionCompat
     private var isHeadsetLinked = true
 
-    // [Safety Tools State]
-    private var sensorHelper: `in`.chinmoydas.signal.utils.SensorHelper? = null
+    // --- [NEW] Safety & Feature Helpers ---
+    private var sensorHelper: SensorHelper? = null
+    private var voxHelper: VoxHelper? = null
+
+    // Feature Toggles
     private var isTheaterMode = false
     private var isSensorEnabled = false
-
-    // [VOX Variables]
-    private var voxHelper: VoxHelper? = null
     private var isVoxEnabled = false
 
+    // Background SOS Timer
     private var sosJob: Job? = null
 
     private val END_STREAM_SIGNAL = "__END_TX__"
@@ -145,9 +149,11 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 isSpeakerOn = userPrefersSpeaker,
                 isHeadsetLinked = isHeadsetLinked,
                 isTransmitting = isSending,
+                // Map New Flags
                 isVoxEnabled = isVoxEnabled,
                 isTheaterMode = isTheaterMode,
-                isSensorEnabled = isSensorEnabled
+                isSensorEnabled = isSensorEnabled,
+                isSosPending = (sosJob?.isActive == true)
             )
         }
     }
@@ -222,9 +228,29 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         connectivityManager.registerNetworkCallback(NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), networkCallback)
 
-        // Sensor triggers the Service-side sequence
-        sensorHelper = `in`.chinmoydas.signal.utils.SensorHelper(this) { reason ->
+        // [NEW] Initialize Safety Sensor (Impact Shield)
+        sensorHelper = SensorHelper(this) { reason ->
             triggerSosSequence(reason)
+        }
+    }
+
+    // [NEW] Background SOS Timer Logic (Fixes Screen-Off Bug)
+    private fun triggerSosSequence(reason: String) {
+        if (sosJob?.isActive == true) return
+
+        _voiceServiceState.update { it.copy(isSosPending = true) }
+
+        sosJob = scope.launch {
+            speakText("Impact Detected. SOS in 5 seconds.")
+            repeat(5) {
+                if (!isActive) return@launch
+                delay(1000)
+            }
+            // If we are still here after 5 seconds, send alert
+            if (isActive) {
+                sendPanicAlert(reason)
+                _voiceServiceState.update { it.copy(isSosPending = false) }
+            }
         }
     }
 
@@ -479,6 +505,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
+    // [NEW] Feature: Signal Trace (Location)
     fun sendLocationPing(lat: Double, lng: Double) {
         val message = "LOC:$lat,$lng"
         scope.launch {
@@ -611,7 +638,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                         if (textData.startsWith("TXT:")) {
                             val cleanMessage = textData.substring(4)
 
-                            // Handle Location Ping (Do NOT speak it)
+                            // [NEW] Signal Trace (Location) Handling
                             if (cleanMessage.startsWith("LOC:")) {
                                 scope.launch {
                                     val db = AppDatabase.getDatabase(applicationContext)
@@ -626,10 +653,10 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                                 return
                             }
 
-                            // Intercept Call Commands
+                            // [NEW] Call Signaling Interception
                             if (cleanMessage.startsWith("CMD:CALL")) {
                                 scope.launch {
-                                    `in`.chinmoydas.signal.utils.CallSignaling.handlePacket(cleanMessage, senderIp)
+                                    CallSignaling.handlePacket(cleanMessage, senderIp)
                                 }
                                 return
                             }
@@ -780,6 +807,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         val headerLen = 1 + nameBytes.size + 4
 
         audioEngine.startRecording(shouldCompress) { rawBuffer ->
+            // [NEW] VOX Processing Hook
             if (isVoxEnabled) voxHelper?.process(rawBuffer)
 
             val payloadToSend = if (isSecureMode && secretKey != null) {
@@ -879,7 +907,9 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
     @Suppress("DEPRECATION")
     private fun vibrate() {
+        // [NEW] Stealth Mode (Theater)
         if (isTheaterMode) return
+
         try {
             val effect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE) else null
             if (effect != null) vibrator.vibrate(effect) else vibrator.vibrate(100)
@@ -937,14 +967,15 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
+    // [UPDATED] Smart Status & Branded Terms
     private fun refreshStatusNotification() {
         val text = when {
             isSending -> "ON AIR: Transmitting..."
             isReceiving -> "Incoming: ${voiceServiceState.value.incomingCall ?: "Signal"}"
             isSilenced -> "Silent Mode Active"
-            isVoxEnabled -> "VOX Standby (Hands-Free)"
-            isSensorEnabled -> "Crash Monitor Active"
-            isTheaterMode -> "Theater Mode Active"
+            isVoxEnabled -> "VOX Pro Active" // Branded
+            isSensorEnabled -> "Impact Shield Active" // Branded
+            isTheaterMode -> "Stealth Mode Active" // Branded
             else -> "Listening..."
         }
         updateNotification(text, null)
@@ -983,8 +1014,10 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     }
 
     override fun onDestroy() {
+        // Stop Sensors & Helpers
         sensorHelper?.stop()
         voxHelper = null
+
         if (tts != null) {
             tts?.stop()
             tts?.shutdown()
@@ -1003,11 +1036,12 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         super.onDestroy()
     }
 
-    // [NEW] Exposed Safety Feature Helpers
+    // --- [NEW] Public Helper Methods for UI Toggles ---
+
     fun toggleSensor(enabled: Boolean) {
         isSensorEnabled = enabled
         if (enabled) sensorHelper?.start() else sensorHelper?.stop()
-        updateState() // IMPORTANT: Update state for UI to see
+        updateState()
         refreshStatusNotification()
     }
 
@@ -1019,7 +1053,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         } else {
             audioManager.isSpeakerphoneOn = userPrefersSpeaker
         }
-        updateState() // IMPORTANT
+        updateState()
         refreshStatusNotification()
     }
 
@@ -1033,35 +1067,15 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun triggerSosSequence(reason: String) {
-        if (sosJob?.isActive == true) return // Already counting down
-
-        _voiceServiceState.update { it.copy(isSosPending = true) }
-
-        sosJob = scope.launch {
-            speakText("Impact Detected. SOS in 5 seconds.")
-            repeat(5) { i ->
-                if (!isActive) return@launch
-                delay(1000)
-            }
-            // Time is up! Send the alert if not cancelled
-            if (isActive) {
-                sendPanicAlert(reason)
-                _voiceServiceState.update { it.copy(isSosPending = false) }
-            }
-        }
-    }
-
-    // [NEW] SOS Cancel Methods
     fun cancelSos() {
         sosJob?.cancel()
         sosJob = null
         _voiceServiceState.update { it.copy(isSosPending = false) }
-        speakText("Emergency Alert Cancelled")
+        speakText("Alert Cancelled")
     }
 
     fun confirmSos() {
-        sosJob?.cancel() // Stop timer
+        sosJob?.cancel()
         sendPanicAlert("AUTO-ALERT: Hard Impact Detected!")
         _voiceServiceState.update { it.copy(isSosPending = false) }
     }
@@ -1082,8 +1096,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                             if (!ip.isNullOrBlank()) {
                                 if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                                     startTalk(listOf(ip), UDP_PORT)
-                                    // Removed context-dependent updateNotification call here to avoid complexity
-                                    // The startTalk already sets isSending = true which updates notification via state flow
                                 }
                             }
                         }
@@ -1096,7 +1108,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 }
             )
         }
-        updateState() // IMPORTANT
+        updateState()
         refreshStatusNotification()
     }
 }

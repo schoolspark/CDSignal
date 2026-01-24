@@ -1,8 +1,11 @@
 package `in`.chinmoydas.signal.utils
 
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.launch
 
 object CallSignaling {
 
@@ -25,6 +28,9 @@ object CallSignaling {
 
     // Sender Function (To be linked from ViewModel)
     var sendUdpTextFunction: ((String, String) -> Unit)? = null
+
+    // Scope for emitting events
+    private val scope = CoroutineScope(Dispatchers.Main)
 
     suspend fun handlePacket(text: String, senderIp: String) {
         if (!text.startsWith("CMD:CALL")) return
@@ -68,6 +74,10 @@ object CallSignaling {
     fun startOutgoingCall(ip: String) {
         currentCallerIp = ip
         sendSignal(CMD_REQ, ip)
+        // [FIX] Tell UI we are dialing
+        scope.launch {
+            _callEvents.emit(CallEvent.OutgoingCall(ip))
+        }
     }
 
     fun acceptCall() {
@@ -84,9 +94,19 @@ object CallSignaling {
     }
 
     fun endCall() {
-        val ip = currentCallerIp ?: return
-        sendSignal(CMD_END, ip)
+        val ip = currentCallerIp
+        if (ip != null) {
+            sendSignal(CMD_END, ip)
+        }
+
         CallEngine.stopCall()
+
+        // CRITICAL FIX: Tell the UI the call is over!
+        // Using scope.launch because emit is a suspend function
+        scope.launch {
+            _callEvents.emit(CallEvent.CallEnded)
+        }
+
         reset()
     }
 
@@ -97,6 +117,7 @@ object CallSignaling {
 
     sealed class CallEvent {
         data class IncomingCall(val ip: String) : CallEvent()
+        data class OutgoingCall(val ip: String) : CallEvent() // [NEW]
         object CallConnected : CallEvent()
         object CallRejected : CallEvent()
         object CallBusy : CallEvent()

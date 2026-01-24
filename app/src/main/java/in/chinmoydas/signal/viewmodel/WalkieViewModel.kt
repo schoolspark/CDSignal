@@ -27,7 +27,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import android.graphics.Color as AndroidColor
 
-// [FIXED] Updated Contact Data Class to include 'isPriority'
+// Contact Data Class
 data class Contact(
     val name: String,
     var ip: String,
@@ -89,7 +89,20 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         loadData()
     }
 
-    // [NEW] Toggle Priority Logic
+    // [FIX] Added Helper to get IP for Calls (Fixes MainActivity error)
+    fun getCurrentTargetIp(): String? {
+        if (targetUser.isEmpty()) return null
+
+        // 1. Check Saved Contacts
+        val saved = savedContacts.find { it.name == targetUser }
+        if (saved != null) return saved.ip
+
+        // 2. Check Nearby/Local Users
+        val nearby = nearbyUsers.find { it.name == targetUser }
+        return nearby?.ip
+    }
+
+    // Toggle Priority Logic
     fun togglePriority(name: String) {
         val contact = savedContacts.find { it.name == name } ?: return
         viewModelScope.launch {
@@ -116,12 +129,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         }
 
         connectionStatus = ConnectionStatus.CHECKING
-        val contact = savedContacts.find { it.name == targetUser }
-
-        var targetIp = contact?.ip
-        if (targetIp == null) {
-            targetIp = nearbyUsers.find { it.name == targetUser }?.ip
-        }
+        val targetIp = getCurrentTargetIp() // Reused the new helper here
 
         if (targetIp != null && targetIp != "SERVER_LINK") {
             service?.sendPing(targetIp)
@@ -141,7 +149,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     fun loadData() {
         viewModelScope.launch {
             savedContacts.clear()
-            // [FIXED] Now mapping the 5th argument 'isPriority' correctly
             savedContacts.addAll(repository.getAllContacts().map {
                 Contact(it.name, it.ip, true, it.savedCode, it.isPriority)
             })
@@ -168,14 +175,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     fun sendTextPayload(service: VoiceService?, text: String) {
         if (text.isBlank()) return
 
-        val target = targetUser
-        if (target.isEmpty()) {
-            _uiState.value = UiState.Error("Select a Target")
-            return
-        }
-
-        val contact = savedContacts.find { it.name == target } ?: nearbyUsers.find { it.name == target }
-        val ip = contact?.ip
+        val ip = getCurrentTargetIp() // Reused helper
 
         if (ip != null && ip != "SERVER_LINK") {
             service?.sendTextMessage(ip, text)
