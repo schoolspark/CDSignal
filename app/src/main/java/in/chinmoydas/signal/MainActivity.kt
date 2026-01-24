@@ -167,10 +167,12 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
                         }
-                        // Render Call UI on top of everything
+                        // --- OVERLAYS ---
+
+                        // 1. Phone Call Screen (With Name Lookup Fix)
                         CallOverlay(
                             nameResolver = { ip ->
-                                // [FIX] Look up the name from saved contacts!
+                                // Look up the name from saved contacts!
                                 val contact = walkieViewModel.savedContacts.find { it.ip == ip }
                                 if (contact != null) {
                                     contact.name
@@ -184,6 +186,9 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         )
+
+                        // 2. Emergency Alerts (Red Screen / Map Popup)
+                        SafetyOverlay()
                     } else {
                         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             CircularProgressIndicator()

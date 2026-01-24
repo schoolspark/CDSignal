@@ -484,14 +484,45 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     }
 
     // [NEW] 2. Link the Receiver
-    // Returns TRUE if the packet was a Call Command (so you can skip saving it to history)
     fun handleIncomingPacket(text: String, ip: String): Boolean {
+        // 1. Calls
         if (text.startsWith("CMD:CALL")) {
             viewModelScope.launch {
                 `in`.chinmoydas.signal.utils.CallSignaling.handlePacket(text, ip)
             }
-            return true // Handled as Call
+            return true
         }
-        return false // Handled as Chat
+
+        // 2. SOS / Panic
+        if (text.startsWith("CMD:SOS") || text.startsWith("CMD:PANIC")) {
+            `in`.chinmoydas.signal.utils.SafetySignaling.triggerSOS(ip)
+            // [FIX] Return FALSE so this packet falls through and gets saved
+            // to the History/Pager database as a text message.
+            return false
+        }
+
+        // 3. Location
+        if (text.startsWith("LOC:")) {
+            val coords = text.removePrefix("LOC:")
+            `in`.chinmoydas.signal.utils.SafetySignaling.triggerLocation(ip, coords)
+            return false // Keep false to save to history
+        }
+
+        return false
+    }
+    fun toggleStealth(service: VoiceService?) {
+        service?.let {
+            val intent = android.content.Intent(it, VoiceService::class.java)
+            intent.action = "TOGGLE_STEALTH"
+            it.startService(intent)
+        }
+    }
+
+    fun toggleVox(service: VoiceService?) {
+        service?.let {
+            val intent = android.content.Intent(it, VoiceService::class.java)
+            intent.action = "TOGGLE_VOX"
+            it.startService(intent)
+        }
     }
 }

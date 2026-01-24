@@ -3,6 +3,7 @@ package `in`.chinmoydas.signal.utils
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
@@ -66,15 +67,21 @@ object CallSignaling {
         }
     }
 
+    // [FIX] Redundant Signaling: Send critical packets 3 times to prevent data loss
     private fun sendSignal(cmd: String, ip: String) {
-        sendUdpTextFunction?.invoke(cmd, ip)
+        scope.launch(Dispatchers.IO) {
+            repeat(3) {
+                sendUdpTextFunction?.invoke(cmd, ip)
+                delay(50) // Tiny delay between bursts
+            }
+        }
     }
 
     // UI Actions
     fun startOutgoingCall(ip: String) {
         currentCallerIp = ip
         sendSignal(CMD_REQ, ip)
-        // [FIX] Tell UI we are dialing
+        // Notify UI immediately
         scope.launch {
             _callEvents.emit(CallEvent.OutgoingCall(ip))
         }
@@ -96,13 +103,13 @@ object CallSignaling {
     fun endCall() {
         val ip = currentCallerIp
         if (ip != null) {
+            // [FIX] Send the END command multiple times before closing
             sendSignal(CMD_END, ip)
         }
 
         CallEngine.stopCall()
 
-        // CRITICAL FIX: Tell the UI the call is over!
-        // Using scope.launch because emit is a suspend function
+        // Notify Local UI immediately
         scope.launch {
             _callEvents.emit(CallEvent.CallEnded)
         }
@@ -117,7 +124,7 @@ object CallSignaling {
 
     sealed class CallEvent {
         data class IncomingCall(val ip: String) : CallEvent()
-        data class OutgoingCall(val ip: String) : CallEvent() // [NEW]
+        data class OutgoingCall(val ip: String) : CallEvent()
         object CallConnected : CallEvent()
         object CallRejected : CallEvent()
         object CallBusy : CallEvent()
