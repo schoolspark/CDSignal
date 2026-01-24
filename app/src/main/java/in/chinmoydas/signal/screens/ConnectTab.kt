@@ -124,17 +124,25 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                                     modifier = Modifier.padding(12.dp).widthIn(min = 80.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
-                                    Box {
-                                        Icon(if (isGroup) Icons.Default.Groups else Icons.Default.Person, null, modifier = Modifier.size(32.dp), tint = MaterialTheme.colorScheme.primary)
+                                    Box(Modifier.fillMaxWidth()) {
+                                        // [FIX] 3-Dots Menu Button (Visible)
+                                        IconButton(
+                                            onClick = { showMenu = true },
+                                            modifier = Modifier.size(20.dp).align(Alignment.TopEnd)
+                                        ) {
+                                            Icon(Icons.Default.MoreVert, "Menu", modifier = Modifier.size(16.dp))
+                                        }
+
+                                        Icon(if (isGroup) Icons.Default.Groups else Icons.Default.Person, null, modifier = Modifier.size(32.dp).align(Alignment.Center), tint = MaterialTheme.colorScheme.primary)
+
                                         if (contact.isPriority) {
                                             Icon(
                                                 imageVector = Icons.Default.Star,
                                                 contentDescription = "Principal",
                                                 tint = Color.Yellow,
-                                                modifier = Modifier.size(16.dp).align(Alignment.TopEnd).offset(x = 4.dp, y = (-4).dp)
+                                                modifier = Modifier.size(16.dp).align(Alignment.TopStart)
                                             )
                                         }
-                                        Box(Modifier.matchParentSize().pointerInput(Unit) { detectTapGestures(onLongPress = { showMenu = true }) { viewModel.setTarget(contact.name); onConnected() } })
                                     }
                                     Spacer(Modifier.height(8.dp))
                                     Text(displayName, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -142,7 +150,6 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                                     DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
                                         DropdownMenuItem(
                                             text = { Text("Voice Call", fontWeight = FontWeight.Bold) },
-                                            // [FIX] Removed 'context' parameter
                                             onClick = { CallSignaling.startOutgoingCall(contact.ip); showMenu = false },
                                             leadingIcon = { Icon(Icons.Default.Call, null, tint = if(isOnline) Color(0xFF43A047) else Color.Gray) },
                                             enabled = isOnline
@@ -232,7 +239,6 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                         status = "Local Network",
                         isOnline = true,
                         onRadioClick = { viewModel.addContact(user.name, user.ip, ""); onConnected() },
-                        // [FIX] Removed 'context'
                         onCallClick = { CallSignaling.startOutgoingCall(user.ip) }
                     )
                 }
@@ -262,7 +268,6 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                         status = if (contact.isPriority) "⭐ Principal" else "Saved",
                         isOnline = isOnline,
                         onRadioClick = { viewModel.setTarget(contact.name); onConnected() },
-                        // [FIX] Removed 'context'
                         onCallClick = { CallSignaling.startOutgoingCall(contact.ip) }
                     )
                 }

@@ -30,7 +30,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import `in`.chinmoydas.signal.data.MainRepository
-import `in`.chinmoydas.signal.screens.* // Imports CallOverlay and Screens
+import `in`.chinmoydas.signal.screens.*
 import `in`.chinmoydas.signal.ui.theme.CDSignalTheme
 import `in`.chinmoydas.signal.utils.CallSignaling
 import `in`.chinmoydas.signal.viewmodel.ViewModelFactory
@@ -61,9 +61,13 @@ class MainActivity : ComponentActivity() {
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(className: ComponentName, service: IBinder) {
             val binder = service as VoiceService.LocalBinder
-            voiceService = binder.getService()
+            val boundService = binder.getService()
+            voiceService = boundService
             isBound = true
-            serviceBoundState.value = binder.getService()
+            serviceBoundState.value = boundService
+
+            // [CRITICAL FIX] Link Logic safely here, after connection is guaranteed
+            linkServiceLogic(boundService)
         }
 
         override fun onServiceDisconnected(arg0: ComponentName) {
@@ -112,37 +116,18 @@ class MainActivity : ComponentActivity() {
 
                     if (startDest != null) {
                         val navController = rememberNavController()
+
+                        // Initialize ViewModel
                         walkieViewModel = ViewModelProvider(this@MainActivity, factory)[WalkieViewModel::class.java]
-                        val currentName by repository.myUsername.collectAsState()
 
-                        // --- [CRITICAL UPDATE] Service & Logic Linking ---
-                        LaunchedEffect(currentService) {
-                            currentService?.let { service ->
-                                // A. Link Call System
-                                walkieViewModel.setupCallSupport(service)
-
-                                // B. Audio Conflict Guard: Stop PTT if a Phone Call starts
-                                launch {
-                                    CallSignaling.callEvents.collect { event ->
-                                        if (event is CallSignaling.CallEvent.CallConnected) {
-                                            // Call Accepted! Kill PTT and VOX to free up Mic
-                                            service.stopTalk()
-                                            service.toggleVox(false)
-                                        }
-                                    }
-                                }
-
-                                // C. Observe Incoming PTT
-                                service.voiceServiceState.collectLatest { state ->
-                                    if (state.incomingCall != null && state.incomingIp != null) {
-                                        walkieViewModel.onReceptionStarted(state.incomingCall, state.incomingIp)
-                                    } else {
-                                        walkieViewModel.onReceptionEnded()
-                                    }
-                                }
+                        // [FIX] Double-check linkage in case Service bound before ViewModel was ready
+                        LaunchedEffect(Unit) {
+                            if (isBound && voiceService != null) {
+                                linkServiceLogic(voiceService!!)
                             }
                         }
-                        // ------------------------------------------------
+
+                        val currentName by repository.myUsername.collectAsState()
 
                         LaunchedEffect(intent) { handleIntent(intent) }
 
@@ -167,33 +152,59 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
                         }
+
                         // --- OVERLAYS ---
 
-                        // 1. Phone Call Screen (With Name Lookup Fix)
-                        CallOverlay(
-                            nameResolver = { ip ->
-                                // Look up the name from saved contacts!
-                                val contact = walkieViewModel.savedContacts.find { it.ip == ip }
-                                if (contact != null) {
-                                    contact.name
-                                } else {
-                                    // Fallback: Check if it's the target user
-                                    if (walkieViewModel.getCurrentTargetIp() == ip) {
-                                        walkieViewModel.targetUser
-                                    } else {
-                                        ip // No name found, show IP
-                                    }
-                                }
-                            }
-                        )
+                        // [UPGRADE] Centralized Name Resolver for Calls AND Safety Alerts
+                        val nameResolverHelper: (String) -> String = { ip ->
+                            // 1. Try to find in Saved Contacts (Live Data)
+                            val contact = walkieViewModel.savedContacts.find { it.ip == ip } // FIXED: Removed .value
+                            contact?.name ?: if (walkieViewModel.getCurrentTargetIp() == ip) walkieViewModel.targetUser else ip
+                        }
+
+                        // 1. Phone Call Screen
+                        CallOverlay(nameResolver = nameResolverHelper)
 
                         // 2. Emergency Alerts (Red Screen / Map Popup)
-                        SafetyOverlay()
+                        SafetyOverlay(nameResolver = nameResolverHelper)
+
                     } else {
                         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             CircularProgressIndicator()
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // [CRITICAL FIX] Extracted Logic Linker to prevent Race Conditions
+    private fun linkServiceLogic(service: VoiceService) {
+        // Guard: If ViewModel isn't ready yet, abort (Compose will retry via LaunchedEffect)
+        if (!::walkieViewModel.isInitialized) return
+
+        // A. Link Call System
+        walkieViewModel.setupCallSupport(service)
+
+        // B. Audio Conflict Guard: Stop PTT if a Phone Call starts
+        // We use lifecycleScope so this survives UI recomposition
+        lifecycleScope.launch {
+            CallSignaling.callEvents.collect { event ->
+                if (event is CallSignaling.CallEvent.CallConnected) {
+                    // Call Accepted! Kill PTT and VOX to free up Mic
+                    service.stopTalk()
+                    service.toggleVox(false)
+                }
+            }
+        }
+
+        // C. Observe Incoming PTT
+        lifecycleScope.launch {
+            service.voiceServiceState.collectLatest { state ->
+                if (state.incomingCall != null && state.incomingIp != null) {
+                    walkieViewModel.onReceptionStarted(state.incomingCall, state.incomingIp)
+                } else {
+                    walkieViewModel.onReceptionEnded()
                 }
             }
         }

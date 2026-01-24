@@ -28,13 +28,19 @@ import `in`.chinmoydas.signal.utils.SafetySignaling
 import kotlinx.coroutines.delay
 
 @Composable
-fun SafetyOverlay() {
+fun SafetyOverlay(
+    nameResolver: (String) -> String // [UPGRADE] Accept name resolver for friendly alerts
+) {
     val context = LocalContext.current
     var sosSender by remember { mutableStateOf<String?>(null) }
     var locData by remember { mutableStateOf<Pair<String, Pair<Double, Double>>?>(null) }
 
     // [FIX] Alarm Player State
     var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
+
+    // [UPGRADE] Resolve IPs to Names efficiently
+    val sosName = remember(sosSender) { sosSender?.let { nameResolver(it) } ?: "Unknown" }
+    val locName = remember(locData) { locData?.let { nameResolver(it.first) } ?: "Unknown" }
 
     LaunchedEffect(Unit) {
         SafetySignaling.safetyEvents.collect { event ->
@@ -95,7 +101,10 @@ fun SafetyOverlay() {
                     Icon(Icons.Default.Warning, "SOS", tint = Color.White, modifier = Modifier.size(120.dp).scale(scale))
                     Spacer(Modifier.height(32.dp))
                     Text("EMERGENCY ALERT", style = MaterialTheme.typography.displayMedium, fontWeight = FontWeight.Bold, color = Color.White)
-                    Text("From: $sosSender", style = MaterialTheme.typography.headlineSmall, color = Color.White)
+
+                    // [UPGRADE] Show resolved Name
+                    Text("From: $sosName", style = MaterialTheme.typography.headlineSmall, color = Color.White)
+
                     Spacer(Modifier.height(48.dp))
                     Button(
                         onClick = {
@@ -114,7 +123,7 @@ fun SafetyOverlay() {
 
     // --- 2. LOCATION POPUP ---
     if (locData != null) {
-        val (sender, coords) = locData!!
+        val (senderIp, coords) = locData!!
         AlertDialog(
             onDismissRequest = {
                 locData = null
@@ -124,13 +133,15 @@ fun SafetyOverlay() {
             title = { Text("Incoming Signal Trace") },
             text = {
                 Column {
-                    Text("Source: $sender")
+                    // [UPGRADE] Show resolved Name
+                    Text("Source: $locName", fontWeight = FontWeight.Bold)
                     Text("Coords: ${coords.first}, ${coords.second}")
                 }
             },
             confirmButton = {
                 Button(onClick = {
-                    val uri = Uri.parse("geo:${coords.first},${coords.second}?q=${coords.first},${coords.second}($sender)")
+                    // Note: We use the Name in the map label if possible
+                    val uri = Uri.parse("geo:${coords.first},${coords.second}?q=${coords.first},${coords.second}($locName)")
                     val intent = Intent(Intent.ACTION_VIEW, uri)
                     intent.setPackage("com.google.android.apps.maps")
                     try { context.startActivity(intent) } catch (e: Exception) { context.startActivity(Intent(Intent.ACTION_VIEW, uri)) }

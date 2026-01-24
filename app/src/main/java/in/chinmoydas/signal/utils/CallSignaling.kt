@@ -91,6 +91,12 @@ object CallSignaling {
         val ip = currentCallerIp ?: return
         isBusy = true
         sendSignal(CMD_ACC, ip)
+
+        // [FIX] Critical: Update LOCAL UI state immediately to prevent freeze
+        scope.launch {
+            _callEvents.emit(CallEvent.CallConnected)
+        }
+
         CallEngine.startCall(ip)
     }
 

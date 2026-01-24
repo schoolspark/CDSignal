@@ -224,6 +224,15 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             }
         )
 
+        registerReceiver(object : android.content.BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (android.media.AudioManager.ACTION_AUDIO_BECOMING_NOISY == intent?.action) {
+                    if (isSending) stopTalk()
+                    toggleSpeaker(true) // Default to speaker
+                }
+            }
+        }, android.content.IntentFilter(android.media.AudioManager.ACTION_AUDIO_BECOMING_NOISY))
+
         multicastLock.setReferenceCounted(false)
         wakeLock.setReferenceCounted(false)
         wifiLock.setReferenceCounted(false)
@@ -437,8 +446,16 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             "TOGGLE_VOX" -> {
                 val newState = !_voiceServiceState.value.isVoxEnabled
                 _voiceServiceState.update { it.copy(isVoxEnabled = newState) }
-                // [FIX] Start/Stop Monitoring based on Toggle
-                if (newState) startVoxMonitoring() else stopVoxMonitoring()
+
+                if (newState) {
+                    startVoxMonitoring()
+                } else {
+                    stopVoxMonitoring()
+                    // [SAFETY] If we are transmitting and just turned off VOX, kill the stream immediately.
+                    if (isSending) {
+                        stopTalk()
+                    }
+                }
                 refreshNotification()
                 return START_STICKY
             }
@@ -736,26 +753,93 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     }
 
     fun sendPanicAlert() {
-        scope.launch {
-            val target = repository.getTargetUser()
-            var ip = activeIpCache[target] ?: repository.getAllContacts().find { it.name == target }?.ip
-            if (ip == "SERVER_LINK") ip = "signal.chinmoydas.in"
-            if (!ip.isNullOrBlank()) sendTextMessage(ip, "CMD:SOS")
+        scope.launch(Dispatchers.IO) {
+            // [UPGRADE] Safety Flood: Send to ALL saved contacts
+            val allContacts = repository.getAllContacts()
+            var sentCount = 0
+
+            // 1. Send to all Saved Contacts with valid IPs
+            allContacts.forEach { contact ->
+                if (!contact.ip.isNullOrBlank() && contact.ip != "SERVER_LINK") {
+                    sendTextMessage(contact.ip, "CMD:SOS")
+                    sentCount++
+                    // [OPTIMIZATION] Prevent UDP socket buffer overflow
+                    delay(10)
+                }
+            }
+
+            // 2. Also send to the currently active IP (if unique/temporary P2P)
+            val currentTarget = activeIpCache[repository.getTargetUser()]
+            if (!currentTarget.isNullOrBlank() && allContacts.none { it.ip == currentTarget }) {
+                sendTextMessage(currentTarget, "CMD:SOS")
+                sentCount++
+            }
+
+            // 3. [CRITICAL FALLBACK] If no specific targets found, Broadcast to Local Network
+            // This ensures the SOS works even if you have 0 contacts or are fully offline.
+            if (sentCount == 0) {
+                sendTextMessage("255.255.255.255", "CMD:SOS")
+                Log.w(tag, "No direct targets found. Broadcasting SOS to Local Network (255.255.255.255).")
+            } else {
+                Log.d(tag, "SOS Broadcast successfully sent to $sentCount targets.")
+            }
         }
     }
 
     fun sendLocationPing(lat: Double, lon: Double) {
-        scope.launch {
-            val target = repository.getTargetUser()
-            var ip = activeIpCache[target] ?: repository.getAllContacts().find { it.name == target }?.ip
-            if (ip == "SERVER_LINK") ip = "signal.chinmoydas.in"
-            if (!ip.isNullOrBlank()) sendTextMessage(ip, "LOC:$lat,$lon")
+        scope.launch(Dispatchers.IO) {
+            // [UPGRADE] Location Broadcast: Share coordinates with ALL contacts
+            val allContacts = repository.getAllContacts()
+            var sentCount = 0
+
+            // 1. Send to all Saved Contacts
+            allContacts.forEach { contact ->
+                if (!contact.ip.isNullOrBlank() && contact.ip != "SERVER_LINK") {
+                    sendTextMessage(contact.ip, "LOC:$lat,$lon")
+                    sentCount++
+                    // [OPTIMIZATION] Prevent UDP socket buffer overflow
+                    delay(10)
+                }
+            }
+
+            // 2. Also send to current active target (if unique)
+            val currentTarget = activeIpCache[repository.getTargetUser()]
+            if (!currentTarget.isNullOrBlank() && allContacts.none { it.ip == currentTarget }) {
+                sendTextMessage(currentTarget, "LOC:$lat,$lon")
+                sentCount++
+            }
+
+            // 3. [CRITICAL FALLBACK] If no targets found, Broadcast to Local Network
+            if (sentCount == 0) {
+                sendTextMessage("255.255.255.255", "LOC:$lat,$lon")
+                Log.w(tag, "No direct targets found. Broadcasting Location to Local Network.")
+            }
         }
     }
 
+    // [FIX] Added Location Logic
     fun confirmSos() {
         _voiceServiceState.update { it.copy(isSosPending = false) }
+
+        // 1. Send the Red Alert
         sendPanicAlert()
+
+        // 2. Fetch & Send Location Automatically
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+            val locMgr = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+            val loc = locMgr.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER)
+                ?: locMgr.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
+
+            if (loc != null) {
+                sendLocationPing(loc.latitude, loc.longitude)
+                Log.d(tag, "SOS Location Sent: ${loc.latitude}, ${loc.longitude}")
+            } else {
+                Log.w(tag, "SOS Location Failed: No last known location")
+            }
+        }
+
+        // 3. Force Mic ON (listen-in mode)
+        if (!_voiceServiceState.value.isVoxEnabled) toggleVox(true)
     }
 
     fun cancelSos() {
