@@ -13,8 +13,8 @@ android {
         applicationId = "in.chinmoydas.signal"
         minSdk = 29
         targetSdk = 36
-        versionCode = 71
-        versionName = "5.1.5"
+        versionCode = 73
+        versionName = "5.2.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -52,6 +52,8 @@ dependencies {
     implementation(libs.androidx.navigation.compose)
     implementation(libs.androidx.media)
     implementation(libs.play.services.location)
+    implementation(libs.app.update)
+    implementation(libs.app.update.ktx)
     
     // Networking
     implementation(libs.retrofit)

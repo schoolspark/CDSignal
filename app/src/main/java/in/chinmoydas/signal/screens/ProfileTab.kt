@@ -29,18 +29,19 @@ import `in`.chinmoydas.signal.viewmodel.WalkieViewModel
 @Composable
 fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myName: String, viewModel: WalkieViewModel, onLogout: () -> Unit, onExit: () -> Unit) {
     val context = LocalContext.current
+    val prefs = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
     var showBlockedDialog by remember { mutableStateOf(false) }
+    var showGuardianConsent by remember { mutableStateOf(false) }
     val myCode by viewModel.myPairingCode.collectAsState()
 
     // Data Saver State
-    var isDataSaver by remember {
-        mutableStateOf(context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE).getBoolean("data_saver", false))
-    }
+    var isDataSaver by remember { mutableStateOf(prefs.getBoolean("data_saver", false)) }
 
     // Secure Mode State
-    var isSecureMode by remember {
-        mutableStateOf(context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE).getBoolean("secure_mode", false))
-    }
+    var isSecureMode by remember { mutableStateOf(prefs.getBoolean("secure_mode", false)) }
+
+    // Guardian Mode State
+    var isRemoteAllowed by remember { mutableStateOf(prefs.getBoolean("allow_remote_control", false)) }
 
     // Get App Version
     val appVersion = remember {
@@ -101,7 +102,7 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
 
         // --- 2. SETTINGS TOGGLES ---
 
-        // Data Saver
+        // A. Data Saver (Updated with Icon)
         Card(
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha=0.5f)),
             modifier = Modifier.fillMaxWidth()
@@ -112,7 +113,12 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("Data Saver Mode (4G)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    // [FIX] Added Icon Row
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.SignalCellularAlt, null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Data Saver Mode (4G)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    }
                     Text(
                         if (isDataSaver) "Audio compressed on mobile data." else "High Quality Audio on all networks.",
                         style = MaterialTheme.typography.bodySmall,
@@ -123,8 +129,7 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
                     checked = isDataSaver,
                     onCheckedChange = {
                         isDataSaver = it
-                        context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
-                            .edit().putBoolean("data_saver", it).apply()
+                        prefs.edit().putBoolean("data_saver", it).apply()
                     }
                 )
             }
@@ -132,7 +137,7 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
 
         Spacer(Modifier.height(8.dp))
 
-        // Secure Channel
+        // B. Secure Channel
         Card(
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha=0.5f)),
             modifier = Modifier.fillMaxWidth()
@@ -158,9 +163,49 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
                     checked = isSecureMode,
                     onCheckedChange = {
                         isSecureMode = it
-                        context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
-                            .edit().putBoolean("secure_mode", it).apply()
+                        prefs.edit().putBoolean("secure_mode", it).apply()
                     }
+                )
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        // C. Guardian Mode
+        Card(
+            colors = CardDefaults.cardColors(
+                containerColor = if (isRemoteAllowed) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha=0.5f)
+            ),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Shield, null, modifier = Modifier.size(16.dp), tint = if(isRemoteAllowed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Guardian Mode", fontWeight = FontWeight.Bold, color = if(isRemoteAllowed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
+                    }
+                    Text(
+                        if (isRemoteAllowed) "ACTIVE. Trusted users can access Mic." else "DISABLED. Remote commands blocked.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = isRemoteAllowed,
+                    onCheckedChange = { check ->
+                        if (check) {
+                            showGuardianConsent = true
+                        } else {
+                            isRemoteAllowed = false
+                            prefs.edit().putBoolean("allow_remote_control", false).apply()
+                        }
+                    },
+                    colors = SwitchDefaults.colors(checkedThumbColor = MaterialTheme.colorScheme.error, checkedTrackColor = MaterialTheme.colorScheme.errorContainer)
                 )
             }
         }
@@ -203,6 +248,9 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
         Spacer(Modifier.height(50.dp))
     }
 
+    // --- DIALOGS ---
+
+    // 1. Blocked Users Dialog
     if (showBlockedDialog) {
         AlertDialog(
             onDismissRequest = { showBlockedDialog = false },
@@ -212,6 +260,38 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
                 else LazyColumn { items(viewModel.blockedContacts) { contact -> Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text(contact.name); TextButton(onClick = { viewModel.unblockContact(contact.name) }) { Text("Unblock") } } } }
             },
             confirmButton = { TextButton(onClick = { showBlockedDialog = false }) { Text("Close") } }
+        )
+    }
+
+    // 2. Guardian Consent Dialog
+    if (showGuardianConsent) {
+        AlertDialog(
+            onDismissRequest = { showGuardianConsent = false },
+            icon = { Icon(Icons.Default.Warning, null, tint = MaterialTheme.colorScheme.error) },
+            title = { Text("Enable Guardian Mode?", fontWeight = FontWeight.Bold) },
+            text = {
+                Column {
+                    Text("This feature allows trusted contacts (Principals) to remotely activate your Microphone and GPS during emergencies.")
+                    Spacer(Modifier.height(8.dp))
+                    Text("• You will be notified whenever remote access occurs.", fontWeight = FontWeight.Bold)
+                    Text("• Only users you have saved as Principals can use this.", style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        isRemoteAllowed = true
+                        prefs.edit().putBoolean("allow_remote_control", true).apply()
+                        showGuardianConsent = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("I UNDERSTAND (ENABLE)")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showGuardianConsent = false }) { Text("CANCEL") }
+            }
         )
     }
 }

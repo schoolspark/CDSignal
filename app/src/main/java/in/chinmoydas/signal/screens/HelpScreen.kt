@@ -24,7 +24,7 @@ fun HelpScreen(navController: NavController) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("User Manual V5.1") },
+                title = { Text("User Manual") },
                 navigationIcon = {
                     IconButton(onClick = { navController.popBackStack() }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
@@ -41,7 +41,7 @@ fun HelpScreen(navController: NavController) {
                 .verticalScroll(rememberScrollState())
                 .padding(16.dp)
         ) {
-            // --- 1. NEW TRIGGER MODES (CRITICAL) ---
+            // --- 1. NEW TRIGGER MODES ---
             HelpCard(
                 title = "🎙️ PTT TRIGGER MODES",
                 icon = Icons.Default.SettingsRemote,
@@ -78,11 +78,32 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 2. SAFETY TOOLS (UPDATED UI) ---
+            // --- 2. GUARDIAN MODE (CIVILIAN FRIENDLY) ---
             HelpCard(
-                title = "🛡️ SAFETY & DEFENCE TOOLS",
-                icon = Icons.Default.Shield,
+                title = "🛡️ GUARDIAN MODE (REMOTE)",
+                icon = Icons.Default.Security,
                 color = MaterialTheme.colorScheme.errorContainer
+            ) {
+                Text("Emergency Remote Control for families & teams.", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                Step(1, "Go to 'Profile Tab' and enable 'Guardian Mode'.")
+                Step(2, "This allows trusted 'Principal' contacts to assist you in emergencies.")
+                Step(3, "Authorized actions available to Admins:")
+                Spacer(Modifier.height(8.dp))
+
+                StatusDotRow(Color.Black, "Remote Listen-In", "Activates the microphone remotely to check on safety.")
+                StatusDotRow(Color.Blue, "Silent Tracking", "Request current GPS location without alerting the user.")
+                // [FIXED] Changed "Stealth Protocol" -> "Remote Silence" and removed "Covert Ops"
+                StatusDotRow(Color.DarkGray, "Remote Silence", "Remotely silences the device speaker for discretion & safety.")
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // --- 3. SAFETY TOOLS ---
+            HelpCard(
+                title = "⛑️ SAFETY & DEFENCE TOOLS",
+                icon = Icons.Default.Shield,
+                color = MaterialTheme.colorScheme.tertiaryContainer
             ) {
                 Text("The 5 Buttons in the Grey Card:", fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
@@ -90,16 +111,16 @@ fun HelpScreen(navController: NavController) {
                 StatusDotRow(Color.DarkGray, "VOX (Voice)", "Voice Activation. Transmits automatically when you speak.")
                 StatusDotRow(Color.Blue, "Shield (Bike)", "Impact Sensor. Detects crashes/falls and triggers Auto-SOS.")
                 StatusDotRow(Color.Magenta, "Trace (Pin)", "Broadcasts your current GPS Location to all contacts.")
-                StatusDotRow(Color.Red, "SOS (Warning)", "Panic Button. Sends 'Distress Signal' + 'Location' to everyone. Overrides Silent Mode on receiver.")
+                StatusDotRow(Color.Red, "SOS (Warning)", "Panic Button. Sends 'Distress Signal' + 'Location' to everyone.")
             }
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 3. SECURE CALLS ---
+            // --- 4. SECURE CALLS ---
             HelpCard(
                 title = "📞 SECURE CALLS",
                 icon = Icons.Default.Call,
-                color = MaterialTheme.colorScheme.tertiaryContainer
+                color = MaterialTheme.colorScheme.surfaceVariant
             ) {
                 Text("Start a private, full-duplex call:", fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
@@ -110,11 +131,11 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 4. SILENT TEXT (RESTORED) ---
+            // --- 5. SILENT TEXT ---
             HelpCard(
                 title = "💬 SILENT TEXT MESSAGES",
                 icon = Icons.Default.Keyboard,
-                color = MaterialTheme.colorScheme.tertiaryContainer
+                color = MaterialTheme.colorScheme.surfaceVariant
             ) {
                 Text("Send encrypted text over UDP without speaking:", fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
@@ -126,7 +147,7 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 5. ENCRYPTION & KEYS ---
+            // --- 6. ENCRYPTION & KEYS ---
             HelpCard(
                 title = "🔐 SECURE PAIRING",
                 icon = Icons.Default.QrCodeScanner,
@@ -142,7 +163,7 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 6. OFFLINE MODE (RESTORED) ---
+            // --- 7. OFFLINE MODE ---
             HelpCard(
                 title = "📡 OFFLINE / LAN MODE",
                 icon = Icons.Default.Wifi,
@@ -157,7 +178,7 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 7. STATUS INDICATORS ---
+            // --- 8. STATUS INDICATORS ---
             HelpCard(
                 title = "🚦 STATUS LIGHTS",
                 icon = Icons.Default.Info,
@@ -171,15 +192,15 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 8. TROUBLESHOOTING ---
+            // --- 9. TROUBLESHOOTING ---
             Text("Troubleshooting", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
 
-            Text("• SOS Location Missing? Ensure 'Location' permission is set to 'Allow all the time' or 'While using app'.", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyMedium)
+            Text("• Remote Commands Failed? Ensure 'Guardian Mode' is ON in Profile and sender is a trusted contact.", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyMedium)
             Spacer(Modifier.height(4.dp))
+            Text("• SOS Location Missing? Ensure 'Location' permission is set to 'Allow all the time'.")
             Text("• PTT cut off? Disable 'Battery Saver' for this app in Android Settings.")
             Text("• Echo? Don't test with two phones in the same room.")
-            Text("• No Audio? Check if 'Stealth Mode' is active (Icon is filled).")
 
             Spacer(Modifier.height(32.dp))
         }

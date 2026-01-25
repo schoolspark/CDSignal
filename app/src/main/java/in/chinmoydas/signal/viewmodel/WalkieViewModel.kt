@@ -175,10 +175,18 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     fun sendTextPayload(service: VoiceService?, text: String) {
         if (text.isBlank()) return
 
-        val ip = getCurrentTargetIp() // Reused helper
+        val ip = getCurrentTargetIp()
 
         if (ip != null && ip != "SERVER_LINK") {
             service?.sendTextMessage(ip, text)
+
+            // [FIX] Filter out System Commands from Chat History
+            // We don't want "CMD:REMOTE_MIC_ON" cluttering the UI
+            if (text.startsWith("CMD:") || text.startsWith("LOC:")) {
+                return
+            }
+
+            // Only save actual human messages
             viewModelScope.launch {
                 repository.insertPagerEntry(
                     PagerEntry(sender = "Me", type = "TEXT", content = text, isRead = true)

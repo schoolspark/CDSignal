@@ -13,6 +13,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
@@ -29,6 +30,12 @@ import androidx.lifecycle.lifecycleScope
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.google.android.play.core.appupdate.AppUpdateManager
+import com.google.android.play.core.appupdate.AppUpdateManagerFactory
+import com.google.android.play.core.install.InstallStateUpdatedListener
+import com.google.android.play.core.install.model.AppUpdateType
+import com.google.android.play.core.install.model.InstallStatus
+import com.google.android.play.core.install.model.UpdateAvailability
 import `in`.chinmoydas.signal.data.MainRepository
 import `in`.chinmoydas.signal.screens.*
 import `in`.chinmoydas.signal.ui.theme.CDSignalTheme
@@ -45,6 +52,10 @@ class MainActivity : ComponentActivity() {
     private var voiceService: VoiceService? = null
     private var isBound = false
     private lateinit var walkieViewModel: WalkieViewModel
+
+    // [NEW] In-App Update Variables
+    private lateinit var appUpdateManager: AppUpdateManager
+    private val UPDATE_REQUEST_CODE = 123
 
     // State to pass to Compose triggers
     private val serviceBoundState = mutableStateOf<VoiceService?>(null)
@@ -80,7 +91,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1. Register Receiver Securely
+        // 1. Initialize Update Manager
+        appUpdateManager = AppUpdateManagerFactory.create(this)
+        appUpdateManager.registerListener(installStateUpdatedListener)
+        checkForUpdates() // Start checking immediately
+
+        // 2. Register Receiver Securely
         val filter = IntentFilter("in.chinmoydas.signal.ACTION_EXIT")
         ContextCompat.registerReceiver(
             this,
@@ -158,7 +174,7 @@ class MainActivity : ComponentActivity() {
                         // [UPGRADE] Centralized Name Resolver for Calls AND Safety Alerts
                         val nameResolverHelper: (String) -> String = { ip ->
                             // 1. Try to find in Saved Contacts (Live Data)
-                            val contact = walkieViewModel.savedContacts.find { it.ip == ip } // FIXED: Removed .value
+                            val contact = walkieViewModel.savedContacts.find { it.ip == ip }
                             contact?.name ?: if (walkieViewModel.getCurrentTargetIp() == ip) walkieViewModel.targetUser else ip
                         }
 
@@ -178,27 +194,104 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // --- [NEW] IN-APP UPDATE LOGIC ---
+
+    private val installStateUpdatedListener = InstallStateUpdatedListener { state ->
+        if (state.installStatus() == InstallStatus.DOWNLOADED) {
+            // Update downloaded! Prompt user to install.
+            popupSnackbarForCompleteUpdate()
+        }
+    }
+
+    private fun checkForUpdates() {
+        // [FIX] Move to IO thread to prevent "Skipped Frames" lag
+        lifecycleScope.launch(Dispatchers.IO) {
+            appUpdateManager.appUpdateInfo.addOnSuccessListener { appUpdateInfo ->
+                if (appUpdateInfo.updateAvailability() == UpdateAvailability.UPDATE_AVAILABLE &&
+                    appUpdateInfo.isUpdateTypeAllowed(AppUpdateType.FLEXIBLE)
+                ) {
+                    // UI operations must return to Main thread
+                    runOnUiThread {
+                        try {
+                            appUpdateManager.startUpdateFlowForResult(
+                                appUpdateInfo,
+                                AppUpdateType.FLEXIBLE,
+                                this@MainActivity,
+                                UPDATE_REQUEST_CODE
+                            )
+                        } catch (e: Exception) {
+                            Log.e("Update", "Failed to start update flow: ${e.message}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // If an update was downloaded while the app was in background
+        appUpdateManager.appUpdateInfo.addOnSuccessListener { appUpdateInfo ->
+            if (appUpdateInfo.installStatus() == InstallStatus.DOWNLOADED) {
+                popupSnackbarForCompleteUpdate()
+            }
+            // If the update flow was stalled/cancelled, we could restart it here.
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == UPDATE_REQUEST_CODE) {
+            if (resultCode != RESULT_OK) {
+                Log.w("Update", "Update flow failed/cancelled! Code: $resultCode")
+            }
+        }
+    }
+
+    private fun popupSnackbarForCompleteUpdate() {
+        // Since we are using Compose, showing a Toast is the simplest way
+        // to alert without messing up the UI hierarchy.
+        // For a more integrated look, pass a state to HomeScreen later.
+        Toast.makeText(this, "Update Ready! Installing...", Toast.LENGTH_LONG).show()
+        appUpdateManager.completeUpdate()
+    }
+
+    // --- EXISTING LOGIC ---
+
     // [CRITICAL FIX] Extracted Logic Linker to prevent Race Conditions
     private fun linkServiceLogic(service: VoiceService) {
-        // Guard: If ViewModel isn't ready yet, abort (Compose will retry via LaunchedEffect)
         if (!::walkieViewModel.isInitialized) return
 
-        // A. Link Call System
         walkieViewModel.setupCallSupport(service)
 
-        // B. Audio Conflict Guard: Stop PTT if a Phone Call starts
-        // We use lifecycleScope so this survives UI recomposition
+        service.packetInterceptor = { text, ip ->
+            walkieViewModel.handleIncomingPacket(text, ip)
+        }
+
+        // [FIX] Enhanced Call State Management
         lifecycleScope.launch {
             CallSignaling.callEvents.collect { event ->
-                if (event is CallSignaling.CallEvent.CallConnected) {
-                    // Call Accepted! Kill PTT and VOX to free up Mic
-                    service.stopTalk()
-                    service.toggleVox(false)
+                when (event) {
+                    is CallSignaling.CallEvent.CallConnected -> {
+                        // Stop PTT to allow Full-Duplex Call
+                        service.stopTalk()
+                        service.toggleVox(false)
+                    }
+                    is CallSignaling.CallEvent.CallEnded,
+                    is CallSignaling.CallEvent.CallRejected -> {
+                        // [FIX] Safety: Force transmission OFF when call ends
+                        // This prevents the "Hot Mic" bug if VOX tries to wake up
+                        service.stopTalk()
+                        service.toggleVox(false)
+
+                        // Optional: If you want to restore "Pocket Mode" functionality,
+                        // you could re-enable things here, but for safety, we keep mic dead.
+                    }
+                    else -> {}
                 }
             }
         }
 
-        // C. Observe Incoming PTT
         lifecycleScope.launch {
             service.voiceServiceState.collectLatest { state ->
                 if (state.incomingCall != null && state.incomingIp != null) {
@@ -266,6 +359,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        appUpdateManager.unregisterListener(installStateUpdatedListener) // [FIX] Clean up listener
         try { unregisterReceiver(exitReceiver) } catch (e: Exception) {}
 
         if (isBound) {

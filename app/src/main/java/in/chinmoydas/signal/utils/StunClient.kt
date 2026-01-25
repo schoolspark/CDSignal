@@ -5,8 +5,9 @@ import java.net.InetAddress
 import java.nio.ByteBuffer
 
 object StunClient {
-    private const val STUN_SERVER = "stun.l.google.com"
-    private const val STUN_PORT = 19302
+    // Keep defaults for reference, but we will override them
+    private const val DEFAULT_SERVER = "stun.l.google.com"
+    private const val DEFAULT_PORT = 19302
 
     data class StunResult(val publicIp: String, val publicPort: Int)
 
@@ -15,16 +16,17 @@ object StunClient {
         return data[0] == 0x01.toByte() && data[1] == 0x01.toByte()
     }
 
-    fun createBindRequest(): DatagramPacket? {
+    // [UPGRADE] Now accepts host and port arguments
+    fun createBindRequest(host: String = DEFAULT_SERVER, port: Int = DEFAULT_PORT): DatagramPacket? {
         try {
-            val address = InetAddress.getByName(STUN_SERVER)
+            val address = InetAddress.getByName(host)
             val header = ByteArray(20)
             header[0] = 0x00; header[1] = 0x01 // Binding Request
             header[2] = 0x00; header[3] = 0x00 // Length 0
             header[4] = 0x21.toByte(); header[5] = 0x12.toByte()
             header[6] = 0xA4.toByte(); header[7] = 0x42.toByte() // Magic Cookie
             for (i in 8 until 20) header[i] = (0..255).random().toByte() // Transaction ID
-            return DatagramPacket(header, header.size, address, STUN_PORT)
+            return DatagramPacket(header, header.size, address, port)
         } catch (e: Exception) { return null }
     }
 

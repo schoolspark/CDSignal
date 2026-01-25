@@ -12,6 +12,7 @@ object SafetySignaling {
     sealed class SafetyEvent {
         data class SOS(val senderIp: String) : SafetyEvent()
         data class Location(val senderIp: String, val lat: Double, val lon: Double) : SafetyEvent()
+        data class SecurityAlert(val intruderName: String) : SafetyEvent()
     }
 
     private val _safetyEvents = MutableSharedFlow<SafetyEvent>(
@@ -47,5 +48,11 @@ object SafetySignaling {
 
     fun clearEvent() {
         scope.launch { _safetyEvents.resetReplayCache() }
+    }
+
+    fun triggerSecurityAlert(intruderName: String) {
+        scope.launch {
+            _safetyEvents.emit(SafetyEvent.SecurityAlert(intruderName))
+        }
     }
 }

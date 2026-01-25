@@ -118,10 +118,15 @@ fun InfoScreen(navController: NavController) {
                         style = MaterialTheme.typography.bodySmall
                     )
                     Spacer(Modifier.height(4.dp))
-
-                    // [NEW] Added Location Privacy Note
                     Text(
                         "• Location Privacy: 'Signal Trace' coordinates are sent directly to the peer. We do not track or log your location history.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Spacer(Modifier.height(4.dp))
+
+                    // [UPDATED] Disclosure for Guardian Mode
+                    Text(
+                        "• Guardian Mode: Remote Control features (Mic/Location) are disabled by default. You must explicitly enable them in Profile settings.",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Spacer(Modifier.height(4.dp))

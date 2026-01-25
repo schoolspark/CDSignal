@@ -26,6 +26,7 @@ import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
@@ -67,8 +68,14 @@ fun TalkTab(
     val uiState by viewModel.uiState.collectAsState()
     val pagerEntries by viewModel.pagerEntries.collectAsState()
     val isSecureMode = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE).getBoolean("secure_mode", false)
-    var showTextDialog by remember { mutableStateOf(false) }
-    var textMessage by remember { mutableStateOf("") }
+
+    // --- DIALOG STATES (Fixed for Rotation) ---
+    var showTextDialog by rememberSaveable { mutableStateOf(false) }
+    var showSettingsDialog by rememberSaveable { mutableStateOf(false) }
+    var showGuardianControls by rememberSaveable { mutableStateOf(false) }
+    var textMessage by rememberSaveable { mutableStateOf("") }
+
+    // UI Interaction States
     var isPressed by remember { mutableStateOf(false) }
     val fusedLocationClient = remember { LocationServices.getFusedLocationProviderClient(context) }
     val serviceState by service?.voiceServiceState?.collectAsState(initial = VoiceServiceState()) ?: remember { mutableStateOf(VoiceServiceState()) }
@@ -142,36 +149,67 @@ fun TalkTab(
                 }
             }
 
-            // --- 2. TOP CONTROLS ---
+            // --- 2. TOP CONTROLS (Restored Broadcast) ---
             item {
                 Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                    Modifier.fillMaxWidth().padding(horizontal = 4.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(onClick = { service?.triggerHeartbeat(); viewModel.triggerPing(service); Toast.makeText(context, "Synced", Toast.LENGTH_SHORT).show() }) { Icon(Icons.Default.Sync, "Sync", tint = MaterialTheme.colorScheme.primary) }
-                    IconButton(onClick = { showTextDialog = true }) { Icon(Icons.Default.Keyboard, "Message", tint = MaterialTheme.colorScheme.primary) }
+                    // [DISABLED] Settings Shortcut - Commented out for Security/Guardian Mode safety
+                    /*
+                    IconButton(onClick = { showSettingsDialog = true }) {
+                        Icon(Icons.Default.Settings, "Settings", tint = MaterialTheme.colorScheme.primary)
+                    }
+                    */
 
+                    // Guardian Remote Button
+                    IconButton(onClick = {
+                        if (viewModel.targetUser.isNotBlank() && viewModel.targetUser != "SERVER_LINK") {
+                            showGuardianControls = true
+                        } else {
+                            Toast.makeText(context, "Select a Target User first!", Toast.LENGTH_SHORT).show()
+                        }
+                    }) {
+                        Icon(Icons.Default.SettingsRemote, "Guardian Remote", tint = MaterialTheme.colorScheme.error)
+                    }
+
+                    // Sync
+                    IconButton(onClick = { service?.triggerHeartbeat(); viewModel.triggerPing(service); Toast.makeText(context, "Synced", Toast.LENGTH_SHORT).show() }) {
+                        Icon(Icons.Default.Sync, "Sync", tint = MaterialTheme.colorScheme.primary)
+                    }
+
+                    // Message
+                    IconButton(onClick = { showTextDialog = true }) {
+                        Icon(Icons.Default.Keyboard, "Message", tint = MaterialTheme.colorScheme.primary)
+                    }
+
+                    // Speaker
                     FilledTonalIconToggleButton(
                         checked = serviceState.isSpeakerOn,
                         onCheckedChange = { viewModel.toggleSpeaker(service) },
-                        colors = IconButtonDefaults.filledTonalIconToggleButtonColors(checkedContainerColor = MaterialTheme.colorScheme.primaryContainer)
+                        colors = IconButtonDefaults.filledTonalIconToggleButtonColors(checkedContainerColor = MaterialTheme.colorScheme.primaryContainer),
+                        modifier = Modifier.size(40.dp)
                     ) {
                         Icon(if (serviceState.isSpeakerOn) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff, null)
                     }
 
+                    // Silent
                     FilledTonalIconToggleButton(
                         checked = serviceState.isSilenced,
                         onCheckedChange = { viewModel.toggleSilence(service) },
-                        colors = IconButtonDefaults.filledTonalIconToggleButtonColors(checkedContainerColor = MaterialTheme.colorScheme.errorContainer)
+                        colors = IconButtonDefaults.filledTonalIconToggleButtonColors(checkedContainerColor = MaterialTheme.colorScheme.errorContainer),
+                        modifier = Modifier.size(40.dp)
                     ) {
                         Icon(if (serviceState.isSilenced) Icons.Default.NotificationsOff else Icons.Default.NotificationsActive, "Silent")
                     }
 
+                    // [RESTORED] Broadcast Mode
                     FilledTonalIconToggleButton(
                         checked = viewModel.isBroadcastMode,
                         onCheckedChange = { viewModel.toggleBroadcastMode() },
-                        colors = IconButtonDefaults.filledTonalIconToggleButtonColors(checkedContainerColor = MaterialTheme.colorScheme.tertiaryContainer)
+                        colors = IconButtonDefaults.filledTonalIconToggleButtonColors(checkedContainerColor = MaterialTheme.colorScheme.tertiaryContainer),
+                        modifier = Modifier.size(40.dp)
                     ) {
                         Icon(Icons.Default.Groups, "Broadcast")
                     }
@@ -216,77 +254,43 @@ fun TalkTab(
                 }
             }
 
-            // --- 4. TRIGGER MODES (Handsfree & Pocket Mode) ---
+            // --- 4. TRIGGER MODES ---
             item {
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    // A. Handsfree (Latch Mode)
+                    // Handsfree
                     ElevatedFilterChip(
                         selected = viewModel.isHandsFree,
                         onClick = {
                             viewModel.isHandsFree = !viewModel.isHandsFree
-                            // Safety: Stop transmitting if we switch modes while talking
                             if (serviceState.isTransmitting) viewModel.stopTransmission { service?.stopTalk() }
-
                             val status = if (viewModel.isHandsFree) "Handsfree: ON" else "Handsfree: OFF"
                             Toast.makeText(context, status, Toast.LENGTH_SHORT).show()
                         },
-                        label = {
-                            Text(
-                                if (viewModel.isHandsFree) "Handsfree: ON" else "Handsfree: OFF",
-                                fontWeight = FontWeight.Bold
-                            )
-                        },
-                        leadingIcon = {
-                            Icon(
-                                if (viewModel.isHandsFree) Icons.Default.LockOpen else Icons.Default.Lock,
-                                contentDescription = null,
-                                modifier = Modifier.size(18.dp)
-                            )
-                        },
-                        colors = FilterChipDefaults.elevatedFilterChipColors(
-                            selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
-                            selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
-                        ),
+                        label = { Text(if (viewModel.isHandsFree) "Handsfree: ON" else "Handsfree: OFF", fontWeight = FontWeight.Bold) },
+                        leadingIcon = { Icon(if (viewModel.isHandsFree) Icons.Default.LockOpen else Icons.Default.Lock, null, modifier = Modifier.size(18.dp)) },
+                        colors = FilterChipDefaults.elevatedFilterChipColors(selectedContainerColor = MaterialTheme.colorScheme.primaryContainer),
                         modifier = Modifier.weight(1f)
                     )
 
-                    // B. Pocket Mode (Headset/Volume Keys)
+                    // Pocket Mode
                     ElevatedFilterChip(
                         selected = serviceState.isHeadsetLinked,
                         onClick = {
                             val intent = Intent(context, VoiceService::class.java).apply { action = "TOGGLE_HEADSET" }
                             context.startService(intent)
-
-                            // Toast handled by Service, but adding UI confirmation here feels snappier
-                            val status = if (!serviceState.isHeadsetLinked) "Pocket Mode: ON" else "Pocket Mode: OFF"
-                            Toast.makeText(context, status, Toast.LENGTH_SHORT).show()
                         },
-                        label = {
-                            Text(
-                                if (serviceState.isHeadsetLinked) "Pocket Mode: ON" else "Pocket Mode: OFF",
-                                fontWeight = FontWeight.Bold
-                            )
-                        },
-                        leadingIcon = {
-                            Icon(
-                                if (serviceState.isHeadsetLinked) Icons.Default.HeadsetMic else Icons.Default.HeadsetOff,
-                                contentDescription = null,
-                                modifier = Modifier.size(18.dp)
-                            )
-                        },
-                        colors = FilterChipDefaults.elevatedFilterChipColors(
-                            selectedContainerColor = MaterialTheme.colorScheme.tertiaryContainer,
-                            selectedLabelColor = MaterialTheme.colorScheme.onTertiaryContainer
-                        ),
+                        label = { Text(if (serviceState.isHeadsetLinked) "Pocket Mode: ON" else "Pocket Mode: OFF", fontWeight = FontWeight.Bold) },
+                        leadingIcon = { Icon(if (serviceState.isHeadsetLinked) Icons.Default.HeadsetMic else Icons.Default.HeadsetOff, null, modifier = Modifier.size(18.dp)) },
+                        colors = FilterChipDefaults.elevatedFilterChipColors(selectedContainerColor = MaterialTheme.colorScheme.tertiaryContainer),
                         modifier = Modifier.weight(1f)
                     )
                 }
             }
 
-            // --- 5. SAFETY & TOOLS (Fixed Alignment) ---
+            // --- 5. SAFETY & TOOLS ---
             item {
                 Card(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha=0.3f)),
@@ -295,37 +299,27 @@ fun TalkTab(
                 ) {
                     Row(
                         modifier = Modifier.padding(12.dp).fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceEvenly, // [FIX] Better Spacing
+                        horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // Stealth
-                        FilledIconToggleButton(checked = serviceState.isTheaterMode, onCheckedChange = { service?.toggleTheaterMode(it); Toast.makeText(context, if(it) "Stealth ON" else "Stealth OFF", Toast.LENGTH_SHORT).show() }) {
-                            Icon(Icons.Default.DarkMode, "Stealth")
-                        }
+                        FilledIconToggleButton(checked = serviceState.isTheaterMode, onCheckedChange = { service?.toggleTheaterMode(it); Toast.makeText(context, if(it) "Stealth ON" else "Stealth OFF", Toast.LENGTH_SHORT).show() }) { Icon(Icons.Default.DarkMode, "Stealth") }
+                        FilledIconToggleButton(checked = serviceState.isVoxEnabled, onCheckedChange = { service?.toggleVox(it); Toast.makeText(context, if(it) "VOX ON" else "VOX OFF", Toast.LENGTH_SHORT).show() }) { Icon(Icons.Default.RecordVoiceOver, "VOX") }
+                        FilledIconToggleButton(checked = serviceState.isSensorEnabled, onCheckedChange = { service?.toggleSensor(it); Toast.makeText(context, if(it) "Shield ON" else "Shield OFF", Toast.LENGTH_SHORT).show() }) { Icon(Icons.Default.DirectionsBike, "Shield") }
 
-                        // VOX
-                        FilledIconToggleButton(checked = serviceState.isVoxEnabled, onCheckedChange = { service?.toggleVox(it); Toast.makeText(context, if(it) "VOX ON" else "VOX OFF", Toast.LENGTH_SHORT).show() }) {
-                            Icon(Icons.Default.RecordVoiceOver, "VOX")
-                        }
-
-                        // Sensor
-                        FilledIconToggleButton(checked = serviceState.isSensorEnabled, onCheckedChange = { service?.toggleSensor(it); Toast.makeText(context, if(it) "Shield ON" else "Shield OFF", Toast.LENGTH_SHORT).show() }) {
-                            Icon(Icons.Default.DirectionsBike, "Shield")
-                        }
-
-                        // Location
                         FilledIconButton(onClick = {
                             if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
                                 fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null).addOnSuccessListener { loc ->
                                     if (loc != null) { service?.sendLocationPing(loc.latitude, loc.longitude); Toast.makeText(context, "Location Sent", Toast.LENGTH_SHORT).show() }
                                     else { Toast.makeText(context, "Locating...", Toast.LENGTH_SHORT).show() }
                                 }
-                            } else { Toast.makeText(context, "No GPS Perm", Toast.LENGTH_SHORT).show() }
+                            } else {
+                                Toast.makeText(context, "No GPS Perm", Toast.LENGTH_SHORT).show()
+                                permLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
+                            }
                         }, colors = IconButtonDefaults.filledIconButtonColors(containerColor = MaterialTheme.colorScheme.secondary)) {
                             Icon(Icons.Default.LocationOn, "Trace", tint = Color.White)
                         }
 
-                        // SOS
                         FilledIconButton(
                             onClick = {
                                 if (viewModel.targetUser.isNotBlank()) { service?.sendPanicAlert(); Toast.makeText(context, "SOS SENT!", Toast.LENGTH_SHORT).show() }
@@ -339,7 +333,7 @@ fun TalkTab(
                 }
             }
 
-            // --- 6. PAGER / HISTORY ---
+            // --- 6. PAGER ---
             if (pagerEntries.isNotEmpty()) {
                 item {
                     HorizontalDivider(color = Color.LightGray.copy(alpha=0.3f))
@@ -358,7 +352,7 @@ fun TalkTab(
             }
         }
 
-        // --- 7. SECURE CALL FAB ---
+        // --- 7. FAB ---
         val targetUser = viewModel.targetUser
         val canCall = targetUser.isNotEmpty() && targetUser != "SERVER_LINK"
         FloatingActionButton(
@@ -380,6 +374,8 @@ fun TalkTab(
         }
     }
 
+    // --- DIALOGS ---
+
     if (showTextDialog) {
         AlertDialog(
             onDismissRequest = { showTextDialog = false },
@@ -387,6 +383,91 @@ fun TalkTab(
             text = { OutlinedTextField(value = textMessage, onValueChange = { textMessage = it }, label = { Text("Type message...") }, singleLine = true, modifier = Modifier.fillMaxWidth()) },
             confirmButton = { TextButton(onClick = { viewModel.sendTextPayload(service, textMessage); textMessage = ""; showTextDialog = false }) { Text("SEND") } },
             dismissButton = { TextButton(onClick = { showTextDialog = false }) { Text("Cancel") } }
+        )
+    }
+
+    if (showSettingsDialog) {
+        val prefs = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
+        var remoteEnabled by rememberSaveable { mutableStateOf(prefs.getBoolean("allow_remote_control", false)) }
+
+        AlertDialog(
+            onDismissRequest = { showSettingsDialog = false },
+            title = { Text("Quick Settings") },
+            text = {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable { remoteEnabled = !remoteEnabled; prefs.edit().putBoolean("allow_remote_control", remoteEnabled).apply() }) {
+                    Switch(checked = remoteEnabled, onCheckedChange = { remoteEnabled = it; prefs.edit().putBoolean("allow_remote_control", it).apply() })
+                    Spacer(Modifier.width(16.dp))
+                    Text(if(remoteEnabled) "Guardian Mode: ON" else "Guardian Mode: OFF")
+                }
+            },
+            confirmButton = { TextButton(onClick = { showSettingsDialog = false }) { Text("DONE") } }
+        )
+    }
+
+    if (showGuardianControls) {
+        AlertDialog(
+            onDismissRequest = { showGuardianControls = false },
+            icon = { Icon(Icons.Default.Security, null, tint = MaterialTheme.colorScheme.error) },
+            title = {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("GUARDIAN REMOTE", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
+                    Text("Target: ${viewModel.targetUser}", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                }
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("Only use these commands in emergencies. You must be a 'Principal' on the target device.", style = MaterialTheme.typography.bodySmall)
+                    HorizontalDivider()
+
+                    // Command 1: MIC ON
+                    OutlinedButton(
+                        onClick = {
+                            viewModel.sendTextPayload(service, "CMD:REMOTE_MIC_ON")
+                            Toast.makeText(context, "Command Sent: LISTEN IN", Toast.LENGTH_SHORT).show()
+                            showGuardianControls = false
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Red)
+                    ) {
+                        Icon(Icons.Default.Mic, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("FORCE MIC ON (LISTEN)")
+                    }
+
+                    // Command 2: LOCATION
+                    OutlinedButton(
+                        onClick = {
+                            viewModel.sendTextPayload(service, "CMD:REMOTE_LOCATION")
+                            Toast.makeText(context, "Command Sent: LOCATE", Toast.LENGTH_SHORT).show()
+                            showGuardianControls = false
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF1976D2))
+                    ) {
+                        Icon(Icons.Default.LocationSearching, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("PING GPS LOCATION")
+                    }
+
+                    // Command 3: STEALTH
+                    OutlinedButton(
+                        onClick = {
+                            viewModel.sendTextPayload(service, "CMD:REMOTE_STEALTH")
+                            Toast.makeText(context, "Command Sent: SILENCE", Toast.LENGTH_SHORT).show()
+                            showGuardianControls = false
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.DarkGray)
+                    ) {
+                        Icon(Icons.Default.VolumeOff, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("FORCE SILENT MODE")
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showGuardianControls = false }) { Text("CLOSE") }
+            }
         )
     }
 }
@@ -409,6 +490,8 @@ fun PagerItem(entry: PagerEntry, onPlay: () -> Unit, onDelete: () -> Unit) {
     val dateFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
     val isText = entry.type == "TEXT"
     val isLocation = entry.type == "LOCATION"
+    val isAudio = entry.type == "AUDIO"
+
     Card(
         colors = CardDefaults.cardColors(containerColor = when { isLocation -> Color(0xFFE8F5E9); isText -> Color(0xFFFFF3E0); else -> Color(0xFFE3F2FD) }),
         modifier = Modifier.fillMaxWidth().clickable { onPlay() }
@@ -418,7 +501,14 @@ fun PagerItem(entry: PagerEntry, onPlay: () -> Unit, onDelete: () -> Unit) {
             Spacer(modifier = Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(text = entry.sender, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
-                Text(text = if(isLocation) "📍 Shared Location" else entry.content, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+
+                val displayText = when {
+                    isLocation -> "📍 Shared Location"
+                    isAudio -> "▶ Voice Message"
+                    else -> entry.content
+                }
+
+                Text(text = displayText, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             Column(horizontalAlignment = Alignment.End) {
                 Text(text = dateFormat.format(Date(entry.timestamp)), style = MaterialTheme.typography.labelSmall)

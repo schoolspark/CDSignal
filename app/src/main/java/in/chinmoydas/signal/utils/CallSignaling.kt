@@ -3,6 +3,7 @@ package `in`.chinmoydas.signal.utils
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -26,6 +27,7 @@ object CallSignaling {
     // State
     var currentCallerIp: String? = null
     var isBusy = false
+    private var callTimeoutJob: Job? = null // [NEW] Timer for outgoing calls
 
     // Sender Function (To be linked from ViewModel)
     var sendUdpTextFunction: ((String, String) -> Unit)? = null
@@ -40,26 +42,32 @@ object CallSignaling {
 
         when (text) {
             CMD_REQ -> {
+                // [FIX] Check both internal busy flag AND Audio Engine state
                 if (isBusy || CallEngine.isCallActive) {
                     sendSignal(CMD_BUSY, senderIp)
                 } else {
+                    isBusy = true // [FIX] Mark busy immediately upon receiving request
                     currentCallerIp = senderIp
                     _callEvents.emit(CallEvent.IncomingCall(senderIp))
                 }
             }
             CMD_ACC -> {
+                callTimeoutJob?.cancel() // [FIX] Stop the 30s timer
                 _callEvents.emit(CallEvent.CallConnected)
                 CallEngine.startCall(senderIp)
             }
             CMD_REJ -> {
+                callTimeoutJob?.cancel()
                 _callEvents.emit(CallEvent.CallRejected)
                 reset()
             }
             CMD_BUSY -> {
+                callTimeoutJob?.cancel()
                 _callEvents.emit(CallEvent.CallBusy)
                 reset()
             }
             CMD_END -> {
+                callTimeoutJob?.cancel()
                 CallEngine.stopCall()
                 _callEvents.emit(CallEvent.CallEnded)
                 reset()
@@ -67,23 +75,38 @@ object CallSignaling {
         }
     }
 
-    // [FIX] Redundant Signaling: Send critical packets 3 times to prevent data loss
     private fun sendSignal(cmd: String, ip: String) {
         scope.launch(Dispatchers.IO) {
             repeat(3) {
                 sendUdpTextFunction?.invoke(cmd, ip)
-                delay(50) // Tiny delay between bursts
+                delay(50)
             }
         }
     }
 
     // UI Actions
     fun startOutgoingCall(ip: String) {
+        if (isBusy) return // Prevent duplicate calls
+
+        isBusy = true // [FIX] Lock the state immediately
         currentCallerIp = ip
         sendSignal(CMD_REQ, ip)
+
         // Notify UI immediately
         scope.launch {
             _callEvents.emit(CallEvent.OutgoingCall(ip))
+        }
+
+        // [NEW] 30 Second Timeout Logic
+        callTimeoutJob?.cancel()
+        callTimeoutJob = scope.launch {
+            delay(30_000) // 30 Seconds Ringing
+            if (isBusy && !CallEngine.isCallActive) {
+                Log.d(TAG, "Call timed out")
+                // Cancel locally
+                _callEvents.emit(CallEvent.CallEnded) // Or a new CallTimeout event
+                reset()
+            }
         }
     }
 
@@ -92,7 +115,6 @@ object CallSignaling {
         isBusy = true
         sendSignal(CMD_ACC, ip)
 
-        // [FIX] Critical: Update LOCAL UI state immediately to prevent freeze
         scope.launch {
             _callEvents.emit(CallEvent.CallConnected)
         }
@@ -107,15 +129,14 @@ object CallSignaling {
     }
 
     fun endCall() {
+        callTimeoutJob?.cancel() // Ensure timer is killed
         val ip = currentCallerIp
         if (ip != null) {
-            // [FIX] Send the END command multiple times before closing
             sendSignal(CMD_END, ip)
         }
 
         CallEngine.stopCall()
 
-        // Notify Local UI immediately
         scope.launch {
             _callEvents.emit(CallEvent.CallEnded)
         }
@@ -126,6 +147,7 @@ object CallSignaling {
     private fun reset() {
         isBusy = false
         currentCallerIp = null
+        callTimeoutJob?.cancel()
     }
 
     sealed class CallEvent {

@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Map
+import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -42,15 +43,15 @@ fun SafetyOverlay(
     val sosName = remember(sosSender) { sosSender?.let { nameResolver(it) } ?: "Unknown" }
     val locName = remember(locData) { locData?.let { nameResolver(it.first) } ?: "Unknown" }
 
+    var securityIntruder by remember { mutableStateOf<String?>(null) } // [NEW State]
+
     LaunchedEffect(Unit) {
         SafetySignaling.safetyEvents.collect { event ->
             when (event) {
-                is SafetySignaling.SafetyEvent.SOS -> {
-                    sosSender = event.senderIp
-                }
-                is SafetySignaling.SafetyEvent.Location -> {
-                    locData = event.senderIp to (event.lat to event.lon)
-                }
+                is SafetySignaling.SafetyEvent.SOS -> sosSender = event.senderIp
+                is SafetySignaling.SafetyEvent.Location -> locData = event.senderIp to (event.lat to event.lon)
+                // [NEW] Handle Security Alert
+                is SafetySignaling.SafetyEvent.SecurityAlert -> securityIntruder = event.intruderName
             }
         }
     }
@@ -156,6 +157,36 @@ fun SafetyOverlay(
                     locData = null
                     SafetySignaling.clearEvent()
                 }) { Text("Dismiss") }
+            }
+        )
+    }
+    // --- 3. SECURITY WARNING POPUP ---
+    if (securityIntruder != null) {
+        AlertDialog(
+            onDismissRequest = {
+                securityIntruder = null
+                SafetySignaling.clearEvent()
+            },
+            icon = { Icon(Icons.Default.Security, null, tint = Color.Red) },
+            title = { Text("SECURITY WARNING", color = Color.Red, fontWeight = FontWeight.Bold) },
+            text = {
+                Column {
+                    Text("Unauthorized Remote Command Blocked!")
+                    Spacer(Modifier.height(8.dp))
+                    Text("User: $securityIntruder", fontWeight = FontWeight.Bold)
+                    Text("Attempted to access Admin controls.")
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        securityIntruder = null
+                        SafetySignaling.clearEvent()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.Red)
+                ) {
+                    Text("DISMISS")
+                }
             }
         )
     }

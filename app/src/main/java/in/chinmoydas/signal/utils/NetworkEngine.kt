@@ -88,4 +88,8 @@ class NetworkEngine(private val port: Int) {
         sendQueue.clear()
         addressCache.clear()
     }
+
+    fun isBound(): Boolean {
+        return isRunning.get() && socket != null && !socket!!.isClosed
+    }
 }
