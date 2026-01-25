@@ -10,10 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
-import android.media.AudioAttributes
-import android.media.AudioFocusRequest
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.net.ConnectivityManager
@@ -29,12 +26,15 @@ import android.util.Log
 import android.widget.Toast
 import androidx.annotation.RequiresPermission
 import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.core.app.NotificationCompat
 import androidx.media.session.MediaButtonReceiver
 import `in`.chinmoydas.signal.data.AppDatabase
 import `in`.chinmoydas.signal.data.PagerEntry
 import `in`.chinmoydas.signal.data.MainRepository
 import `in`.chinmoydas.signal.utils.AudioEngine
+import `in`.chinmoydas.signal.utils.AudioRouter
+import `in`.chinmoydas.signal.utils.CallEngine
 import `in`.chinmoydas.signal.utils.CryptoEngine
 import `in`.chinmoydas.signal.utils.G711
 import `in`.chinmoydas.signal.utils.LocalLinkManager
@@ -57,7 +57,6 @@ import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.math.abs
 
 data class VoiceServiceState(
     val incomingCall: String? = null,
@@ -74,26 +73,29 @@ data class VoiceServiceState(
     val isSosPending: Boolean = false
 )
 
-class VoiceService : Service(), TextToSpeech.OnInitListener {
+class VoiceService : Service() {
     private val tag = "VoiceService"
     private val binder = LocalBinder()
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private val _voiceServiceState = MutableStateFlow(VoiceServiceState())
-    private var lastRejectTime: Long = 0
-    var packetInterceptor: ((String, String) -> Boolean)? = null
     val voiceServiceState = _voiceServiceState.asStateFlow()
 
+    private var lastRejectTime: Long = 0
+    private var isTheaterMode = false
+    var packetInterceptor: ((String, String) -> Boolean)? = null
+
+    // Engines & Routers
     private lateinit var audioEngine: AudioEngine
     private lateinit var networkEngine: NetworkEngine
+    private lateinit var audioRouter: AudioRouter
     private lateinit var repository: MainRepository
 
     private var sensorHelper: SensorHelper? = null
     private var voxHelper: VoxHelper? = null
-    private var voxJob: Job? = null // [FIX] Added Job tracker for VOX
+    private var voxJob: Job? = null
 
     private var tts: TextToSpeech? = null
-    private var isTtsReady = false
 
     private lateinit var mediaSession: MediaSessionCompat
     private var isHeadsetLinked = true
@@ -142,7 +144,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 isSpeakerOn = userPrefersSpeaker,
                 isHeadsetLinked = isHeadsetLinked,
                 isTransmitting = isSending,
-                isTheaterMode = !userPrefersSpeaker
+                isTheaterMode = isTheaterMode
             )
         }
     }
@@ -160,10 +162,9 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     private val bufferLock = Any()
     var isRecordingEnabled = true
 
-    private val audioManager by lazy { getSystemService(Context.AUDIO_SERVICE) as AudioManager }
     @Suppress("DEPRECATION")
     private val vibrator by lazy { getSystemService(Context.VIBRATOR_SERVICE) as Vibrator }
-    private var activeFocusRequest: AudioFocusRequest? = null
+
     private val wakeLock by lazy { (getSystemService(Context.POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CDSignal:VoiceLock") }
     private val wifiLock by lazy {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -188,9 +189,46 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         }
 
         override fun onAvailable(network: Network) {
-            myLocalIp = getLocalIpAddress()
-            triggerHeartbeat()
-            localLinkManager?.startAdvertising(myUsername, UDP_PORT)
+            super.onAvailable(network)
+            val newIp = getLocalIpAddress()
+
+            if (newIp.isNotEmpty() && newIp != myLocalIp) {
+                Log.i(tag, "Network Handover: $myLocalIp -> $newIp")
+                myLocalIp = newIp
+
+                scope.launch {
+                    try { networkEngine.stop() } catch (e: Exception) {}
+                    delay(500)
+
+                    networkEngine.start { packet ->
+                        if (StunClient.isStunResponse(packet.data)) {
+                            val result = StunClient.parseResponse(packet.data)
+                            if (result != null && myPublicPort != result.publicPort) {
+                                myPublicPort = result.publicPort
+                                triggerHeartbeat()
+                            }
+                            return@start
+                        }
+                        handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
+                    }
+
+                    val principals = repository.getPrincipalContacts()
+                    principalCache.clear()
+                    principalCache.addAll(principals.map { it.name })
+
+                    _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
+                    triggerHeartbeat()
+                    localLinkManager?.startAdvertising(myUsername, UDP_PORT)
+                }
+            } else if (myLocalIp.isEmpty()) {
+                myLocalIp = newIp
+            }
+        }
+
+        override fun onLost(network: Network) {
+            super.onLost(network)
+            Log.w(tag, "Network Lost")
+            _voiceServiceState.update { it.copy(networkStatus = "Waiting for Network...") }
         }
     }
 
@@ -199,6 +237,14 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
     override fun onCreate() {
         super.onCreate()
+
+        audioRouter = AudioRouter(this)
+        audioRouter.initialize()
+        audioRouter.onRouteChanged = { isSpeakerOn ->
+            userPrefersSpeaker = isSpeakerOn
+            updateState()
+        }
+
         audioEngine = AudioEngine(this)
         networkEngine = NetworkEngine(UDP_PORT)
         repository = MainRepository(applicationContext)
@@ -208,30 +254,40 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         dataSaverEnabled = prefs.getBoolean("data_saver", false)
 
         initMediaSession()
-        tts = TextToSpeech(this, this)
 
-        sensorHelper = SensorHelper(this) { message ->
-            scope.launch {
-                _voiceServiceState.update { it.copy(isSosPending = true) }
-                vibrate()
+        tts = TextToSpeech(this) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                tts?.language = Locale.US
             }
         }
 
-        // [FIX] VOX triggers now skip vibration to save battery
-        voxHelper = VoxHelper(
-            onSpeechStart = {
-                scope.launch(Dispatchers.Main) { toggleTalk(fromVox = true) }
-            },
-            onSilence = {
-                scope.launch(Dispatchers.Main) { toggleTalk(fromVox = true) }
+        scope.launch {
+            val principals = repository.getPrincipalContacts()
+            principalCache.clear()
+            principalCache.addAll(principals.map { it.name })
+
+            val blocked = repository.getBlockedContacts()
+            blockedCache.clear()
+            blockedCache.addAll(blocked.map { it.name })
+        }
+
+        sensorHelper = SensorHelper(this) {
+            scope.launch {
+                _voiceServiceState.update { it.copy(isSosPending = true) }
+                val v = if (Build.VERSION.SDK_INT >= 31) (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator else vibrator
+                v.vibrate(VibrationEffect.createOneShot(500, VibrationEffect.DEFAULT_AMPLITUDE))
             }
+        }
+
+        voxHelper = VoxHelper(
+            onSpeechStart = { scope.launch(Dispatchers.Main) { toggleTalk(fromVox = true) } },
+            onSilence = { scope.launch(Dispatchers.Main) { toggleTalk(fromVox = true) } }
         )
 
         registerReceiver(object : android.content.BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 if (android.media.AudioManager.ACTION_AUDIO_BECOMING_NOISY == intent?.action) {
                     if (isSending) stopTalk()
-                    toggleSpeaker(true) // Default to speaker
                 }
             }
         }, android.content.IntentFilter(android.media.AudioManager.ACTION_AUDIO_BECOMING_NOISY))
@@ -241,30 +297,24 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         wifiLock.setReferenceCounted(false)
         val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         connectivityManager.registerNetworkCallback(NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), networkCallback)
-        updateAudioRoute()
     }
 
-    private fun updateAudioRoute() {
-        if (isSilenced) return
-        if (!userPrefersSpeaker) {
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            audioManager.isSpeakerphoneOn = false
-        } else {
-            audioManager.mode = AudioManager.MODE_NORMAL
-            audioManager.isSpeakerphoneOn = true
-        }
-    }
-
-    override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            val result = tts?.setLanguage(Locale.US)
-            isTtsReady = result != TextToSpeech.LANG_MISSING_DATA && result != TextToSpeech.LANG_NOT_SUPPORTED
+    // [NEW] Helper to Bridge MainActivity -> AudioRouter
+    fun setCallMode(active: Boolean) {
+        if (::audioRouter.isInitialized) {
+            audioRouter.setCallMode(active)
         }
     }
 
     fun speakText(text: String) {
-        updateAudioRoute()
-        if (isTtsReady) tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, null)
+        if (isSilenced || isTheaterMode) {
+            Log.d(tag, "TTS Suppressed: Device is Silenced or in Stealth Mode")
+            return
+        }
+
+        val params = Bundle()
+        params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "ID")
     }
 
     private fun initMediaSession() {
@@ -293,11 +343,9 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         mediaSession.isActive = true
     }
 
-    // [FIX] Added 'fromVox' parameter to suppress vibration
     private fun toggleTalk(fromVox: Boolean = false) {
         if (isSending) {
             stopTalk()
-            // Only vibrate on manual release, not VOX auto-stop
             if (!fromVox) vibrate()
         } else {
             scope.launch {
@@ -313,13 +361,11 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
                 if (!ip.isNullOrBlank()) {
                     if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                        // [FIX] Skip vibration if triggered by VOX
                         if (!fromVox) vibrate()
                         startTalk(listOf(ip), UDP_PORT)
                     }
                 } else {
                     if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                        // [FIX] Skip vibration if triggered by VOX
                         if (!fromVox) vibrate()
                         startTalk(if(ip != null) listOf(ip) else emptyList(), UDP_PORT)
                     }
@@ -328,7 +374,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    // [FIX] VOX Monitoring Loop: Listens when NOT transmitting
     private fun startVoxMonitoring() {
         stopVoxMonitoring()
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
@@ -414,15 +459,11 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // 1. Handle Headset Button Clicks (Priority)
         MediaButtonReceiver.handleIntent(mediaSession, intent)
-
         val action = intent?.action
 
-        // 2. Intent Router
         when (action) {
             "STOP_SERVICE" -> {
-                Log.i(tag, "Stopping Service via Intent")
                 sendBroadcast(Intent("in.chinmoydas.signal.ACTION_EXIT").setPackage(packageName))
                 stopSelf()
                 return START_NOT_STICKY
@@ -431,31 +472,20 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             "TOGGLE_MUTE" -> {
                 isSilenced = !isSilenced
                 _voiceServiceState.update { it.copy(isSilenced = isSilenced) }
-
-                // Audio Focus Management
                 if (activeCalls.get() > 0) {
                     if (isSilenced) {
-                        audioManager.mode = AudioManager.MODE_NORMAL
-                        audioManager.isSpeakerphoneOn = false
-                        abandonFocus()
-                    } else {
-                        acquireResources()
-                    }
+                        audioRouter.abandonFocus()
+                    } else { acquireResources() }
                 }
-                updateAudioRoute()
-                refreshNotification() // Refreshes UI with new Mute icon
+                refreshNotification()
                 return START_STICKY
             }
 
             "TOGGLE_HEADSET" -> {
-                // Pocket Mode Logic
                 val newState = !_voiceServiceState.value.isHeadsetLinked
-                isHeadsetLinked = newState // Sync local var
+                isHeadsetLinked = newState
                 _voiceServiceState.update { it.copy(isHeadsetLinked = newState) }
-
-                // Critical: Activate MediaSession so hardware keys work
                 mediaSession.isActive = newState
-
                 val msg = if (newState) "Pocket Mode: ON (Keys Active)" else "Pocket Mode: OFF"
                 updateNotification(msg, null)
                 Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
@@ -463,13 +493,12 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             }
 
             "TOGGLE_STEALTH" -> {
-                // Toggles Speaker/Earpiece routing
                 toggleSpeaker(!userPrefersSpeaker)
+                isTheaterMode = !isTheaterMode
+                _voiceServiceState.update { it.copy(isTheaterMode = isTheaterMode) }
 
-                // Haptic Feedback
                 val v = if (Build.VERSION.SDK_INT >= 31) (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator else vibrator
                 v.vibrate(VibrationEffect.createOneShot(100, 100))
-
                 refreshNotification()
                 return START_STICKY
             }
@@ -477,13 +506,11 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             "TOGGLE_VOX" -> {
                 val newState = !_voiceServiceState.value.isVoxEnabled
                 _voiceServiceState.update { it.copy(isVoxEnabled = newState) }
-
                 if (newState) {
                     startVoxMonitoring()
                     Toast.makeText(this, "VOX: Auto-Transmit ON", Toast.LENGTH_SHORT).show()
                 } else {
                     stopVoxMonitoring()
-                    // [SAFETY] If transmitting via VOX, stop immediately
                     if (isSending) stopTalk()
                     Toast.makeText(this, "VOX: OFF", Toast.LENGTH_SHORT).show()
                 }
@@ -494,7 +521,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             "TOGGLE_SENSOR" -> {
                 val newState = !_voiceServiceState.value.isSensorEnabled
                 _voiceServiceState.update { it.copy(isSensorEnabled = newState) }
-
                 if (newState) {
                     sensorHelper?.start()
                     Toast.makeText(this, "Shield: Crash Detection ON", Toast.LENGTH_SHORT).show()
@@ -507,43 +533,26 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             }
         }
 
-        // 3. Service Initialization (Runs only once on startup)
         if (intent == null && _voiceServiceState.value.networkStatus != "Disconnected") {
-            // Service restarted by system, but already running logic?
-            // Just stick around.
             return START_STICKY
         }
 
         createNotificationChannel()
-        try {
-            startForegroundServiceNotification("Initializing Radio...")
-        } catch (e: Exception) {
-            Log.e(tag, "Foreground Service Failed: ${e.message}")
-            stopSelf()
-            return START_NOT_STICKY
-        }
+        try { startForegroundServiceNotification("Initializing Radio...") } catch (e: Exception) { stopSelf(); return START_NOT_STICKY }
 
-        // 4. Start Background Threads
         scope.launch(Dispatchers.IO) {
             try {
                 if (!multicastLock.isHeld) multicastLock.acquire()
-
-                // A. Start Audio Engine
                 audioEngine.startPlayback()
-
-                // B. Start Network Engine
                 val networkStarted = networkEngine.start { packet ->
-                    // STUN / NAT Traversal Handling
                     if (StunClient.isStunResponse(packet.data)) {
                         val result = StunClient.parseResponse(packet.data)
                         if (result != null && myPublicPort != result.publicPort) {
                             myPublicPort = result.publicPort
-                            Log.d(tag, "NAT Port Update: $myPublicPort")
-                            triggerHeartbeat() // Notify peers of new port
+                            triggerHeartbeat()
                         }
                         return@start
                     }
-                    // Process Standard Packet
                     handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
                 }
 
@@ -555,25 +564,16 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
                 _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
                 updateNotification("Online & Ready", null)
-
-                // C. Start Loops
                 startHeartbeatLoop()
                 startSignalLoop()
 
-            } catch (e: Exception) {
-                Log.e(tag, "Startup Error: ${e.message}")
-            }
+            } catch (e: Exception) { Log.e(tag, "Startup Error: ${e.message}") }
         }
 
-        // 5. Start Local Discovery (NSD / Nearby)
         try {
-            if (localLinkManager == null) {
-                localLinkManager = LocalLinkManager(this, { _, _, _ -> }, { _ -> })
-            }
+            if (localLinkManager == null) localLinkManager = LocalLinkManager(this, { _, _, _ -> }, { _ -> })
             localLinkManager?.startAdvertising(myUsername, UDP_PORT)
-        } catch (e: Exception) {
-            Log.w(tag, "Local Discovery Failed: ${e.message}")
-        }
+        } catch (e: Exception) { }
 
         return START_STICKY
     }
@@ -591,41 +591,26 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    // Define fallback servers (Google, Mozilla, Coturn)
     private val stunServers = listOf(
         Pair("stun.l.google.com", 19302),
         Pair("stun1.l.google.com", 19302),
         Pair("stun2.l.google.com", 19302),
-        Pair("stun.services.mozilla.com", 3478) // Different provider for redundancy
+        Pair("stun.services.mozilla.com", 3478)
     )
 
     private fun startHeartbeatLoop() {
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
-            var serverIndex = 0 // Start with primary
-
+            var serverIndex = 0
             while (isActive) {
-                delay(15_000) // 15s Interval for stability
-
-                if (networkEngine.isBound()) { // [FIX] Ensure you added isBound() to NetworkEngine
+                delay(15_000)
+                if (networkEngine.isBound()) {
                     try {
-                        // 1. Pick current server
                         val (host, port) = stunServers[serverIndex]
-
-                        // 2. Create Request for this specific server
                         val stunReq = StunClient.createBindRequest(host, port)
-
-                        if (stunReq != null) {
-                            networkEngine.sendRawPacket(stunReq)
-                            Log.d(tag, "Heartbeat Sent to $host:$port")
-                        }
-
-                        // 3. Keep Peers Alive
+                        if (stunReq != null) networkEngine.sendRawPacket(stunReq)
                         triggerHeartbeat()
-
                     } catch (e: Exception) {
-                        Log.e(tag, "Heartbeat Failed on server $serverIndex: ${e.message}")
-                        // Rotate to next server on failure
                         serverIndex = (serverIndex + 1) % stunServers.size
                     }
                 }
@@ -649,7 +634,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                         currentChannelKey,
                         status
                     )
-                } catch (e: Exception) { Log.e(tag, "Heartbeat failed", e) }
+                } catch (e: Exception) { }
             }
         }
     }
@@ -715,13 +700,11 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun handleIncomingPacket(data: ByteArray, length: Int, senderIp: String) {
-        // 1. Basic Filters
         if (isSending || senderIp == myLocalIp || length <= 5) return
         val nameLen = data[0].toInt() and 0xFF
         if (nameLen + 5 > length) return
         val senderName = String(data, 1, nameLen)
 
-        // 2. Signaling (Ping/Pong/End)
         if (senderName == PING_SIGNAL) { sendPong(senderIp); return }
         if (senderName == PONG_SIGNAL) { _voiceServiceState.update { it.copy(lastPingResponse = System.currentTimeMillis()) }; return }
 
@@ -742,7 +725,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             return
         }
 
-        // 3. Security & Priority Checks
         if (senderName.trim().equals(myUsername.trim(), ignoreCase = true) || blockedCache.contains(senderName) || senderIp == ignoredSender) return
         val isPrincipal = principalCache.contains(senderName)
 
@@ -753,7 +735,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             } else { return }
         } else { currentSpeakerName = senderName }
 
-        // 4. Sequence & Log Logic
         val seqOffset = 1 + nameLen
         val seqNum = ByteBuffer.wrap(data, seqOffset, 4).int
         val payloadOffset = seqOffset + 4
@@ -761,12 +742,10 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         val lastSeq = sequenceMap.getOrPut(senderName) { -1 }
 
         if (seqNum > lastSeq || seqNum < lastSeq - 1000 || seqNum == 0) {
-            // Update IP if changed
             if (!senderName.startsWith("group:") && activeIpCache[senderName] != senderIp) {
                 activeIpCache[senderName] = senderIp
                 scope.launch { repository.updateContactIp(senderName, senderIp) }
             }
-            // Log new session
             if (seqNum == 0 || seqNum < lastSeq - 1000) {
                 scope.launch { repository.insertLog(senderName, true) }
                 sequenceMap[senderName] = -1
@@ -775,7 +754,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             lastIncomingIp = senderIp
             handleIncomingSignal(senderName, isPrincipal)
 
-            // 5. Decryption (Secure Mode)
             if (payloadLen > 0) {
                 var payload = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
                 val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
@@ -786,7 +764,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                     val secretKey = getDecryptionKey(isGroup)
                     if (secretKey != null) {
                         var decrypted = CryptoEngine.decrypt(payload, seqNum, secretKey)
-                        // Fallback for packet fragmentation edge cases
                         if (decrypted == null && payload.size > 656 && payload.size < 720) {
                             try {
                                 val trimmedPayload = payload.copyOfRange(0, 656)
@@ -797,50 +774,40 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                     }
                 }
 
-                // 6. Text & Command Processing
                 if (payload.size < 500) {
                     try {
                         val textData = String(payload, Charsets.UTF_8)
                         if (textData.startsWith("TXT:")) {
                             val cleanMessage = textData.substring(4)
 
-                            // [CRITICAL UPGRADE] Interceptor Hook
-                            // This allows WalkieViewModel to grab CMD:CALL packets before they hit TTS
                             if (packetInterceptor?.invoke(cleanMessage, senderIp) == true) {
-                                Log.d(tag, "Packet intercepted by UI: $cleanMessage")
                                 return
                             }
 
-                            // A. CALL COMMANDS (Fallback if interceptor misses)
                             if (cleanMessage.startsWith("CMD:CALL")) {
-                                scope.launch { `in`.chinmoydas.signal.utils.CallSignaling.handlePacket(cleanMessage, senderIp) }
+                                scope.launch { CallSignaling.handlePacket(cleanMessage, senderIp) }
                                 return
                             }
 
-                            // B. SOS / PANIC
                             if (cleanMessage.startsWith("CMD:SOS") || cleanMessage.startsWith("CMD:PANIC")) {
-                                scope.launch { `in`.chinmoydas.signal.utils.SafetySignaling.triggerSOS(senderIp) }
+                                scope.launch { SafetySignaling.triggerSOS(senderIp) }
                                 return
                             }
 
-                            // C. LOCATION
                             if (cleanMessage.startsWith("LOC:")) {
                                 val coords = cleanMessage.removePrefix("LOC:")
-                                scope.launch { `in`.chinmoydas.signal.utils.SafetySignaling.triggerLocation(senderIp, coords) }
+                                scope.launch { SafetySignaling.triggerLocation(senderIp, coords) }
                                 return
                             }
 
-                            // D. REMOTE GUARDIAN COMMANDS
                             if (cleanMessage.startsWith("CMD:REMOTE_")) {
                                 val isRemoteAllowed = prefs.getBoolean("allow_remote_control", false)
 
                                 if (!isRemoteAllowed) {
-                                    // [FIX] Rate Limit Rejections (Prevent Battery Drain Attack)
                                     val now = System.currentTimeMillis()
                                     if (now - lastRejectTime > 5000) {
                                         lastRejectTime = now
-                                        Log.w(tag, "Remote Command BLOCKED: Guardian OFF. Sender: $senderName")
-                                        sendTextMessage(senderIp, "TXT:Remote Control is DISABLED on this device.")
+                                        sendTextMessage(senderIp, "Remote Control is DISABLED on this device.")
                                         updateNotification("🚫 Blocked CMD", "Guardian Mode OFF. Ignored $senderName")
                                     }
                                     return
@@ -853,11 +820,13 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                                     }
                                     else if (cleanMessage == "CMD:REMOTE_STEALTH") {
                                         updateNotification("🤫 STEALTH MODE", "Activated by $senderName")
-                                        toggleSpeaker(false); isSilenced = true
+                                        toggleSpeaker(false)
+                                        isSilenced = true
+                                        isTheaterMode = true
+                                        _voiceServiceState.update { it.copy(isSilenced = true, isTheaterMode = true) }
                                     }
                                     else if (cleanMessage == "CMD:REMOTE_LOCATION") {
-                                        // [FIX] Use ContextCompat for Services
-                                        if (androidx.core.content.ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                                        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
                                             val locMgr = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
                                             val loc = locMgr.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER)
                                                 ?: locMgr.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
@@ -869,13 +838,12 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                                         }
                                     }
                                 } else {
-                                    scope.launch { `in`.chinmoydas.signal.utils.SafetySignaling.triggerSecurityAlert(senderName) }
+                                    scope.launch { SafetySignaling.triggerSecurityAlert(senderName) }
                                     updateNotification("⚠️ SECURITY WARN", "Blocked CMD from $senderName")
                                 }
                                 return
                             }
 
-                            // E. REGULAR MESSAGES
                             val notificationPrefix = if(isPrincipal) "⚠️ PRIORITY MSG" else "Message"
                             speakText(cleanMessage)
                             scope.launch {
@@ -888,10 +856,15 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                     } catch (e: Exception) { }
                 }
 
-                // 7. Audio Processing (Decode G711 -> PCM)
                 if (payload.size >= 640 && payload.size < 720) {
                     try { payload = G711.decode(payload, 640) } catch (e: Exception) { }
                 }
+
+                // [FIX] Diamond State: Suppress PTT audio if Call is Active
+                if (CallEngine.isCallActive) {
+                    return
+                }
+
                 if (!isSilenced || isPrincipal) {
                     try { audioEngine.writeAudio(seqNum, payload) } catch (e: Exception) {}
                 }
@@ -933,91 +906,57 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
     fun sendPanicAlert() {
         scope.launch(Dispatchers.IO) {
-            // [UPGRADE] Safety Flood: Send to ALL saved contacts
             val allContacts = repository.getAllContacts()
             var sentCount = 0
-
-            // 1. Send to all Saved Contacts with valid IPs
             allContacts.forEach { contact ->
                 if (!contact.ip.isNullOrBlank() && contact.ip != "SERVER_LINK") {
                     sendTextMessage(contact.ip, "CMD:SOS")
                     sentCount++
-                    // [OPTIMIZATION] Prevent UDP socket buffer overflow
                     delay(10)
                 }
             }
-
-            // 2. Also send to the currently active IP (if unique/temporary P2P)
             val currentTarget = activeIpCache[repository.getTargetUser()]
             if (!currentTarget.isNullOrBlank() && allContacts.none { it.ip == currentTarget }) {
                 sendTextMessage(currentTarget, "CMD:SOS")
                 sentCount++
             }
-
-            // 3. [CRITICAL FALLBACK] If no specific targets found, Broadcast to Local Network
-            // This ensures the SOS works even if you have 0 contacts or are fully offline.
             if (sentCount == 0) {
                 sendTextMessage("255.255.255.255", "CMD:SOS")
-                Log.w(tag, "No direct targets found. Broadcasting SOS to Local Network (255.255.255.255).")
-            } else {
-                Log.d(tag, "SOS Broadcast successfully sent to $sentCount targets.")
             }
         }
     }
 
     fun sendLocationPing(lat: Double, lon: Double) {
         scope.launch(Dispatchers.IO) {
-            // [UPGRADE] Location Broadcast: Share coordinates with ALL contacts
             val allContacts = repository.getAllContacts()
             var sentCount = 0
-
-            // 1. Send to all Saved Contacts
             allContacts.forEach { contact ->
                 if (!contact.ip.isNullOrBlank() && contact.ip != "SERVER_LINK") {
                     sendTextMessage(contact.ip, "LOC:$lat,$lon")
                     sentCount++
-                    // [OPTIMIZATION] Prevent UDP socket buffer overflow
                     delay(10)
                 }
             }
-
-            // 2. Also send to current active target (if unique)
             val currentTarget = activeIpCache[repository.getTargetUser()]
             if (!currentTarget.isNullOrBlank() && allContacts.none { it.ip == currentTarget }) {
                 sendTextMessage(currentTarget, "LOC:$lat,$lon")
                 sentCount++
             }
-
-            // 3. [CRITICAL FALLBACK] If no targets found, Broadcast to Local Network
             if (sentCount == 0) {
                 sendTextMessage("255.255.255.255", "LOC:$lat,$lon")
-                Log.w(tag, "No direct targets found. Broadcasting Location to Local Network.")
             }
         }
     }
 
-    // [FIX] Added Location Logic
     fun confirmSos() {
         _voiceServiceState.update { it.copy(isSosPending = false) }
-
-        // 1. Send the Red Alert
         sendPanicAlert()
-
-        // 2. Fetch & Send Location Automatically
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
             val locMgr = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
             val loc = locMgr.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER)
                 ?: locMgr.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
-
-            if (loc != null) {
-                sendLocationPing(loc.latitude, loc.longitude)
-                Log.d(tag, "SOS Location Sent: ${loc.latitude}, ${loc.longitude}")
-            } else {
-                Log.w(tag, "SOS Location Failed: No last known location")
-            }
+            if (loc != null) sendLocationPing(loc.latitude, loc.longitude)
         }
-
-        // 3. Force Mic ON (listen-in mode)
         if (!_voiceServiceState.value.isVoxEnabled) toggleVox(true)
     }
 
@@ -1044,10 +983,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     fun startTalk(ips: List<String>, port: Int) {
         if (isSending) return
-
-        // [FIX] Pause VOX Monitoring while transmitting to prevent hardware conflict
         stopVoxMonitoring()
-
         acquireResources(forceAudio = true)
         isSending = true
         currentSequenceNumber = 0
@@ -1063,10 +999,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         val secretKey = if (isSecureMode) getEncryptionKey() else null
 
         audioEngine.startRecording(shouldCompress) { rawBuffer ->
-            if (_voiceServiceState.value.isVoxEnabled) {
-                voxHelper?.process(rawBuffer)
-            }
-
+            if (_voiceServiceState.value.isVoxEnabled) voxHelper?.process(rawBuffer)
             val payloadToSend = if (isSecureMode && secretKey != null) {
                 CryptoEngine.encrypt(rawBuffer, currentSequenceNumber, secretKey) ?: rawBuffer
             } else { rawBuffer }
@@ -1095,18 +1028,14 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             repeat(3) { networkEngine.send(buf, activeTargets, lastPort); delay(20) }
             releaseResourcesIfNeeded()
         }
-
-        // [FIX] Resume VOX Monitoring if enabled
-        if (_voiceServiceState.value.isVoxEnabled) {
-            startVoxMonitoring()
-        }
+        if (_voiceServiceState.value.isVoxEnabled) startVoxMonitoring()
     }
 
     @Suppress("DEPRECATION")
     fun toggleSpeaker(on: Boolean) {
+        audioRouter.setSpeakerPreferred(on)
         userPrefersSpeaker = on
         updateState()
-        updateAudioRoute()
         refreshNotification()
     }
 
@@ -1115,8 +1044,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             if (!wakeLock.isHeld) wakeLock.acquire(10 * 60 * 1000L)
             if (!wifiLock.isHeld) wifiLock.acquire()
             if (!isSilenced || forceAudio) {
-                updateAudioRoute()
-                requestFocus()
+                audioRouter.requestFocus()
             }
         }
     }
@@ -1125,25 +1053,9 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         if (activeCalls.decrementAndGet() == 0) {
             if (wakeLock.isHeld) wakeLock.release()
             if (wifiLock.isHeld) wifiLock.release()
-            updateAudioRoute()
-            abandonFocus()
+            audioRouter.abandonFocus()
         }
     }
-
-    private fun requestFocus(): Boolean {
-        val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
-            .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
-            .setOnAudioFocusChangeListener { focusChange ->
-                if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
-                    if (isSending) stopTalk()
-                    if (isReceiving) stopReceiving()
-                }
-            }.build()
-        activeFocusRequest = focusRequest
-        return audioManager.requestAudioFocus(focusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-    }
-
-    private fun abandonFocus() { activeFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }; activeFocusRequest = null }
 
     @Suppress("DEPRECATION")
     private fun vibrate() {
@@ -1267,6 +1179,11 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
     override fun onDestroy() {
         if (tts != null) { tts?.stop(); tts?.shutdown(); tts = null }
+        audioRouter.shutdown()
+
+        // [FIX] Ensure Call Engine releases the Microphone if Service dies
+        CallEngine.stopCall()
+
         scope.launch { triggerHeartbeat("offline") }
         sensorHelper?.stop()
         stopVoxMonitoring()

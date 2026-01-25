@@ -197,6 +197,20 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         }
     }
 
+    // [FIX] Dynamic SOS Trigger (Always targets the CURRENT user)
+    // This fixes the issue where the button was stuck on the previous user's IP
+    fun triggerCurrentSos(service: VoiceService?) {
+        val ip = getCurrentTargetIp()
+
+        if (ip != null && ip != "SERVER_LINK") {
+            // Target specific user
+            service?.sendTextMessage(ip, "CMD:SOS")
+        } else {
+            // If no specific target, use the Service's "Broadcast Mode"
+            service?.sendPanicAlert()
+        }
+    }
+
     fun playEntry(context: Context, entry: PagerEntry, service: VoiceService?) {
         if (entry.type == "AUDIO") {
             val file = File(entry.content)

@@ -69,7 +69,7 @@ fun TalkTab(
     val pagerEntries by viewModel.pagerEntries.collectAsState()
     val isSecureMode = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE).getBoolean("secure_mode", false)
 
-    // --- DIALOG STATES (Fixed for Rotation) ---
+    // --- DIALOG STATES ---
     var showTextDialog by rememberSaveable { mutableStateOf(false) }
     var showSettingsDialog by rememberSaveable { mutableStateOf(false) }
     var showGuardianControls by rememberSaveable { mutableStateOf(false) }
@@ -149,20 +149,13 @@ fun TalkTab(
                 }
             }
 
-            // --- 2. TOP CONTROLS (Restored Broadcast) ---
+            // --- 2. TOP CONTROLS ---
             item {
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 4.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // [DISABLED] Settings Shortcut - Commented out for Security/Guardian Mode safety
-                    /*
-                    IconButton(onClick = { showSettingsDialog = true }) {
-                        Icon(Icons.Default.Settings, "Settings", tint = MaterialTheme.colorScheme.primary)
-                    }
-                    */
-
                     // Guardian Remote Button
                     IconButton(onClick = {
                         if (viewModel.targetUser.isNotBlank() && viewModel.targetUser != "SERVER_LINK") {
@@ -184,7 +177,7 @@ fun TalkTab(
                         Icon(Icons.Default.Keyboard, "Message", tint = MaterialTheme.colorScheme.primary)
                     }
 
-                    // Speaker
+                    // Speaker (Updates automatically via AudioRouter)
                     FilledTonalIconToggleButton(
                         checked = serviceState.isSpeakerOn,
                         onCheckedChange = { viewModel.toggleSpeaker(service) },
@@ -204,7 +197,7 @@ fun TalkTab(
                         Icon(if (serviceState.isSilenced) Icons.Default.NotificationsOff else Icons.Default.NotificationsActive, "Silent")
                     }
 
-                    // [RESTORED] Broadcast Mode
+                    // Broadcast Mode
                     FilledTonalIconToggleButton(
                         checked = viewModel.isBroadcastMode,
                         onCheckedChange = { viewModel.toggleBroadcastMode() },
@@ -302,8 +295,8 @@ fun TalkTab(
                         horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        FilledIconToggleButton(checked = serviceState.isTheaterMode, onCheckedChange = { service?.toggleTheaterMode(it); Toast.makeText(context, if(it) "Stealth ON" else "Stealth OFF", Toast.LENGTH_SHORT).show() }) { Icon(Icons.Default.DarkMode, "Stealth") }
-                        FilledIconToggleButton(checked = serviceState.isVoxEnabled, onCheckedChange = { service?.toggleVox(it); Toast.makeText(context, if(it) "VOX ON" else "VOX OFF", Toast.LENGTH_SHORT).show() }) { Icon(Icons.Default.RecordVoiceOver, "VOX") }
+                        FilledIconToggleButton(checked = serviceState.isTheaterMode, onCheckedChange = { viewModel.toggleStealth(service); Toast.makeText(context, if(it) "Stealth ON" else "Stealth OFF", Toast.LENGTH_SHORT).show() }) { Icon(Icons.Default.DarkMode, "Stealth") }
+                        FilledIconToggleButton(checked = serviceState.isVoxEnabled, onCheckedChange = { viewModel.toggleVox(service); Toast.makeText(context, if(it) "VOX ON" else "VOX OFF", Toast.LENGTH_SHORT).show() }) { Icon(Icons.Default.RecordVoiceOver, "VOX") }
                         FilledIconToggleButton(checked = serviceState.isSensorEnabled, onCheckedChange = { service?.toggleSensor(it); Toast.makeText(context, if(it) "Shield ON" else "Shield OFF", Toast.LENGTH_SHORT).show() }) { Icon(Icons.Default.DirectionsBike, "Shield") }
 
                         FilledIconButton(onClick = {
@@ -322,7 +315,11 @@ fun TalkTab(
 
                         FilledIconButton(
                             onClick = {
-                                if (viewModel.targetUser.isNotBlank()) { service?.sendPanicAlert(); Toast.makeText(context, "SOS SENT!", Toast.LENGTH_SHORT).show() }
+                                if (viewModel.targetUser.isNotBlank()) {
+                                    // [FIX] Use ViewModel Dynamic SOS
+                                    viewModel.triggerCurrentSos(service)
+                                    Toast.makeText(context, "SOS SENT!", Toast.LENGTH_SHORT).show()
+                                }
                                 else { Toast.makeText(context, "Select Target!", Toast.LENGTH_SHORT).show() }
                             },
                             colors = IconButtonDefaults.filledIconButtonColors(containerColor = MaterialTheme.colorScheme.error)

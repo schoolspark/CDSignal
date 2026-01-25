@@ -13,26 +13,22 @@ object CallSignaling {
 
     private const val TAG = "CallSignaling"
 
-    // Protocol Commands
     const val CMD_REQ = "CMD:CALL_REQ"
     const val CMD_ACC = "CMD:CALL_ACC"
     const val CMD_REJ = "CMD:CALL_REJ"
     const val CMD_END = "CMD:CALL_END"
     const val CMD_BUSY = "CMD:CALL_BUSY"
 
-    // UI Events
-    private val _callEvents = MutableSharedFlow<CallEvent>()
+    // [CRITICAL FIX] replay = 1 ensures the UI (CallScreen) never misses an event,
+    // even if it initializes slightly after the event was emitted.
+    private val _callEvents = MutableSharedFlow<CallEvent>(replay = 1)
     val callEvents: SharedFlow<CallEvent> = _callEvents
 
-    // State
     var currentCallerIp: String? = null
     var isBusy = false
-    private var callTimeoutJob: Job? = null // [NEW] Timer for outgoing calls
+    private var callTimeoutJob: Job? = null
 
-    // Sender Function (To be linked from ViewModel)
     var sendUdpTextFunction: ((String, String) -> Unit)? = null
-
-    // Scope for emitting events
     private val scope = CoroutineScope(Dispatchers.Main)
 
     suspend fun handlePacket(text: String, senderIp: String) {
@@ -42,17 +38,16 @@ object CallSignaling {
 
         when (text) {
             CMD_REQ -> {
-                // [FIX] Check both internal busy flag AND Audio Engine state
                 if (isBusy || CallEngine.isCallActive) {
                     sendSignal(CMD_BUSY, senderIp)
                 } else {
-                    isBusy = true // [FIX] Mark busy immediately upon receiving request
+                    isBusy = true
                     currentCallerIp = senderIp
                     _callEvents.emit(CallEvent.IncomingCall(senderIp))
                 }
             }
             CMD_ACC -> {
-                callTimeoutJob?.cancel() // [FIX] Stop the 30s timer
+                callTimeoutJob?.cancel()
                 _callEvents.emit(CallEvent.CallConnected)
                 CallEngine.startCall(senderIp)
             }
@@ -77,34 +72,31 @@ object CallSignaling {
 
     private fun sendSignal(cmd: String, ip: String) {
         scope.launch(Dispatchers.IO) {
-            repeat(3) {
+            // [ROBUSTNESS] 5x Redundancy ensures signal delivery on weak 4G networks
+            repeat(5) {
                 sendUdpTextFunction?.invoke(cmd, ip)
-                delay(50)
+                delay(40)
             }
         }
     }
 
-    // UI Actions
     fun startOutgoingCall(ip: String) {
-        if (isBusy) return // Prevent duplicate calls
-
-        isBusy = true // [FIX] Lock the state immediately
+        if (isBusy) return
+        isBusy = true
         currentCallerIp = ip
         sendSignal(CMD_REQ, ip)
 
-        // Notify UI immediately
-        scope.launch {
-            _callEvents.emit(CallEvent.OutgoingCall(ip))
-        }
+        // Emitting immediately triggers the "Dialing" UI
+        scope.launch { _callEvents.emit(CallEvent.OutgoingCall(ip)) }
 
-        // [NEW] 30 Second Timeout Logic
+        // [FIX] Robust Timeout: Cancels remote ring if no answer after 30s
         callTimeoutJob?.cancel()
         callTimeoutJob = scope.launch {
-            delay(30_000) // 30 Seconds Ringing
+            delay(30_000)
             if (isBusy && !CallEngine.isCallActive) {
-                Log.d(TAG, "Call timed out")
-                // Cancel locally
-                _callEvents.emit(CallEvent.CallEnded) // Or a new CallTimeout event
+                Log.d(TAG, "Call timed out - cancelling remote")
+                sendSignal(CMD_END, ip)
+                _callEvents.emit(CallEvent.CallEnded)
                 reset()
             }
         }
@@ -114,33 +106,24 @@ object CallSignaling {
         val ip = currentCallerIp ?: return
         isBusy = true
         sendSignal(CMD_ACC, ip)
-
-        scope.launch {
-            _callEvents.emit(CallEvent.CallConnected)
-        }
-
+        scope.launch { _callEvents.emit(CallEvent.CallConnected) }
         CallEngine.startCall(ip)
     }
 
     fun declineCall() {
-        val ip = currentCallerIp ?: return
-        sendSignal(CMD_REJ, ip)
+        val ip = currentCallerIp
+        if (ip != null) sendSignal(CMD_REJ, ip)
+        // [FIX] Force UI update even if state was partial
+        _callEvents.tryEmit(CallEvent.CallRejected)
         reset()
     }
 
     fun endCall() {
-        callTimeoutJob?.cancel() // Ensure timer is killed
+        callTimeoutJob?.cancel()
         val ip = currentCallerIp
-        if (ip != null) {
-            sendSignal(CMD_END, ip)
-        }
-
+        if (ip != null) sendSignal(CMD_END, ip)
         CallEngine.stopCall()
-
-        scope.launch {
-            _callEvents.emit(CallEvent.CallEnded)
-        }
-
+        scope.launch { _callEvents.emit(CallEvent.CallEnded) }
         reset()
     }
 

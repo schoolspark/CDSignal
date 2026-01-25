@@ -53,7 +53,7 @@ class MainActivity : ComponentActivity() {
     private var isBound = false
     private lateinit var walkieViewModel: WalkieViewModel
 
-    // [NEW] In-App Update Variables
+    // In-App Update Variables
     private lateinit var appUpdateManager: AppUpdateManager
     private val UPDATE_REQUEST_CODE = 123
 
@@ -77,11 +77,13 @@ class MainActivity : ComponentActivity() {
             isBound = true
             serviceBoundState.value = boundService
 
-            // [CRITICAL FIX] Link Logic safely here, after connection is guaranteed
+            // Link Logic safely here
             linkServiceLogic(boundService)
         }
 
         override fun onServiceDisconnected(arg0: ComponentName) {
+            // [FIX] Clear reference to prevent leaks
+            voiceService?.packetInterceptor = null
             isBound = false
             voiceService = null
             serviceBoundState.value = null
@@ -94,7 +96,7 @@ class MainActivity : ComponentActivity() {
         // 1. Initialize Update Manager
         appUpdateManager = AppUpdateManagerFactory.create(this)
         appUpdateManager.registerListener(installStateUpdatedListener)
-        checkForUpdates() // Start checking immediately
+        checkForUpdates()
 
         // 2. Register Receiver Securely
         val filter = IntentFilter("in.chinmoydas.signal.ACTION_EXIT")
@@ -123,6 +125,10 @@ class MainActivity : ComponentActivity() {
                     var startDest by remember { mutableStateOf<String?>(null) }
                     val currentService by serviceBoundState
 
+                    // [NEW] Collect Service State for Overlays (Speaker Status)
+                    val serviceState by currentService?.voiceServiceState?.collectAsState(initial = VoiceServiceState())
+                        ?: remember { mutableStateOf(VoiceServiceState()) }
+
                     LaunchedEffect(Unit) {
                         val prefs = withContext(Dispatchers.IO) {
                             getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
@@ -136,7 +142,7 @@ class MainActivity : ComponentActivity() {
                         // Initialize ViewModel
                         walkieViewModel = ViewModelProvider(this@MainActivity, factory)[WalkieViewModel::class.java]
 
-                        // [FIX] Double-check linkage in case Service bound before ViewModel was ready
+                        // Double-check linkage
                         LaunchedEffect(Unit) {
                             if (isBound && voiceService != null) {
                                 linkServiceLogic(voiceService!!)
@@ -171,17 +177,19 @@ class MainActivity : ComponentActivity() {
 
                         // --- OVERLAYS ---
 
-                        // [UPGRADE] Centralized Name Resolver for Calls AND Safety Alerts
                         val nameResolverHelper: (String) -> String = { ip ->
-                            // 1. Try to find in Saved Contacts (Live Data)
                             val contact = walkieViewModel.savedContacts.find { it.ip == ip }
                             contact?.name ?: if (walkieViewModel.getCurrentTargetIp() == ip) walkieViewModel.targetUser else ip
                         }
 
-                        // 1. Phone Call Screen
-                        CallOverlay(nameResolver = nameResolverHelper)
+                        // 1. Phone Call Screen (Wired to Service Audio)
+                        CallOverlay(
+                            nameResolver = nameResolverHelper,
+                            onSpeakerToggle = { currentService?.toggleSpeaker(!serviceState.isSpeakerOn) },
+                            isSpeakerOn = serviceState.isSpeakerOn
+                        )
 
-                        // 2. Emergency Alerts (Red Screen / Map Popup)
+                        // 2. Emergency Alerts
                         SafetyOverlay(nameResolver = nameResolverHelper)
 
                     } else {
@@ -194,23 +202,20 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // --- [NEW] IN-APP UPDATE LOGIC ---
+    // --- IN-APP UPDATE LOGIC ---
 
     private val installStateUpdatedListener = InstallStateUpdatedListener { state ->
         if (state.installStatus() == InstallStatus.DOWNLOADED) {
-            // Update downloaded! Prompt user to install.
             popupSnackbarForCompleteUpdate()
         }
     }
 
     private fun checkForUpdates() {
-        // [FIX] Move to IO thread to prevent "Skipped Frames" lag
         lifecycleScope.launch(Dispatchers.IO) {
             appUpdateManager.appUpdateInfo.addOnSuccessListener { appUpdateInfo ->
                 if (appUpdateInfo.updateAvailability() == UpdateAvailability.UPDATE_AVAILABLE &&
                     appUpdateInfo.isUpdateTypeAllowed(AppUpdateType.FLEXIBLE)
                 ) {
-                    // UI operations must return to Main thread
                     runOnUiThread {
                         try {
                             appUpdateManager.startUpdateFlowForResult(
@@ -230,12 +235,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // If an update was downloaded while the app was in background
         appUpdateManager.appUpdateInfo.addOnSuccessListener { appUpdateInfo ->
             if (appUpdateInfo.installStatus() == InstallStatus.DOWNLOADED) {
                 popupSnackbarForCompleteUpdate()
             }
-            // If the update flow was stalled/cancelled, we could restart it here.
         }
     }
 
@@ -249,16 +252,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun popupSnackbarForCompleteUpdate() {
-        // Since we are using Compose, showing a Toast is the simplest way
-        // to alert without messing up the UI hierarchy.
-        // For a more integrated look, pass a state to HomeScreen later.
         Toast.makeText(this, "Update Ready! Installing...", Toast.LENGTH_LONG).show()
         appUpdateManager.completeUpdate()
     }
 
-    // --- EXISTING LOGIC ---
+    // --- SERVICE LOGIC ---
 
-    // [CRITICAL FIX] Extracted Logic Linker to prevent Race Conditions
     private fun linkServiceLogic(service: VoiceService) {
         if (!::walkieViewModel.isInitialized) return
 
@@ -276,16 +275,18 @@ class MainActivity : ComponentActivity() {
                         // Stop PTT to allow Full-Duplex Call
                         service.stopTalk()
                         service.toggleVox(false)
+
+                        // [FIXED] Use the public helper method, not the private variable
+                        service.setCallMode(true)
                     }
                     is CallSignaling.CallEvent.CallEnded,
                     is CallSignaling.CallEvent.CallRejected -> {
                         // [FIX] Safety: Force transmission OFF when call ends
-                        // This prevents the "Hot Mic" bug if VOX tries to wake up
                         service.stopTalk()
                         service.toggleVox(false)
 
-                        // Optional: If you want to restore "Pocket Mode" functionality,
-                        // you could re-enable things here, but for safety, we keep mic dead.
+                        // [FIXED] Revert to Standard PTT Mode via helper
+                        service.setCallMode(false)
                     }
                     else -> {}
                 }
@@ -359,10 +360,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        appUpdateManager.unregisterListener(installStateUpdatedListener) // [FIX] Clean up listener
+        appUpdateManager.unregisterListener(installStateUpdatedListener)
         try { unregisterReceiver(exitReceiver) } catch (e: Exception) {}
 
         if (isBound) {
+            voiceService?.packetInterceptor = null // [FIX] Detach interceptor
             try { unbindService(connection) } catch (e: Exception) {
                 Log.e("MainActivity", "Failed to unbind service", e)
             }

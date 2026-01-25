@@ -43,10 +43,17 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
     var searchQuery by remember { mutableStateOf("") }
 
     // Filter Logic
-    val allContacts = viewModel.savedContacts.toList()
-    val filteredContacts = remember(searchQuery, viewModel.savedContacts) {
-        if (searchQuery.isBlank()) allContacts
-        else allContacts.filter { it.name.contains(searchQuery, ignoreCase = true) }
+    // [FIXED] Uses derivedStateOf to detect deletions in the savedContacts list immediately
+    val filteredContacts by remember(searchQuery) {
+        derivedStateOf {
+            if (searchQuery.isBlank()) {
+                viewModel.savedContacts.toList()
+            } else {
+                viewModel.savedContacts.filter {
+                    it.name.contains(searchQuery, ignoreCase = true)
+                }
+            }
+        }
     }
 
     // QR Logic
@@ -125,7 +132,7 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                                     horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
                                     Box(Modifier.fillMaxWidth()) {
-                                        // [FIX] 3-Dots Menu Button (Visible)
+                                        // 3-Dots Menu Button
                                         IconButton(
                                             onClick = { showMenu = true },
                                             modifier = Modifier.size(20.dp).align(Alignment.TopEnd)
