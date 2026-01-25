@@ -299,7 +299,7 @@ class VoiceService : Service() {
         connectivityManager.registerNetworkCallback(NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), networkCallback)
     }
 
-    // [NEW] Helper to Bridge MainActivity -> AudioRouter
+    // Helper to Bridge MainActivity -> AudioRouter
     fun setCallMode(active: Boolean) {
         if (::audioRouter.isInitialized) {
             audioRouter.setCallMode(active)
@@ -504,15 +504,27 @@ class VoiceService : Service() {
             }
 
             "TOGGLE_VOX" -> {
-                val newState = !_voiceServiceState.value.isVoxEnabled
-                _voiceServiceState.update { it.copy(isVoxEnabled = newState) }
-                if (newState) {
+                // [FIX] Read the specific state requested from the intent
+                val requestedState = if (intent.hasExtra("state")) {
+                    intent.getBooleanExtra("state", false)
+                } else {
+                    !_voiceServiceState.value.isVoxEnabled // Fallback to toggle
+                }
+
+                _voiceServiceState.update { it.copy(isVoxEnabled = requestedState) }
+
+                if (requestedState) {
                     startVoxMonitoring()
-                    Toast.makeText(this, "VOX: Auto-Transmit ON", Toast.LENGTH_SHORT).show()
+                    // Only show Toast if it was a manual toggle (not a programmatic reset)
+                    if (!intent.hasExtra("state")) {
+                        Toast.makeText(this, "VOX: Auto-Transmit ON", Toast.LENGTH_SHORT).show()
+                    }
                 } else {
                     stopVoxMonitoring()
                     if (isSending) stopTalk()
-                    Toast.makeText(this, "VOX: OFF", Toast.LENGTH_SHORT).show()
+                    if (!intent.hasExtra("state")) {
+                        Toast.makeText(this, "VOX: OFF", Toast.LENGTH_SHORT).show()
+                    }
                 }
                 refreshNotification()
                 return START_STICKY
@@ -860,7 +872,6 @@ class VoiceService : Service() {
                     try { payload = G711.decode(payload, 640) } catch (e: Exception) { }
                 }
 
-                // [FIX] Diamond State: Suppress PTT audio if Call is Active
                 if (CallEngine.isCallActive) {
                     return
                 }
@@ -966,8 +977,12 @@ class VoiceService : Service() {
 
     fun toggleTheaterMode(enabled: Boolean) { toggleSpeaker(!enabled) }
 
+    // [FIX] Updated helper to send explicit state
     fun toggleVox(enabled: Boolean) {
-        val intent = Intent(this, VoiceService::class.java).apply { action = "TOGGLE_VOX" }
+        val intent = Intent(this, VoiceService::class.java).apply {
+            action = "TOGGLE_VOX"
+            putExtra("state", enabled) // Pass specific state request
+        }
         startService(intent)
     }
 
@@ -1028,6 +1043,8 @@ class VoiceService : Service() {
             repeat(3) { networkEngine.send(buf, activeTargets, lastPort); delay(20) }
             releaseResourcesIfNeeded()
         }
+
+        // [FIX] Don't restart VOX if we are just ending a transmission manually
         if (_voiceServiceState.value.isVoxEnabled) startVoxMonitoring()
     }
 
@@ -1180,10 +1197,7 @@ class VoiceService : Service() {
     override fun onDestroy() {
         if (tts != null) { tts?.stop(); tts?.shutdown(); tts = null }
         audioRouter.shutdown()
-
-        // [FIX] Ensure Call Engine releases the Microphone if Service dies
         CallEngine.stopCall()
-
         scope.launch { triggerHeartbeat("offline") }
         sensorHelper?.stop()
         stopVoxMonitoring()
