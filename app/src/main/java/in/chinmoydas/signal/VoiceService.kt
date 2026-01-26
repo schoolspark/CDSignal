@@ -218,6 +218,7 @@ class VoiceService : Service() {
 
                     _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
                     triggerHeartbeat()
+                    broadcastHello()
                     localLinkManager?.startAdvertising(myUsername, UDP_PORT)
                 }
             } else if (myLocalIp.isEmpty()) {
@@ -669,6 +670,36 @@ class VoiceService : Service() {
         }
     }
 
+    // [NEW] v5.3.0: Broadcasts my Identity + FCM Token to peers
+    fun broadcastHello() {
+        scope.launch(Dispatchers.IO) {
+            val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
+            val myToken = prefs.getString("my_fcm_token", "NO_TOKEN") ?: "NO_TOKEN"
+
+            // Format: HELLO:Username:Token
+            val payloadString = "HELLO:$myUsername:$myToken"
+            val payloadBytes = payloadString.toByteArray(Charsets.UTF_8)
+
+            // Construct Packet (Standard Protocol)
+            // [Len][Payload (Name area used for Hello data)][Seq][Empty Body]
+            val buf = ByteArray(1 + payloadBytes.size + 4)
+            buf[0] = payloadBytes.size.toByte() // Length of the "Hello" string
+            System.arraycopy(payloadBytes, 0, buf, 1, payloadBytes.size)
+            // Sequence number 0 for hello
+            ByteBuffer.wrap(buf, 1 + payloadBytes.size, 4).putInt(0)
+
+            // Send to Broadcast Address (Discovery)
+            networkEngine.send(buf, listOf("255.255.255.255"), UDP_PORT)
+
+            // Also send to all known contacts (Reliability)
+            val contacts = repository.getAllContacts()
+            val knownIps = contacts.mapNotNull { it.ip }.filter { it != "SERVER_LINK" && it.isNotEmpty() }
+            if (knownIps.isNotEmpty()) {
+                networkEngine.send(buf, knownIps, UDP_PORT)
+            }
+        }
+    }
+
     private fun sendPong(ip: String) {
         scope.launch {
             val signalBytes = PONG_SIGNAL.toByteArray()
@@ -726,6 +757,30 @@ class VoiceService : Service() {
         val nameLen = data[0].toInt() and 0xFF
         if (nameLen + 5 > length) return
         val senderName = String(data, 1, nameLen)
+
+        // [NEW] v5.3.0: Catch Token Exchange
+        if (senderName.startsWith("HELLO:")) {
+            val parts = senderName.split(":")
+            // parts[0] = HELLO
+            // parts[1] = Username
+            // parts[2] = Token
+
+            if (parts.size >= 3) {
+                val remoteUser = parts[1]
+                val remoteToken = parts[2]
+
+                // If it's a valid user and token, save it
+                if (remoteUser.isNotEmpty() && remoteToken != "NO_TOKEN") {
+                    Log.d(tag, "Received Token from $remoteUser")
+                    scope.launch {
+                        repository.updateContactToken(remoteUser, remoteToken)
+                        // Optional: Update IP if changed
+                        repository.updateContactIp(remoteUser, senderIp)
+                    }
+                }
+            }
+            return // Stop processing here, don't play audio
+        }
 
         if (senderName == PING_SIGNAL) { sendPong(senderIp); return }
         if (senderName == PONG_SIGNAL) { _voiceServiceState.update { it.copy(lastPingResponse = System.currentTimeMillis()) }; return }

@@ -72,9 +72,11 @@ object OfflineIntelligence {
                 ) { service?.toggleSpeaker(true) }
             }
             return AssistantResponse(
-                "Audio path seems clear. I am initializing the Acoustic Echo Canceler (AEC) and Noise Suppression (NS) algorithms. If problems persist, check your hardware volume buttons.",
+                "Audio path seems clear. I am initializing the Acoustic Echo Canceler (AEC). We can run a 3-second Loopback Test to verify your microphone.",
                 "Run Audio Test"
-            ) { /* Trigger Audio Diagnostic */ }
+            ) {
+                `in`.chinmoydas.signal.utils.AudioDiagnostics.runAudioTest(context, service)
+            }
         }
 
         // Connection/Network Issues
@@ -114,6 +116,22 @@ object OfflineIntelligence {
         // =========================================================================
         // 3. APP FEATURES & HELP (The Guide)
         // =========================================================================
+
+        // [NEW] Cloud Wake-Up Instructions
+        if (q.contains("wake") || q.contains("cloud") || q.contains("red dot") || q.contains("reach") || q.contains("offline")) {
+            return AssistantResponse(
+                "To use Cloud Wake: If a Saved Contact shows a Red Dot (Offline), wait 2 seconds. An amber 'WAKE DEVICE (CLOUD)' button will appear automatically.  Tapping it sends a secure signal via Google servers to wake their phone.",
+                null, null
+            )
+        }
+
+        // [NEW] Guardian Mode Setup Instructions
+        if (q.contains("set guardian") || q.contains("add guardian") || q.contains("principal") || q.contains("trust")) {
+            return AssistantResponse(
+                "To authorize a Guardian: Go to the 'Connect' tab and find the person in 'Saved Contacts'. Tap the 'Star' (Priority) icon next to their name.  Starred contacts can bypass Silent Mode and ping your location during emergencies.",
+                null, null
+            )
+        }
 
         // Guardian Mode / Remote Control
         if (q.contains("guardian") || q.contains("remote") || q.contains("control") || q.contains("child")) {
@@ -157,8 +175,11 @@ object OfflineIntelligence {
         // =========================================================================
 
         return AssistantResponse(
-            "I am designed to protect your privacy and maintain connection. I didn't understand that query. Try asking about 'Encryption', 'Connection', 'Audio', or 'Guardian Mode'.",
-            "Run System Diagnostics"
-        ) { /* Trigger Diagnostics */ }
+            "I am designed to protect your privacy and maintain connection. I didn't understand that query. Try asking about 'Cloud Wake', 'Encryption', or 'Guardian Mode'.",
+            "Run System Diagnostics" // <--- Update Label
+        ) {
+            // Link to your SystemDiagnostics OR AudioDiagnostics
+            `in`.chinmoydas.signal.utils.SystemDiagnostics.runChecks(context, service)
+        }
     }
 }

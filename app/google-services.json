@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "612501228378",
+    "project_id": "cdsignal-22a45",
+    "storage_bucket": "cdsignal-22a45.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:612501228378:android:1baa3d7d9c2a03daad4163",
+        "android_client_info": {
+          "package_name": "in.chinmoydas.signal"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB0xu-EUV5gO8jlpJJklaz14XgRR6wwqN8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -78,28 +78,49 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 2. GUARDIAN MODE (CIVILIAN FRIENDLY) ---
+            // --- 2: CLOUD WAKE (v5.3.0) ---
+            HelpCard(
+                title = "⚡ CLOUD WAKE / KICKER",
+                icon = Icons.Default.Bolt,
+                color = Color(0xFFFFF8E1) // Light Amber
+            ) {
+                Text("How to reach offline users:", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                Step(1, "If a contact shows a Red Dot (Offline), wait 2 seconds.")
+                Step(2, "An Amber Button 'WAKE DEVICE (CLOUD)' will appear.")
+                Step(3, "Tap it to send a high-priority signal via Google Servers.")
+                Step(4, "The other phone will wake up, start the radio, and turn Green.")
+                Text("Note: Both users must have Internet for this to work.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // --- 3. GUARDIAN MODE (UPDATED) ---
             HelpCard(
                 title = "🛡️ GUARDIAN MODE (REMOTE)",
                 icon = Icons.Default.Security,
                 color = MaterialTheme.colorScheme.errorContainer
             ) {
-                Text("Emergency Remote Control for families & teams.", fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(8.dp))
-                Step(1, "Go to 'Profile Tab' and enable 'Guardian Mode'.")
-                Step(2, "This allows trusted 'Principal' contacts to assist you in emergencies.")
-                Step(3, "Authorized actions available to Admins:")
+                Text("Emergency Remote Control for families.", fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
 
-                StatusDotRow(Color.Black, "Remote Listen-In", "Activates the microphone remotely to check on safety.")
-                StatusDotRow(Color.Blue, "Silent Tracking", "Request current GPS location without alerting the user.")
-                // [FIXED] Changed "Stealth Protocol" -> "Remote Silence" and removed "Covert Ops"
-                StatusDotRow(Color.DarkGray, "Remote Silence", "Remotely silences the device speaker for discretion & safety.")
+                Text("How to Authorize a Guardian:", fontWeight = FontWeight.Bold)
+                Step(1, "Go to the 'Connect' Tab.")
+                Step(2, "Find a trusted contact (Spouse/Parent).")
+                Step(3, "Tap the Star Icon (⭐) next to their name.")
+                Text("Only 'Starred' contacts can send remote commands.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+
+                Spacer(Modifier.height(12.dp))
+                Text("Available Commands:", fontWeight = FontWeight.Bold)
+                StatusDotRow(Color.Black, "Remote Listen-In", "Forces Mic ON to check safety.")
+                StatusDotRow(Color.Blue, "Silent Tracking", "Pings GPS location silently.")
+                StatusDotRow(Color.DarkGray, "Remote Silence", "Silences speaker remotely.")
+                StatusDotRow(Color(0xFF2E7D32), "Remote Restore", "Resets device to normal (Un-mute/Un-Vox).")
             }
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 3. SAFETY TOOLS ---
+            // --- 4. SAFETY TOOLS ---
             HelpCard(
                 title = "⛑️ SAFETY & DEFENCE TOOLS",
                 icon = Icons.Default.Shield,
@@ -116,7 +137,7 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 4. SECURE CALLS ---
+            // --- 5. SECURE CALLS ---
             HelpCard(
                 title = "📞 SECURE CALLS",
                 icon = Icons.Default.Call,
@@ -131,7 +152,7 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 5. SILENT TEXT ---
+            // --- 6. SILENT TEXT ---
             HelpCard(
                 title = "💬 SILENT TEXT MESSAGES",
                 icon = Icons.Default.Keyboard,
@@ -147,7 +168,7 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 6. ENCRYPTION & KEYS ---
+            // --- 7. ENCRYPTION & KEYS ---
             HelpCard(
                 title = "🔐 SECURE PAIRING",
                 icon = Icons.Default.QrCodeScanner,
@@ -163,7 +184,7 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 7. OFFLINE MODE ---
+            // --- 8. OFFLINE MODE ---
             HelpCard(
                 title = "📡 OFFLINE / LAN MODE",
                 icon = Icons.Default.Wifi,
@@ -178,21 +199,21 @@ fun HelpScreen(navController: NavController) {
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 8. STATUS INDICATORS ---
+            // --- 9. STATUS INDICATORS ---
             HelpCard(
                 title = "🚦 STATUS LIGHTS",
                 icon = Icons.Default.Info,
                 color = MaterialTheme.colorScheme.surfaceVariant
             ) {
-                StatusDotRow(Color.Green, "Green Dot", "Online & Ready. Path is open.")
-                StatusDotRow(Color.Yellow, "Yellow Dot", "Checking Network / Waking up peer.")
-                StatusDotRow(Color.Gray, "Gray Dot", "Offline. Select user to ping.")
-                StatusDotRow(Color.Red, "Red Pulse", "Transmitting (On Air).")
+                StatusDotRow(Color.Green, "Green Dot", "Online. PTT path is open.")
+                StatusDotRow(Color.Yellow, "Yellow Dot", "Checking Network...")
+                StatusDotRow(Color.Red, "Red Dot", "Offline. Look for 'Wake' button.") // Updated
+                StatusDotRow(Color(0xFFD32F2F), "Red Pulse", "Transmitting (On Air).")
             }
 
             Spacer(Modifier.height(16.dp))
 
-            // --- 9. TROUBLESHOOTING ---
+            // --- 10. TROUBLESHOOTING ---
             Text("Troubleshooting", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
 

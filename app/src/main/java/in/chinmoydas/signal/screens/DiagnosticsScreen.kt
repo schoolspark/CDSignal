@@ -72,6 +72,7 @@ fun DiagnosticsScreen(navController: NavController) {
     var serverStatus by remember { mutableStateOf("Checking...") }
     var storageStatus by remember { mutableStateOf(checkStorage(context)) }
     var audioFxStatus by remember { mutableStateOf(checkAudioEffects()) }
+    var fcmStatus by remember { mutableStateOf(checkFcmToken(context)) }
 
     // [NEW] Sensor Check for Impact Shield
     var sensorStatus by remember { mutableStateOf(checkSensors(context)) }
@@ -151,6 +152,7 @@ fun DiagnosticsScreen(navController: NavController) {
             Port 50005 (PTT): $portStatus
             Port 50006 (Call): $callPortStatus
             Sensors: $sensorStatus
+            fcmStatus = checkFcmToken(context)
             Voice Vol: $volumeStatus
             TTS Engine: $ttsStatus
             Storage: $storageStatus
@@ -211,6 +213,7 @@ fun DiagnosticsScreen(navController: NavController) {
             DiagnosticRow("Battery Opt", batteryStatus)
             DiagnosticRow("Network", netStatus)
             DiagnosticRow("NAT/STUN", stunStatus)
+            DiagnosticRow("Cloud Token", fcmStatus)
             DiagnosticRow("Local IP", localIp)
             DiagnosticRow("Server API", serverStatus)
             DiagnosticRow("Port 50005 (PTT)", portStatus)
@@ -594,4 +597,11 @@ fun startPlaying(file: File, playerState: MutableState<MediaPlayer?>, onComplete
         }
     }
     playerState.value = player
+}
+
+// [NEW] Checks shared prefs for the token
+fun checkFcmToken(context: Context): String {
+    val prefs = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
+    val token = prefs.getString("my_fcm_token", null)
+    return if (!token.isNullOrBlank()) "OK (Generated)" else "Fail (Missing)"
 }

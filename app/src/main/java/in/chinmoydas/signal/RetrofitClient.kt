@@ -11,6 +11,11 @@ import retrofit2.http.POST
 import java.util.concurrent.TimeUnit
 
 // --- RESPONSE MODELS ---
+data class WakeResponse(
+    val status: String,  // "success" or "error"
+    val message: String?,
+    val error: String?
+)
 data class LoginResponse(
     val status: String,
     val token: String,
@@ -112,6 +117,14 @@ interface ApiService {
     suspend fun checkSignals(
         @Header("Authorization") token: String
     ): SignalResponse
+
+    // [NEW] The Cloud Wake Method
+    @FormUrlEncoded
+    @POST("api/fcm_wake.php")
+    suspend fun sendWakeSignal(
+        @Field("target_token") token: String,
+        @Field("sender_name") sender: String
+    ): retrofit2.Response<WakeResponse>
 }
 
 object RetrofitClient {

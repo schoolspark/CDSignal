@@ -1,6 +1,7 @@
 [versions]
 agp = "9.0.0"
 appUpdate = "2.1.0"
+firebaseMessaging = "25.0.1"
 media = "1.7.1"
 playServicesLocation = "21.3.0"
 retrofit = "3.0.0"
@@ -30,6 +31,7 @@ app-update = { module = "com.google.android.play:app-update", version.ref = "app
 app-update-ktx = { module = "com.google.android.play:app-update-ktx", version.ref = "appUpdate" }
 converter-gson = { module = "com.squareup.retrofit2:converter-gson", version.ref = "retrofit" }
 core = { module = "com.google.zxing:core", version.ref = "core" }
+firebase-messaging = { module = "com.google.firebase:firebase-messaging", version.ref = "firebaseMessaging" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
 androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }

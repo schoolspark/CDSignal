@@ -3,6 +3,8 @@ plugins {
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.google.ksp)
+
+    id("com.google.gms.google-services")
 }
 
 android {
@@ -13,8 +15,8 @@ android {
         applicationId = "in.chinmoydas.signal"
         minSdk = 29
         targetSdk = 36
-        versionCode = 76
-        versionName = "5.2.4"
+        versionCode = 77
+        versionName = "5.3.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -54,6 +56,7 @@ dependencies {
     implementation(libs.play.services.location)
     implementation(libs.app.update)
     implementation(libs.app.update.ktx)
+    implementation(libs.firebase.messaging)
     
     // Networking
     implementation(libs.retrofit)

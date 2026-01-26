@@ -147,6 +147,41 @@ fun TalkTab(
                         Text(statusText, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = statusColor, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                     Text(if (isSecureMode) "Encrypted Channel" else "Public Channel", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+
+                    // Only show if: Target Selected + OFFLINE + We have a Token
+                    if (viewModel.targetUser.isNotEmpty() &&
+                        viewModel.connectionStatus == ConnectionStatus.OFFLINE &&
+                        !viewModel.isBroadcastMode) {
+
+                        val targetContact = viewModel.savedContacts.find { it.name == viewModel.targetUser }
+                        val hasToken = targetContact?.fcmToken?.isNotBlank() == true
+
+                        if (hasToken) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Button(
+                                onClick = {
+                                    if (targetContact != null) {
+                                        viewModel.sendCloudWakeUp(context, targetContact)
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFA000)), // Amber
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                            ) {
+                                Icon(Icons.Default.Bolt, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text("WAKE DEVICE (CLOUD)", fontWeight = FontWeight.Bold)
+                            }
+                            Text(
+                                "Target is offline. Tap to wake them up.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color.Gray,
+                                fontSize = 10.sp,
+                                modifier = Modifier.padding(top = 4.dp)
+                            )
+                        }
+                    }
+                    // [END NEW CODE]
                 }
             }
 

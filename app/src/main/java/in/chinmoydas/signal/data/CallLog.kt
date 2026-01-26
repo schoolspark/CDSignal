@@ -19,7 +19,8 @@ data class ContactEntity(
     val ip: String,
     val savedCode: String = "",
     val isBlocked: Boolean = false,
-    val isPriority: Boolean = false // [NEW] Priority Flag
+    val isPriority: Boolean = false, // [NEW] Priority Flag
+    val fcmToken: String = ""
 )
 
 // Entity for Silent Comms (Voice Pager)
@@ -79,6 +80,9 @@ interface ContactDao {
     // Silent IP Update helper
     @Query("UPDATE contacts SET ip = :newIp WHERE name = :name")
     suspend fun updateIp(name: String, newIp: String)
+
+    @Query("UPDATE contacts SET fcmToken = :token WHERE name = :name")
+    suspend fun updateContactToken(name: String, token: String)
 }
 
 // DAO for Pager Logic
@@ -100,7 +104,7 @@ interface PagerDao {
 
 // --- DATABASE ---
 
-@Database(entities = [CallLog::class, ContactEntity::class, PagerEntry::class], version = 5)
+@Database(entities = [CallLog::class, ContactEntity::class, PagerEntry::class], version = 6)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun callLogDao(): CallLogDao
     abstract fun contactDao(): ContactDao

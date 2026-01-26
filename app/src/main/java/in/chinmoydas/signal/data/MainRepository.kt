@@ -150,4 +150,8 @@ class MainRepository(context: Context) {
     }
 
     suspend fun getPrincipalContacts() = contactDao.getPrincipalContacts()
+
+    suspend fun updateContactToken(name: String, token: String) {
+        db.contactDao().updateContactToken(name, token)
+    }
 }

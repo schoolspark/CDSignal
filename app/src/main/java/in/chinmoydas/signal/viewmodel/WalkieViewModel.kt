@@ -33,7 +33,8 @@ data class Contact(
     var ip: String,
     val isTrusted: Boolean = false,
     val savedCode: String = "",
-    val isPriority: Boolean = false
+    val isPriority: Boolean = false,
+    val fcmToken: String = ""
 )
 
 enum class ConnectionStatus {
@@ -150,12 +151,12 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         viewModelScope.launch {
             savedContacts.clear()
             savedContacts.addAll(repository.getAllContacts().map {
-                Contact(it.name, it.ip, true, it.savedCode, it.isPriority)
+                Contact(it.name, it.ip, true, it.savedCode, it.isPriority, it.fcmToken)
             })
 
             blockedContacts.clear()
             blockedContacts.addAll(repository.getBlockedContacts().map {
-                Contact(it.name, it.ip, true, it.savedCode, it.isPriority)
+                Contact(it.name, it.ip, true, it.savedCode, it.isPriority, it.fcmToken)
             })
 
             _callLogs.value = repository.getAllLogs()
@@ -550,4 +551,39 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
     fun performHealthCheck(context: Context, service: VoiceService?) =
         `in`.chinmoydas.signal.utils.SystemDiagnostics.runChecks(context, service)
+
+    fun sendCloudWakeUp(context: Context, contact: Contact) {
+        if (contact.fcmToken.isBlank()) {
+            android.widget.Toast.makeText(context, "No Cloud Token for this user", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // 1. Get my name
+                val myName = repository.myUsername.firstOrNull() ?: "Walkie User"
+
+                // 2. Call API via Retrofit
+                val response = `in`.chinmoydas.signal.RetrofitClient.api.sendWakeSignal(
+                    token = contact.fcmToken,
+                    sender = myName
+                )
+
+                // 3. Handle Result
+                withContext(Dispatchers.Main) {
+                    if (response.isSuccessful && response.body()?.status == "success") {
+                        android.widget.Toast.makeText(context, "Wake Signal Sent! ⚡", android.widget.Toast.LENGTH_SHORT).show()
+                    } else {
+                        val errorMsg = response.body()?.error ?: "Server Error: ${response.code()}"
+                        android.widget.Toast.makeText(context, errorMsg, android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                withContext(Dispatchers.Main) {
+                    android.widget.Toast.makeText(context, "Failed: Check Internet", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
 }

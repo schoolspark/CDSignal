@@ -23,10 +23,10 @@
             <InsightsFilterSettings>
               <option name="connection">
                 <ConnectionSetting>
-                  <option name="appId" value="PLACEHOLDER" />
-                  <option name="mobileSdkAppId" value="" />
-                  <option name="projectId" value="" />
-                  <option name="projectNumber" value="" />
+                  <option name="appId" value="in.chinmoydas.signal" />
+                  <option name="mobileSdkAppId" value="1:612501228378:android:1baa3d7d9c2a03daad4163" />
+                  <option name="projectId" value="cdsignal-22a45" />
+                  <option name="projectNumber" value="612501228378" />
                 </ConnectionSetting>
               </option>
               <option name="signal" value="SIGNAL_UNSPECIFIED" />
