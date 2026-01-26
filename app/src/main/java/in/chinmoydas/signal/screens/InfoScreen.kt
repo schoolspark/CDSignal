@@ -14,6 +14,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Policy
@@ -124,7 +125,6 @@ fun InfoScreen(navController: NavController) {
                     )
                     Spacer(Modifier.height(4.dp))
 
-                    // [UPDATED] Disclosure for Guardian Mode
                     Text(
                         "• Guardian Mode: Remote Control features (Mic/Location) are disabled by default. You must explicitly enable them in Profile settings.",
                         style = MaterialTheme.typography.bodySmall
@@ -134,6 +134,31 @@ fun InfoScreen(navController: NavController) {
                     Text(
                         "• Auto-Delete: Incoming Voice Pager messages are stored locally and automatically removed immediately after playback.",
                         style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // [NEW] AI Assistant Badge
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)) {
+                Column(Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.AutoAwesome, null, tint = MaterialTheme.colorScheme.onTertiaryContainer)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Offline Intelligence (CD-1)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onTertiaryContainer)
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "• Local AI: The 'Signal Assistant' runs entirely on your device. It does not send your queries to the cloud.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "• Smart Diagnostics: CD-1 can detect network errors and audio configuration issues in real-time to help you stay connected.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer
                     )
                 }
             }

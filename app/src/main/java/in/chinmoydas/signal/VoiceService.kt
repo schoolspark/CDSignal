@@ -682,8 +682,11 @@ class VoiceService : Service() {
     fun sendTextMessage(targetIp: String, message: String) {
         scope.launch(Dispatchers.IO) {
             try {
+                // 1. Prepare Payload (Same as before)
                 val rawPayload = "TXT:$message".toByteArray(Charsets.UTF_8)
                 val seqNum = (System.currentTimeMillis() % 1000000).toInt()
+
+                // 2. Encryption (Same as before)
                 val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
                 val isSecureMode = prefs.getBoolean("secure_mode", false)
                 val finalPayload = if (isSecureMode) {
@@ -693,6 +696,7 @@ class VoiceService : Service() {
                     CryptoEngine.encrypt(rawPayload, seqNum, secretKeySpec) ?: rawPayload
                 } else { rawPayload }
 
+                // 3. Construct Packet (Same as before)
                 val nameBytes = myUsername.toByteArray(Charsets.UTF_8)
                 val packetSize = 1 + nameBytes.size + 4 + finalPayload.size
                 val buffer = ByteBuffer.allocate(packetSize)
@@ -702,11 +706,17 @@ class VoiceService : Service() {
                 buffer.put(finalPayload)
                 val packetData = buffer.array()
 
-                val socket = DatagramSocket()
-                val address = InetAddress.getByName(targetIp)
-                val packet = DatagramPacket(packetData, packetData.size, address, 50005)
-                repeat(3) { socket.send(packet); delay(50) }
-                socket.close()
+                // [THE FIX] REUSE THE EXISTING NETWORK ENGINE
+                // Do NOT create a new DatagramSocket().
+                // Do NOT call socket.close().
+                // This sends data from Port 50005, keeping the router "door" open.
+
+                repeat(3) {
+                    // UDP_PORT is your constant 50005
+                    networkEngine.send(packetData, listOf(targetIp), UDP_PORT)
+                    delay(50)
+                }
+
             } catch (e: Exception) { e.printStackTrace() }
         }
     }
@@ -846,8 +856,28 @@ class VoiceService : Service() {
                                             if (loc != null) {
                                                 sendTextMessage(senderIp, "LOC:${loc.latitude},${loc.longitude}")
                                                 updateNotification("📍 LOCATION SHARED", "Sent to $senderName")
+                                            } else {
+                                                // [IMPROVEMENT] Tell the Guardian that GPS failed instead of staying silent
+                                                sendTextMessage(senderIp, "ERROR: No GPS Signal found")
                                             }
                                         }
+                                    }
+                                    // [NOTE] It is cleaner to use 'else if' here to keep the chain together,
+                                    // but a separate 'if' works fine too.
+                                    else if (cleanMessage == "CMD:REMOTE_RESTORE") {
+                                        // Reset Flags
+                                        isSilenced = false
+                                        isTheaterMode = false
+                                        _voiceServiceState.update { it.copy(isSilenced = false, isTheaterMode = false) }
+
+                                        // Reset Hardware
+                                        toggleSpeaker(true)
+                                        if (_voiceServiceState.value.isVoxEnabled) toggleVox(false)
+
+                                        // Confirm
+                                        speakText("Device restored to normal mode")
+                                        updateNotification("✅ RESTORED", "Reset by $senderName")
+                                        sendTextMessage(senderIp, "CONFIRM: Device Restored to Normal")
                                     }
                                 } else {
                                     scope.launch { SafetySignaling.triggerSecurityAlert(senderName) }

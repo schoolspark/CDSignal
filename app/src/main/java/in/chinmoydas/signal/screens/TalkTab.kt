@@ -62,7 +62,8 @@ fun TalkTab(
     modifier: Modifier = Modifier,
     viewModel: WalkieViewModel,
     service: VoiceService?,
-    onPermissionsGranted: () -> Unit
+    onPermissionsGranted: () -> Unit,
+    onCheckSystem: () -> Unit
 ) {
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsState()
@@ -170,6 +171,10 @@ fun TalkTab(
                     // Sync
                     IconButton(onClick = { service?.triggerHeartbeat(); viewModel.triggerPing(service); Toast.makeText(context, "Synced", Toast.LENGTH_SHORT).show() }) {
                         Icon(Icons.Default.Sync, "Sync", tint = MaterialTheme.colorScheme.primary)
+                    }
+                    // System Check
+                    IconButton(onClick = onCheckSystem) {
+                        Icon(Icons.Default.VerifiedUser, "System Check", tint = MaterialTheme.colorScheme.primary)
                     }
 
                     // Message
@@ -459,6 +464,21 @@ fun TalkTab(
                         Icon(Icons.Default.VolumeOff, null)
                         Spacer(Modifier.width(8.dp))
                         Text("FORCE SILENT MODE")
+                    }
+
+                    // Command 4: RESTORE
+                    OutlinedButton(
+                        onClick = {
+                            viewModel.sendTextPayload(service, "CMD:REMOTE_RESTORE")
+                            Toast.makeText(context, "Command Sent: RESTORE", Toast.LENGTH_SHORT).show()
+                            showGuardianControls = false
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF2E7D32)) // Green
+                    ) {
+                        Icon(Icons.Default.RestartAlt, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("RESTORE DEVICE (RESET)")
                     }
                 }
             },

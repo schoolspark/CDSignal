@@ -1,17 +1,18 @@
 package `in`.chinmoydas.signal.screens
 
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBars
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Help
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.navigation.NavController
@@ -31,11 +32,19 @@ fun HomeScreen(
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
 
+    // [NEW] State for Overlays
+    var showDiagnostics by remember { mutableStateOf(false) }
+    var showAssistant by remember { mutableStateOf(false) }
+
+    // [NEW] Auto-Run Diagnostics only once per session
+    var hasRunDiagnostics by rememberSaveable { mutableStateOf(false) }
+
     // Live count of nearby devices for the Badge
     val nearbyCount = viewModel.nearbyUsers.size
 
     Scaffold(
-        modifier = Modifier.navigationBarsPadding(),
+        // [FIX] Removed navigationBarsPadding() to prevent double-padding/gaps.
+        // contentWindowInsets handles the edge-to-edge layout correctly.
         containerColor = MaterialTheme.colorScheme.surfaceVariant,
         topBar = {
             CenterAlignedTopAppBar(
@@ -60,6 +69,19 @@ fun HomeScreen(
                     }
                 }
             )
+        },
+        // [FIX] Pinned AI Button to Bottom-Left to avoid overlapping Call/SOS buttons
+        floatingActionButtonPosition = FabPosition.Start,
+        floatingActionButton = {
+            if (selectedTab == 0) {
+                FloatingActionButton(
+                    onClick = { showAssistant = true },
+                    containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                    contentColor = MaterialTheme.colorScheme.onTertiaryContainer
+                ) {
+                    Icon(Icons.Default.AutoAwesome, "AI Assistant")
+                }
+            }
         },
         bottomBar = {
             NavigationBar {
@@ -106,17 +128,50 @@ fun HomeScreen(
 
         val contentModifier = Modifier.padding(innerPadding)
 
+        // [NEW] Automatic Readiness Check (Runs once when Service is ready)
+        if (!hasRunDiagnostics && service != null) {
+            SystemReadinessDialog(
+                viewModel = viewModel,
+                service = service,
+                onDismiss = { hasRunDiagnostics = true }
+            )
+        }
+
+        // [NEW] Manual Readiness Check (Triggered by Button)
+        if (showDiagnostics) {
+            SystemReadinessDialog(
+                viewModel = viewModel,
+                service = service,
+                onDismiss = { showDiagnostics = false }
+            )
+        }
+
+        // [NEW] AI Assistant Sheet
+        if (showAssistant) {
+            ModalBottomSheet(
+                onDismissRequest = { showAssistant = false },
+                sheetState = rememberModalBottomSheetState()
+            ) {
+                AssistantSheet(
+                    viewModel = viewModel,
+                    service = service,
+                    onDismiss = { showAssistant = false }
+                )
+            }
+        }
+
         when (selectedTab) {
             0 -> TalkTab(
                 modifier = contentModifier,
                 viewModel = viewModel,
                 service = service,
-                onPermissionsGranted = onPermissionsGranted
+                onPermissionsGranted = onPermissionsGranted,
+                onCheckSystem = { showDiagnostics = true }
             )
             1 -> HistoryTab(
                 modifier = contentModifier,
                 viewModel = viewModel,
-                service = service // [FIXED] Now passing the required service parameter
+                service = service
             )
             2 -> ConnectTab(
                 modifier = contentModifier,

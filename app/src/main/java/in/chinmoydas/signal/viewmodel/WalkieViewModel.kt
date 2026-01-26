@@ -547,4 +547,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
             it.startService(intent)
         }
     }
+
+    fun performHealthCheck(context: Context, service: VoiceService?) =
+        `in`.chinmoydas.signal.utils.SystemDiagnostics.runChecks(context, service)
 }

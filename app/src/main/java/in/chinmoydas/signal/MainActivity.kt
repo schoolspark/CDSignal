@@ -107,7 +107,7 @@ class MainActivity : ComponentActivity() {
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
 
-        requestBatteryOptimizationExemption()
+        checkBatteryOptimizations()
 
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT),
@@ -312,16 +312,25 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requestBatteryOptimizationExemption() {
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-            try {
-                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                    data = Uri.parse("package:$packageName")
+    private fun checkBatteryOptimizations() {
+        // 1. Safety Check: Only run on Android 6.0+ (API 23+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+
+            // 2. Check if we already have the exemption
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                try {
+                    // 3. Request the exemption
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                } catch (e: Exception) {
+                    // 4. Crash Protection: Some manufacturers (e.g., Xiaomi/Huawei)
+                    // remove this standard Intent, causing a crash without this catch block.
+                    Log.e("MainActivity", "Failed to launch Battery Optimization settings", e)
+                    Toast.makeText(this, "Please manually disable Battery Saver for this app", Toast.LENGTH_LONG).show()
                 }
-                startActivity(intent)
-            } catch (e: Exception) {
-                Log.e("MainActivity", "Battery optimization request failed", e)
             }
         }
     }
