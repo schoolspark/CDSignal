@@ -6,8 +6,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+
+// Move Enum here so it's accessible globally
+enum class CallStatus { Idle, Ringing, Dialing, Active }
 
 object CallSignaling {
 
@@ -19,8 +25,11 @@ object CallSignaling {
     const val CMD_END = "CMD:CALL_END"
     const val CMD_BUSY = "CMD:CALL_BUSY"
 
-    // [CRITICAL FIX] replay = 1 ensures the UI (CallScreen) never misses an event,
-    // even if it initializes slightly after the event was emitted.
+    // [FIX] Persistent State (Source of Truth)
+    private val _callStatus = MutableStateFlow(CallStatus.Idle)
+    val callStatus: StateFlow<CallStatus> = _callStatus.asStateFlow()
+
+    // Keep events for one-shot triggers (like sounds or toasts)
     private val _callEvents = MutableSharedFlow<CallEvent>(replay = 1)
     val callEvents: SharedFlow<CallEvent> = _callEvents
 
@@ -43,11 +52,13 @@ object CallSignaling {
                 } else {
                     isBusy = true
                     currentCallerIp = senderIp
+                    _callStatus.value = CallStatus.Ringing // [FIX] Update State
                     _callEvents.emit(CallEvent.IncomingCall(senderIp))
                 }
             }
             CMD_ACC -> {
                 callTimeoutJob?.cancel()
+                _callStatus.value = CallStatus.Active // [FIX] Update State
                 _callEvents.emit(CallEvent.CallConnected)
                 CallEngine.startCall(senderIp)
             }
@@ -72,7 +83,6 @@ object CallSignaling {
 
     private fun sendSignal(cmd: String, ip: String) {
         scope.launch(Dispatchers.IO) {
-            // [ROBUSTNESS] 5x Redundancy ensures signal delivery on weak 4G networks
             repeat(5) {
                 sendUdpTextFunction?.invoke(cmd, ip)
                 delay(40)
@@ -84,17 +94,17 @@ object CallSignaling {
         if (isBusy) return
         isBusy = true
         currentCallerIp = ip
-        sendSignal(CMD_REQ, ip)
 
-        // Emitting immediately triggers the "Dialing" UI
+        // [FIX] Set State IMMEDIATELY
+        _callStatus.value = CallStatus.Dialing
+
+        sendSignal(CMD_REQ, ip)
         scope.launch { _callEvents.emit(CallEvent.OutgoingCall(ip)) }
 
-        // [FIX] Robust Timeout: Cancels remote ring if no answer after 30s
         callTimeoutJob?.cancel()
         callTimeoutJob = scope.launch {
             delay(30_000)
             if (isBusy && !CallEngine.isCallActive) {
-                Log.d(TAG, "Call timed out - cancelling remote")
                 sendSignal(CMD_END, ip)
                 _callEvents.emit(CallEvent.CallEnded)
                 reset()
@@ -105,6 +115,7 @@ object CallSignaling {
     fun acceptCall() {
         val ip = currentCallerIp ?: return
         isBusy = true
+        _callStatus.value = CallStatus.Active // [FIX] Update State
         sendSignal(CMD_ACC, ip)
         scope.launch { _callEvents.emit(CallEvent.CallConnected) }
         CallEngine.startCall(ip)
@@ -113,8 +124,6 @@ object CallSignaling {
     fun declineCall() {
         val ip = currentCallerIp
         if (ip != null) sendSignal(CMD_REJ, ip)
-        // [FIX] Force UI update even if state was partial
-        _callEvents.tryEmit(CallEvent.CallRejected)
         reset()
     }
 
@@ -131,6 +140,7 @@ object CallSignaling {
         isBusy = false
         currentCallerIp = null
         callTimeoutJob?.cancel()
+        _callStatus.value = CallStatus.Idle // [FIX] Reset State
     }
 
     sealed class CallEvent {

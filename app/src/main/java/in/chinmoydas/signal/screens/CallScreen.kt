@@ -33,6 +33,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import `in`.chinmoydas.signal.utils.CallEngine
 import `in`.chinmoydas.signal.utils.CallSignaling
+import `in`.chinmoydas.signal.utils.CallStatus
 import kotlinx.coroutines.delay
 
 @Composable
@@ -41,49 +42,34 @@ fun CallOverlay(
     onSpeakerToggle: () -> Unit,
     isSpeakerOn: Boolean
 ) {
-    var callState by remember { mutableStateOf<CallState>(CallState.Idle) }
+    // [FIX] Observe Global State directly (Single Source of Truth)
+    val callState by CallSignaling.callStatus.collectAsState()
+
+    // Track caller IP for name resolution
     var callerIp by remember { mutableStateOf("") }
 
-    // [FIX] Audio Feedback System (Rings/Dialtone)
+    // [FIX] Update callerIp when state changes to Ringing/Dialing
+    LaunchedEffect(callState) {
+        if (callState == CallStatus.Ringing || callState == CallStatus.Dialing) {
+            CallSignaling.currentCallerIp?.let { callerIp = it }
+        }
+    }
+
     SoundEffectManager(callState = callState)
 
     val displayName = remember(callerIp) {
         if (callerIp.isNotEmpty()) nameResolver(callerIp) else "Unknown"
     }
 
-    LaunchedEffect(Unit) {
-        // Collects events. Since we use replay=1, we immediately get the current state.
-        CallSignaling.callEvents.collect { event ->
-            when (event) {
-                is CallSignaling.CallEvent.IncomingCall -> {
-                    callerIp = event.ip
-                    callState = CallState.Ringing
-                }
-                is CallSignaling.CallEvent.OutgoingCall -> {
-                    callerIp = event.ip
-                    callState = CallState.Dialing
-                }
-                is CallSignaling.CallEvent.CallConnected -> {
-                    callState = CallState.Active
-                }
-                is CallSignaling.CallEvent.CallEnded,
-                is CallSignaling.CallEvent.CallRejected,
-                is CallSignaling.CallEvent.CallBusy -> {
-                    callState = CallState.Idle
-                }
-            }
-        }
-    }
-
     AnimatedVisibility(
-        visible = callState != CallState.Idle,
+        visible = callState != CallStatus.Idle,
         enter = slideInVertically { it } + fadeIn(),
         exit = slideOutVertically { it } + fadeOut()
     ) {
         when (callState) {
-            CallState.Ringing -> IncomingCallDialog(displayName, { CallSignaling.acceptCall() }, { CallSignaling.declineCall() })
-            CallState.Dialing -> DialingDialog(displayName, { CallSignaling.endCall() })
-            CallState.Active -> ActiveCallScreen(
+            CallStatus.Ringing -> IncomingCallDialog(displayName, { CallSignaling.acceptCall() }, { CallSignaling.declineCall() })
+            CallStatus.Dialing -> DialingDialog(displayName, { CallSignaling.endCall() })
+            CallStatus.Active -> ActiveCallScreen(
                 callerName = displayName,
                 isSpeakerOn = isSpeakerOn,
                 onSpeakerToggle = onSpeakerToggle,
@@ -96,7 +82,7 @@ fun CallOverlay(
 
 // [FIX] Plays Ringtone or Dialtone based on state
 @Composable
-fun SoundEffectManager(callState: CallState) {
+fun SoundEffectManager(callState: CallStatus) {
     val context = LocalContext.current
 
     DisposableEffect(callState) {
@@ -104,7 +90,7 @@ fun SoundEffectManager(callState: CallState) {
         var toneGenerator: ToneGenerator? = null
 
         when (callState) {
-            CallState.Ringing -> {
+            CallStatus.Ringing -> {
                 try {
                     val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
                     ringtone = RingtoneManager.getRingtone(context, uri)
@@ -114,7 +100,7 @@ fun SoundEffectManager(callState: CallState) {
                     ringtone.play()
                 } catch (e: Exception) { e.printStackTrace() }
             }
-            CallState.Dialing -> {
+            CallStatus.Dialing -> {
                 try {
                     toneGenerator = ToneGenerator(AudioManager.STREAM_VOICE_CALL, 80)
                     toneGenerator.startTone(ToneGenerator.TONE_SUP_RINGTONE)
@@ -184,11 +170,12 @@ fun ActiveCallScreen(
             Spacer(Modifier.height(64.dp))
 
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                // [FIX] Mute button wired to Engine
-                var isMuted by remember { mutableStateOf(false) }
+
+                // [FIX] Observe Real Engine State
+                val isMuted by CallEngine.muteStatus.collectAsState()
+
                 IconButton(onClick = {
-                    isMuted = !isMuted
-                    CallEngine.toggleMute(isMuted)
+                    CallEngine.toggleMute() // Toggle Singleton
                 }, modifier = Modifier.size(56.dp).background(if(isMuted) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.surfaceVariant, CircleShape)) {
                     Icon(if (isMuted) Icons.Default.MicOff else Icons.Default.Mic, null)
                 }
@@ -197,7 +184,7 @@ fun ActiveCallScreen(
                     Icon(Icons.Default.CallEnd, null, modifier = Modifier.size(32.dp))
                 }
 
-                // [FIX] Speaker button wired to Service/Activity
+                // Speaker logic was already correct (wired to Service)
                 IconButton(onClick = onSpeakerToggle, modifier = Modifier.size(56.dp).background(if(isSpeakerOn) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant, CircleShape)) {
                     Icon(if (isSpeakerOn) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff, null)
                 }
@@ -229,5 +216,3 @@ fun CallTimer() {
     }
     Text("%02d:%02d".format(seconds / 60, seconds % 60), style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary)
 }
-
-enum class CallState { Idle, Ringing, Dialing, Active }

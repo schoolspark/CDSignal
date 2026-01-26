@@ -862,6 +862,12 @@ class VoiceService : Service() {
                             }
 
                             if (cleanMessage.startsWith("CMD:CALL")) {
+
+                                // [BATTERY FIX] Wake Screen ONLY for Call Requests (Ringing)
+                                if (cleanMessage == "CMD:CALL_REQ") {
+                                    showIncomingCallNotification(senderName)
+                                }
+
                                 scope.launch { CallSignaling.handlePacket(cleanMessage, senderIp) }
                                 return
                             }
@@ -1094,7 +1100,18 @@ class VoiceService : Service() {
         val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
         dataSaverEnabled = prefs.getBoolean("data_saver", false)
         val isGroupCall = ips.size > 1
-        val shouldCompress = isGroupCall || (!isOnWifi && dataSaverEnabled)
+
+        // [LOGIC FIX]
+        // 1. Group Calls: ALWAYS Compress (Bandwidth is shared, sending Raw is dangerous).
+        // 2. Mobile Data: Compress IF the user asked for "Data Saver".
+        // 3. WiFi: User gets "Crystal Clear" (Raw) unless they manually forced Data Saver.
+
+        val shouldCompress = if (isGroupCall) {
+            true // Force compression for groups to prevent lag
+        } else {
+            // P2P Call: Obey the toggle + Network Status
+            !isOnWifi && dataSaverEnabled
+        }
         val isSecureMode = prefs.getBoolean("secure_mode", false)
         val secretKey = if (isSecureMode) getEncryptionKey() else null
 
@@ -1180,23 +1197,32 @@ class VoiceService : Service() {
 
     private fun handleIncomingSignal(callerName: String, isPriority: Boolean = false) {
         val currentTime = System.currentTimeMillis()
+
+        // Logic: Only update state if it's a new burst (>3s silence) or Priority
         if (!isReceiving || (currentTime - lastReceiveTime > 3000) || isPriority) {
             acquireResources()
             isReceiving = true
+
+            // Update internal state
+            _voiceServiceState.update { it.copy(incomingCall = callerName, incomingIp = lastIncomingIp) }
+
+            // [BATTERY FIX] DO NOT WAKE SCREEN HERE.
+            // Just update the notification bar so they see who is talking if they look.
             val status = if (isPriority) "⚠️ PRIORITY: $callerName" else if (isSilenced) "Missed: $callerName" else "Incoming: $callerName"
             updateNotification(status, callerName)
+
+            // Vibrate if needed (Haptic feedback for "Incoming Voice")
             if (!isSilenced || isPriority) vibrate()
-            _voiceServiceState.update { it.copy(incomingCall = callerName, incomingIp = lastIncomingIp) }
         }
+
         lastReceiveTime = currentTime
+
+        // Keep the session alive for 5 seconds of silence
         resetJob?.cancel()
         resetJob = scope.launch {
             delay(5000)
             if (isReceiving) {
-                isReceiving = false
-                releaseResourcesIfNeeded()
-                updateNotification("Listening...", null)
-                _voiceServiceState.update { it.copy(incomingCall = null, networkStatus = "Listening...") }
+                stopReceiving()
             }
         }
     }
@@ -1205,10 +1231,19 @@ class VoiceService : Service() {
         ignoredSender = lastIncomingIp
         isReceiving = false
         resetJob?.cancel()
+
         _voiceServiceState.update { it.copy(incomingCall = null, networkStatus = "Listening...") }
         updateNotification("Listening...", null)
+
+        // [NEW] Clear the Call Notification
+        getSystemService(NotificationManager::class.java).cancel(2)
+
         releaseResourcesIfNeeded()
-        scope.launch { delay(IGNORE_SENDER_DELAY); ignoredSender = null }
+
+        scope.launch {
+            delay(IGNORE_SENDER_DELAY)
+            ignoredSender = null
+        }
     }
 
     private fun createNotificationChannel() {
@@ -1277,6 +1312,46 @@ class VoiceService : Service() {
             .addAction(exitAction)
             .setStyle(androidx.media.app.NotificationCompat.MediaStyle().setShowActionsInCompactView(0, 1, 2))
             .build()
+    }
+
+    // [NEW] High Priority Notification that wakes the screen
+    private fun showIncomingCallNotification(callerName: String) {
+        // 1. Create the Intent to open MainActivity
+        val fullScreenIntent = Intent(this, MainActivity::class.java).apply {
+            action = "INCOMING_CALL"
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra("auto_connect_channel", callerName) // Optional: Pass caller info
+        }
+
+        val fullScreenPendingIntent = PendingIntent.getActivity(
+            this,
+            111,
+            fullScreenIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        // 2. Build the Notification
+        val notificationBuilder = NotificationCompat.Builder(this, "VoiceChannel")
+            .setSmallIcon(R.mipmap.ic_launcher_foreground)
+            .setContentTitle("Incoming Call")
+            .setContentText(callerName)
+            .setPriority(NotificationCompat.PRIORITY_MAX) // MAX is required for pop-up
+            .setCategory(NotificationCompat.CATEGORY_CALL) // Critical for DND bypass
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC) // Show on lock screen
+            .setAutoCancel(true)
+            .setFullScreenIntent(fullScreenPendingIntent, true) // <--- THE KEY LINE
+            .setOngoing(true)
+
+            // Add an "Answer" button directly in the notification banner
+            .addAction(
+                android.R.drawable.ic_menu_call,
+                "Open",
+                fullScreenPendingIntent
+            )
+
+        // 3. Fire it! (Using ID 2 to separate it from the persistent service ID 1)
+        val notificationManager = getSystemService(NotificationManager::class.java)
+        notificationManager.notify(2, notificationBuilder.build())
     }
 
     override fun onDestroy() {

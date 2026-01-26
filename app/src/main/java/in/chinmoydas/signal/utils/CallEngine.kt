@@ -16,6 +16,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -33,14 +36,16 @@ object CallEngine {
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
 
-    // [FIX] Full Audio Processing Stack
     private var echoCanceler: AcousticEchoCanceler? = null
     private var noiseSuppressor: NoiseSuppressor? = null
     private var autoGainControl: AutomaticGainControl? = null
 
     var isCallActive = false
         private set
-    var isMuted = false
+
+    // [FIX] StateFlow for UI Synchronization
+    private val _muteStatus = MutableStateFlow(false)
+    val muteStatus: StateFlow<Boolean> = _muteStatus.asStateFlow()
 
     private var recordJob: Job? = null
     private var playJob: Job? = null
@@ -55,7 +60,9 @@ object CallEngine {
 
         targetIp = ip
         isCallActive = true
-        isMuted = false
+
+        // [FIX] Always start unmuted
+        _muteStatus.value = false
 
         try {
             callSocket = DatagramSocket(CALL_PORT)
@@ -109,6 +116,7 @@ object CallEngine {
         Log.d(TAG, "Stopping Call Engine")
 
         isCallActive = false
+        _muteStatus.value = false // Reset UI
         recordJob?.cancel()
         playJob?.cancel()
 
@@ -137,7 +145,8 @@ object CallEngine {
             val buffer = ByteArray(bufSize)
 
             while (isActive && isCallActive) {
-                if (isMuted) {
+                // [FIX] Read directly from StateFlow
+                if (_muteStatus.value) {
                     Arrays.fill(buffer, 0)
                     try {
                         callSocket?.send(DatagramPacket(buffer, buffer.size, address, CALL_PORT))
@@ -171,7 +180,7 @@ object CallEngine {
         }
     }
 
-    fun toggleMute(mute: Boolean) {
-        isMuted = mute
+    fun toggleMute() {
+        _muteStatus.value = !_muteStatus.value
     }
 }

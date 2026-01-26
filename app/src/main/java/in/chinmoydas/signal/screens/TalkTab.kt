@@ -148,15 +148,17 @@ fun TalkTab(
                     }
                     Text(if (isSecureMode) "Encrypted Channel" else "Public Channel", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
 
-                    // Only show if: Target Selected + OFFLINE + We have a Token
-                    if (viewModel.targetUser.isNotEmpty() &&
-                        viewModel.connectionStatus == ConnectionStatus.OFFLINE &&
-                        !viewModel.isBroadcastMode) {
+                    // [UPDATED] Permanent Cloud Wake/Ping Button
+                    // Shows whenever a Target is selected + Not in Broadcast Mode
+                    if (viewModel.targetUser.isNotEmpty() && !viewModel.isBroadcastMode) {
 
                         val targetContact = viewModel.savedContacts.find { it.name == viewModel.targetUser }
+                        // Check if we have a token (allow the button even if status is 'Ready' just in case)
                         val hasToken = targetContact?.fcmToken?.isNotBlank() == true
 
                         if (hasToken) {
+                            val isOffline = viewModel.connectionStatus == ConnectionStatus.OFFLINE
+
                             Spacer(modifier = Modifier.height(12.dp))
                             Button(
                                 onClick = {
@@ -164,16 +166,22 @@ fun TalkTab(
                                         viewModel.sendCloudWakeUp(context, targetContact)
                                     }
                                 },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFA000)), // Amber
+                                // Amber for Wake (Offline), Grey for Ping (Online)
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = if (isOffline) Color(0xFFFFA000) else Color.LightGray,
+                                    contentColor = if (isOffline) Color.Black else Color.DarkGray
+                                ),
                                 shape = RoundedCornerShape(8.dp),
                                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
                             ) {
                                 Icon(Icons.Default.Bolt, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(8.dp))
-                                Text("WAKE DEVICE (CLOUD)", fontWeight = FontWeight.Bold)
+                                Text(if (isOffline) "WAKE DEVICE (CLOUD)" else "SEND CLOUD PING", fontWeight = FontWeight.Bold)
                             }
+
+                            // Helper text below button
                             Text(
-                                "Target is offline. Tap to wake them up.",
+                                if (isOffline) "Target is offline. Tap to wake them." else "Target is online. Tap to ping.",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = Color.Gray,
                                 fontSize = 10.sp,
@@ -181,7 +189,6 @@ fun TalkTab(
                             )
                         }
                     }
-                    // [END NEW CODE]
                 }
             }
 

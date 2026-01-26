@@ -563,10 +563,10 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                 // 1. Get my name
                 val myName = repository.myUsername.firstOrNull() ?: "Walkie User"
 
-                // 2. Call API via Retrofit
-                val response = `in`.chinmoydas.signal.RetrofitClient.api.sendWakeSignal(
-                    token = contact.fcmToken,
-                    sender = myName
+                // 2. Call via Repository (NEW - CORRECT)
+                val response = repository.sendWakeSignal(
+                    senderName = myName,
+                    targetToken = contact.fcmToken
                 )
 
                 // 3. Handle Result

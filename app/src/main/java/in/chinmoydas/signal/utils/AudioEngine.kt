@@ -41,7 +41,7 @@ class AudioEngine(context: Context) {
     }
     private val jitterBuffer = PriorityQueue<AudioPacket>()
     private var lastPlayedSeq = -1
-    private val BUFFER_THRESHOLD = 3
+    private val BUFFER_THRESHOLD = 8
     private val FRAME_SIZE = 640
     private val NOISE_GATE_THRESHOLD = 150
     private val GAIN_LIMIT_THRESHOLD = 28000
@@ -73,7 +73,11 @@ class AudioEngine(context: Context) {
                     var packetToPlay: AudioPacket? = null
                     synchronized(jitterBuffer) {
                         if (jitterBuffer.isNotEmpty()) {
-                            if (lastPlayedSeq != -1 || jitterBuffer.size >= BUFFER_THRESHOLD) packetToPlay = jitterBuffer.poll()
+                            // [FIX] Strict buffering: Don't play until we have enough packets (BUFFER_THRESHOLD)
+                            // This prevents the "Robotic Start" effect.
+                            if (lastPlayedSeq != -1 || jitterBuffer.size >= BUFFER_THRESHOLD) {
+                                packetToPlay = jitterBuffer.poll()
+                            }
                         }
                     }
 
@@ -94,19 +98,24 @@ class AudioEngine(context: Context) {
     fun writeAudio(seq: Int, data: ByteArray) {
         if (!isPlaying.get()) return
 
-        // FIX: Allow for Network Padding (Garbage bytes added by carrier).
-        // Compressed (640) + Padding (up to 100 bytes) -> Treat as Compressed.
-        // Raw (1280) -> Treat as Raw.
+        // [FIX] Robust Packet Handling
+        // Compressed (G711): 640 bytes (plus reasonable overhead up to 800)
+        // Raw (PCM): 1280 bytes (plus overhead up to 1400)
 
-        val pcmData = if (data.size >= FRAME_SIZE && data.size < FRAME_SIZE + 100) {
-            // It IS compressed, but might have garbage at the end.
-            // G711.decode only reads the first 'length' bytes, so we pass FRAME_SIZE (640).
-            G711.decode(data, FRAME_SIZE)
+        val pcmData = if (data.size < 1000) {
+            // Treat anything under 1000 bytes as Compressed (G711)
+            try {
+                G711.decode(data, FRAME_SIZE)
+            } catch (e: Exception) {
+                return // Drop bad packet
+            }
         } else {
-            data // Treat as Raw (1280 bytes)
+            // Treat anything large as Raw Audio ("Crystal Clear")
+            data
         }
 
         synchronized(jitterBuffer) {
+            // [FIX] Cap the buffer size prevents infinite latency if network freezes
             if (jitterBuffer.size > 50) jitterBuffer.clear()
             jitterBuffer.offer(AudioPacket(seq, pcmData))
         }

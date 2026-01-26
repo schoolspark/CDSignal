@@ -154,4 +154,7 @@ class MainRepository(context: Context) {
     suspend fun updateContactToken(name: String, token: String) {
         db.contactDao().updateContactToken(name, token)
     }
+
+    suspend fun sendWakeSignal(senderName: String, targetToken: String) =
+        RetrofitClient.api.sendWakeSignal(targetToken, senderName)
 }
