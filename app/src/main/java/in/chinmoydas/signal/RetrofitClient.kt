@@ -1,6 +1,7 @@
 package `in`.chinmoydas.signal
 
 import okhttp3.OkHttpClient
+import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.Field
@@ -28,7 +29,8 @@ data class PeerResponse(
     val status: String,
     val ip: String?,
     val local_ip: String?,
-    val port: Int?
+    val port: Int?,
+    val fcm_token: String? // Added this field
 )
 
 data class ChannelUser(
@@ -45,6 +47,12 @@ data class ChannelResponse(
 data class ResetResponse(
     val status: String,
     val new_code: String?
+)
+
+data class GenericResponse(
+    val status: String,
+    val message: String?,
+    val error: String?
 )
 
 // [CRITICAL UPDATE START]
@@ -122,15 +130,51 @@ interface ApiService {
     @FormUrlEncoded
     @POST("api/fcm_wake.php")
     suspend fun sendWakeSignal(
+        @Header("Authorization") authHeader: String, // Added Auth Header
         @Field("target_token") token: String,
         @Field("sender_name") sender: String
     ): retrofit2.Response<WakeResponse>
+
+    @FormUrlEncoded
+    @POST("api/reset_auth.php")
+    suspend fun requestOtp(
+        @Field("action") action: String = "request_otp",
+        @Field("username") username: String
+    ): GenericResponse
+
+    @FormUrlEncoded
+    @POST("api/reset_auth.php")
+    suspend fun resetPassword(
+        @Field("action") action: String = "reset_pass",
+        @Field("username") username: String,
+        @Field("otp") otp: String,
+        @Field("new_password") pass: String
+    ): GenericResponse
+
+    @FormUrlEncoded
+    @POST("api/update_fcm.php")
+    suspend fun updateFcmToken(
+        @Header("Authorization") token: String,
+        @Field("fcm_token") fcmToken: String
+    ): retrofit2.Response<Unit>
+
+    @FormUrlEncoded
+    @POST("api/update_email.php")
+    suspend fun updateRecoveryEmail(
+        @Header("Authorization") authHeader: String,
+        @Field("email") email: String
+    ): retrofit2.Response<GenericResponse>
 }
 
 object RetrofitClient {
     private const val BASE_URL = "https://signal.chinmoydas.in/"
 
+    private val logging = HttpLoggingInterceptor().apply {
+        level = HttpLoggingInterceptor.Level.BODY // See everything: URL, Headers, Body
+    }
+
     private val okHttpClient = OkHttpClient.Builder()
+        .addInterceptor(logging)
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
         .writeTimeout(10, TimeUnit.SECONDS)

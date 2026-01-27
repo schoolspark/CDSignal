@@ -7,6 +7,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import androidx.core.content.ContextCompat
 import `in`.chinmoydas.signal.VoiceService
+import `in`.chinmoydas.signal.RetrofitClient
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.flow
 
@@ -28,9 +29,10 @@ object SystemDiagnostics {
         val hasMic = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         if (!hasMic) {
             emit(DiagnosticItem("Microphone Access Denied", DiagnosticStatus.Failure, "Grant permission in Settings"))
-            return@flow
+            // We don't return@flow here to allow checking other systems (like server conn) even if mic is off
+        } else {
+            emit(DiagnosticItem("Audio System Secure", DiagnosticStatus.Success))
         }
-        emit(DiagnosticItem("Audio System Secure", DiagnosticStatus.Success))
 
         // 2. Radio Bind (Critical)
         emit(DiagnosticItem("Checking Radio Ports", DiagnosticStatus.Running))
@@ -41,11 +43,10 @@ object SystemDiagnostics {
             emit(DiagnosticItem("Port 50005 Bound", DiagnosticStatus.Success))
         } else {
             emit(DiagnosticItem("Radio Bind Failed", DiagnosticStatus.Failure, "Restart App"))
-            return@flow
         }
 
-        // 3. Network Transport (Hybrid Check)
-        emit(DiagnosticItem("Checking Cloud Link", DiagnosticStatus.Running))
+        // 3. Network Transport
+        emit(DiagnosticItem("Checking Connectivity", DiagnosticStatus.Running))
         delay(400)
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val hasNet = cm.activeNetwork?.let {
@@ -58,10 +59,45 @@ object SystemDiagnostics {
             emit(DiagnosticItem("Offline Mode Active", DiagnosticStatus.Warning, "Local Range Only"))
         }
 
-        // 4. Guardian Services (Config Check)
+        // 4. CLOUD WAKE TOKEN (New & Critical for Internet Calls)
+        emit(DiagnosticItem("Cloud Wake Service", DiagnosticStatus.Running))
+        delay(500)
+        val prefs = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
+        val token = prefs.getString("my_fcm_token", "")
+
+        // Google Play Services Check
+        val googleApi = com.google.android.gms.common.GoogleApiAvailability.getInstance()
+        val resultCode = googleApi.isGooglePlayServicesAvailable(context)
+
+        if (resultCode != com.google.android.gms.common.ConnectionResult.SUCCESS) {
+            emit(DiagnosticItem("Cloud Wake Service", DiagnosticStatus.Failure, "Google Play Services Missing"))
+        } else if (token.isNullOrBlank()) {
+            // This catches the "Fresh Install" bug we just fixed
+            emit(DiagnosticItem("Cloud Wake Service", DiagnosticStatus.Failure, "Token Missing. Relogin required."))
+        } else {
+            val shortToken = token.take(6) + "..."
+            emit(DiagnosticItem("Cloud Wake Service", DiagnosticStatus.Success, "Active ($shortToken)"))
+        }
+
+        // 5. SERVER HEARTBEAT (New)
+        emit(DiagnosticItem("Server Link", DiagnosticStatus.Running))
+        delay(500)
+        val jwt = prefs.getString("jwt_token", "")
+        if (jwt.isNullOrEmpty() || jwt == "OFFLINE_TOKEN") {
+            emit(DiagnosticItem("Server Link", DiagnosticStatus.Warning, "Offline Login Mode"))
+        } else {
+            try {
+                // Lightweight ping to ensure API is reachable and JWT is valid
+                RetrofitClient.api.checkSignals("Bearer $jwt")
+                emit(DiagnosticItem("Server Link", DiagnosticStatus.Success, "Connected"))
+            } catch (e: Exception) {
+                emit(DiagnosticItem("Server Link", DiagnosticStatus.Failure, "Unreachable (Check Internet)"))
+            }
+        }
+
+        // 6. Guardian Services (Config Check)
         emit(DiagnosticItem("Scanning Guardian Services", DiagnosticStatus.Running))
         delay(300)
-        val prefs = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
         val remoteAllowed = prefs.getBoolean("allow_remote_control", false)
 
         if (remoteAllowed) {

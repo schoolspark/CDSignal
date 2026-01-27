@@ -2,6 +2,8 @@ package `in`.chinmoydas.signal.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
+import `in`.chinmoydas.signal.GenericResponse
 import `in`.chinmoydas.signal.RetrofitClient
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -82,10 +84,13 @@ class MainRepository(context: Context) {
         return contactDao.getAllContacts().find { it.ip == ip }
     }
 
-    suspend fun saveContact(name: String, ip: String, code: String) {
+    // Inside MainRepository.kt
+
+    suspend fun saveContact(name: String, ip: String, code: String, fcmToken: String = "") {
         val isBlocked = contactDao.isBlocked(name) // Preserve Block Status
-        contactDao.insert(ContactEntity(name, ip, code, isBlocked = isBlocked))
-        triggerConfigRefresh() // Normal save triggers a refresh
+        // [FIX] Pass the fcmToken into the Entity
+        contactDao.insert(ContactEntity(name, ip, code, isBlocked = isBlocked, fcmToken = fcmToken))
+        triggerConfigRefresh()
     }
 
     // Silent Update: Updates IP without triggering UI refresh
@@ -155,6 +160,29 @@ class MainRepository(context: Context) {
         db.contactDao().updateContactToken(name, token)
     }
 
-    suspend fun sendWakeSignal(senderName: String, targetToken: String) =
-        RetrofitClient.api.sendWakeSignal(targetToken, senderName)
+    suspend fun sendWakeSignal(authHeader: String, senderName: String, targetToken: String) =
+        RetrofitClient.api.sendWakeSignal(authHeader, targetToken, senderName)
+
+
+    suspend fun syncFcmTokenToServer() {
+        val token = prefs.getString("my_fcm_token", null) ?: return
+        if (token == null) {
+            Log.w("FCM_DEBUG", "Skipping Sync: No FCM Token found in SharedPreferences yet.")
+            return
+        }
+        val jwt = getToken() ?: return
+
+        try {
+            RetrofitClient.api.updateFcmToken("Bearer $jwt", token)
+            Log.d("FCM", "Token synced to server successfully")
+        } catch (e: Exception) {
+            Log.e("FCM", "Failed to sync token: ${e.message}")
+        }
+    }
+
+    suspend fun updateRecoveryEmail(email: String): retrofit2.Response<GenericResponse> {
+        val jwt = getToken() ?: throw Exception("Not logged in")
+        // Uses the function you defined in RetrofitClient
+        return RetrofitClient.api.updateRecoveryEmail("Bearer $jwt", email)
+    }
 }

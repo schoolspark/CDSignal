@@ -17,6 +17,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -31,7 +32,10 @@ import `in`.chinmoydas.signal.viewmodel.LoginViewModel
 fun LoginScreen(navController: NavController, prefs: SharedPreferences, viewModel: LoginViewModel = viewModel()) {
     LaunchedEffect(Unit) { viewModel.loadLastUser(prefs) }
 
-    // State for password visibility
+    // Required for potential server token synchronization or context-based alerts
+    val context = LocalContext.current
+
+    // State for password visibility in the main login form
     var passwordVisible by remember { mutableStateOf(false) }
 
     Box(
@@ -53,7 +57,7 @@ fun LoginScreen(navController: NavController, prefs: SharedPreferences, viewMode
                     .fillMaxWidth(),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // Logo Section
+                // --- LOGO SECTION ---
                 Box(
                     Modifier
                         .size(100.dp)
@@ -71,7 +75,7 @@ fun LoginScreen(navController: NavController, prefs: SharedPreferences, viewMode
                 Text("CD Signal", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(32.dp))
 
-                // Username Field
+                // --- USERNAME FIELD ---
                 OutlinedTextField(
                     value = viewModel.username,
                     onValueChange = { viewModel.username = it },
@@ -83,7 +87,7 @@ fun LoginScreen(navController: NavController, prefs: SharedPreferences, viewMode
 
                 Spacer(Modifier.height(16.dp))
 
-                // Password Field with Eye Toggle
+                // --- PASSWORD FIELD ---
                 OutlinedTextField(
                     value = viewModel.password,
                     onValueChange = { viewModel.password = it },
@@ -93,7 +97,7 @@ fun LoginScreen(navController: NavController, prefs: SharedPreferences, viewMode
                         IconButton(onClick = { passwordVisible = !passwordVisible }) {
                             Icon(
                                 imageVector = if (passwordVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                                contentDescription = if (passwordVisible) "Hide password" else "Show password"
+                                contentDescription = if (passwordVisible) "Toggle visibility" else "Toggle visibility"
                             )
                         }
                     },
@@ -102,18 +106,26 @@ fun LoginScreen(navController: NavController, prefs: SharedPreferences, viewMode
                     modifier = Modifier.fillMaxWidth()
                 )
 
-                Spacer(Modifier.height(24.dp))
+                // --- FORGOT PASSWORD LINK ---
+                Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+                    TextButton(onClick = { viewModel.showResetDialog = true }) {
+                        Text("Forgot Password?", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
 
-                // Error Message
+                Spacer(Modifier.height(8.dp))
+
+                // --- ERROR MESSAGE ---
                 if (viewModel.errorMsg != null) {
                     Text(viewModel.errorMsg!!, color = MaterialTheme.colorScheme.error)
                     Spacer(Modifier.height(16.dp))
                 }
 
-                // Login Button
+                // --- LOGIN BUTTON ---
                 Button(
                     onClick = {
-                        viewModel.login(prefs) {
+                        // [FIX] Pass 'context' as the first argument
+                        viewModel.login(context, prefs) {
                             navController.navigate("home") { popUpTo("login") { inclusive = true } }
                         }
                     },
@@ -123,7 +135,7 @@ fun LoginScreen(navController: NavController, prefs: SharedPreferences, viewMode
                     shape = RoundedCornerShape(12.dp),
                     enabled = !viewModel.isLoading
                 ) {
-                    if(viewModel.isLoading) {
+                    if (viewModel.isLoading) {
                         CircularProgressIndicator(Modifier.size(24.dp), color = MaterialTheme.colorScheme.onPrimary)
                     } else {
                         Text("LOGIN", fontWeight = FontWeight.Bold)
@@ -132,7 +144,7 @@ fun LoginScreen(navController: NavController, prefs: SharedPreferences, viewMode
 
                 Spacer(Modifier.height(16.dp))
 
-                // Offline Mode Button
+                // --- OFFLINE MODE BUTTON ---
                 TextButton(onClick = {
                     if (viewModel.username.isNotBlank()) {
                         viewModel.loginOffline(viewModel.username, prefs) {
@@ -147,7 +159,7 @@ fun LoginScreen(navController: NavController, prefs: SharedPreferences, viewMode
 
                 Spacer(Modifier.height(8.dp))
 
-                // NEW: Help Button
+                // --- HELP BUTTON ---
                 TextButton(onClick = { navController.navigate("help") }) {
                     Icon(Icons.Default.Info, null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
@@ -155,5 +167,86 @@ fun LoginScreen(navController: NavController, prefs: SharedPreferences, viewMode
                 }
             }
         }
+    }
+
+    // --- RESET PASSWORD DIALOG (Two-Step State Machine) ---
+    if (viewModel.showResetDialog) {
+        AlertDialog(
+            onDismissRequest = { viewModel.showResetDialog = false },
+            title = {
+                Text(
+                    if (viewModel.resetStep == 0) "Reset Password" else "Enter Verification Code",
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Column {
+                    if (viewModel.resetStep == 0) {
+                        Text("Enter your username. An OTP will be sent to your recovery email if you have configured one in Profile Settings.")
+
+                        // [NEW] Privacy Notice for Reset Feature
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "Privacy Note: You must have previously linked a recovery email to use this feature. We use this email strictly for verification and never share it.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        Spacer(Modifier.height(16.dp))
+                        OutlinedTextField(
+                            value = viewModel.resetUsername,
+                            onValueChange = { viewModel.resetUsername = it },
+                            label = { Text("Username") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    } else {
+                        Text("Check your email for the 6-digit code.")
+                        Spacer(Modifier.height(16.dp))
+                        OutlinedTextField(
+                            value = viewModel.resetOtp,
+                            onValueChange = { viewModel.resetOtp = it },
+                            label = { Text("OTP Code") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = viewModel.resetNewPass,
+                            onValueChange = { viewModel.resetNewPass = it },
+                            label = { Text("New Password") },
+                            visualTransformation = PasswordVisualTransformation(),
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+
+                    if (viewModel.resetMsg != null) {
+                        Spacer(Modifier.height(12.dp))
+                        Text(viewModel.resetMsg!!, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (viewModel.resetStep == 0) viewModel.requestOtp()
+                        else viewModel.confirmReset()
+                    },
+                    enabled = !viewModel.resetLoading
+                ) {
+                    if (viewModel.resetLoading) {
+                        CircularProgressIndicator(Modifier.size(16.dp), color = MaterialTheme.colorScheme.onPrimary)
+                    } else {
+                        Text(if (viewModel.resetStep == 0) "Get OTP" else "Update Password")
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { viewModel.showResetDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }

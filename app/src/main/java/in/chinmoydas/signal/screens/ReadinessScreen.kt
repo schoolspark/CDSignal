@@ -1,6 +1,5 @@
 package `in`.chinmoydas.signal.screens
 
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -40,6 +39,9 @@ fun SystemReadinessDialog(
     var isFinished by remember { mutableStateOf(false) }
     var hasCriticalError by remember { mutableStateOf(false) }
 
+    // Track specific errors to suggest smart fixes
+    var isTokenMissing by remember { mutableStateOf(false) }
+
     LaunchedEffect(Unit) {
         viewModel.performHealthCheck(context, service).collect { item ->
             if (item.status == DiagnosticStatus.Running) {
@@ -49,10 +51,16 @@ fun SystemReadinessDialog(
                 if (item.status == DiagnosticStatus.Failure) {
                     hasCriticalError = true
                     currentItem = item
+
+                    // [SMART FIX LOGIC] Check for specific error signatures
+                    if (item.name == "Cloud Wake Service" && item.detail?.contains("Relogin") == true) {
+                        isTokenMissing = true
+                    }
                 }
                 if (item.name == "DIAGNOSTIC COMPLETE") {
                     isFinished = true
-                    delay(2000)
+                    delay(1000)
+                    // Auto-dismiss only if perfect
                     if (!hasCriticalError) onDismiss()
                 }
             }
@@ -103,7 +111,7 @@ fun SystemReadinessDialog(
                 Spacer(Modifier.height(16.dp))
 
                 Text(
-                    text = if (isFinished) "System Ready" else "Running Diagnostics...",
+                    text = if (isFinished) (if (hasCriticalError) "Issues Found" else "System Ready") else "Running Diagnostics...",
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold
                 )
@@ -138,13 +146,20 @@ fun SystemReadinessDialog(
 
                 if (isFinished || hasCriticalError) {
                     Button(
-                        onClick = onDismiss,
+                        onClick = {
+                            if (isTokenMissing) {
+                                // Inform user what to do since we can't auto-navigate from here cleanly without callbacks
+                                android.widget.Toast.makeText(context, "Please Logout and Login to regenerate token.", android.widget.Toast.LENGTH_LONG).show()
+                            }
+                            onDismiss()
+                        },
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = if (hasCriticalError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
                         )
                     ) {
-                        Text(if (hasCriticalError) "Close & Fix" else "Close")
+                        // [SMART LABEL] Change text based on the error
+                        Text(if (isTokenMissing) "Close & Relogin" else if (hasCriticalError) "Close" else "Done")
                     }
                 }
             }

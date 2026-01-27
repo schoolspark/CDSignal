@@ -150,6 +150,15 @@ class MainActivity : ComponentActivity() {
                         startDest = if (prefs.getString("jwt_token", null) != null) "home" else "login"
                     }
 
+                    LaunchedEffect(startDest) {
+                        if (startDest == "home") {
+                            // Sync our latest FCM token to the server so others can "Wake" us
+                            lifecycleScope.launch(Dispatchers.IO) {
+                                repository.syncFcmTokenToServer()
+                            }
+                        }
+                    }
+
                     if (startDest != null) {
                         val navController = rememberNavController()
 
@@ -319,10 +328,26 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleIntent(intent: Intent?) {
+        // 1. Existing Auto-Channel logic (for normal notifications)
         val autoChannel = intent?.getStringExtra("auto_connect_channel")
-        if (autoChannel != null && ::walkieViewModel.isInitialized) {
-            walkieViewModel.setTarget(autoChannel)
-            intent.removeExtra("auto_connect_channel")
+
+        // 2. New Cloud Wake logic
+        val isCloudWake = intent?.getBooleanExtra("is_cloud_wake", false) == true
+        val wokenBy = intent?.getStringExtra("woken_by")
+
+        if (::walkieViewModel.isInitialized) {
+            if (isCloudWake && wokenBy != null) {
+                // Focus on the person who triggered the Cloud Wake
+                walkieViewModel.setTarget(wokenBy)
+                Toast.makeText(this, "Woken by $wokenBy", Toast.LENGTH_SHORT).show()
+            } else if (autoChannel != null) {
+                walkieViewModel.setTarget(autoChannel)
+            }
+
+            // Clean up intent to prevent re-triggering on rotation
+            intent?.removeExtra("auto_connect_channel")
+            intent?.removeExtra("is_cloud_wake")
+            intent?.removeExtra("woken_by")
         }
     }
 

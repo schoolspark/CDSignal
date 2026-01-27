@@ -546,6 +546,14 @@ class VoiceService : Service() {
             }
         }
 
+        if (intent?.getBooleanExtra("is_cloud_wake", false) == true) {
+            val wokenBy = intent.getStringExtra("woken_by")
+            Log.d(tag, "Service woken by Cloud. Identifying myself to $wokenBy")
+
+            // This tells User A: "I am awake now, here is my current IP!"
+            broadcastHello()
+        }
+
         if (intent == null && _voiceServiceState.value.networkStatus != "Disconnected") {
             return START_STICKY
         }

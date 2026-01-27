@@ -5,6 +5,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -30,6 +31,8 @@ import `in`.chinmoydas.signal.viewmodel.WalkieViewModel
 fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myName: String, viewModel: WalkieViewModel, onLogout: () -> Unit, onExit: () -> Unit) {
     val context = LocalContext.current
     val prefs = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
+    var showEmailDialog by remember { mutableStateOf(false) }
+    var recoveryEmail by remember { mutableStateOf(prefs.getString("recovery_email", "Not Set") ?: "Not Set") }
     var showBlockedDialog by remember { mutableStateOf(false) }
     var showGuardianConsent by remember { mutableStateOf(false) }
     val myCode by viewModel.myPairingCode.collectAsState()
@@ -209,6 +212,33 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
                 )
             }
         }
+        Spacer(Modifier.height(16.dp))
+
+        // --- NEW: RECOVERY EMAIL CARD ---
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha=0.3f)),
+            modifier = Modifier.fillMaxWidth().clickable { showEmailDialog = true }
+        ) {
+            Row(
+                modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Email, null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Recovery Email", fontWeight = FontWeight.Bold)
+                    }
+                    Text(
+                        recoveryEmail,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Icon(Icons.Default.Edit, contentDescription = "Edit Email", modifier = Modifier.size(20.dp), tint = Color.Gray)
+            }
+        }
 
         Spacer(Modifier.height(24.dp))
 
@@ -291,6 +321,75 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
             },
             dismissButton = {
                 TextButton(onClick = { showGuardianConsent = false }) { Text("CANCEL") }
+            }
+        )
+    }
+    // 3. RECOVERY EMAIL DIALOG ---
+    if (showEmailDialog) {
+        var emailInput by remember { mutableStateOf(if(recoveryEmail == "Not Set") "" else recoveryEmail) }
+
+        AlertDialog(
+            onDismissRequest = { showEmailDialog = false },
+            title = { Text("Update Recovery Email") },
+            text = {
+                Column {
+                    Text(
+                        "Data Privacy: Providing a recovery email is completely optional. " +
+                                "It is stored securely and used ONLY for verifying your identity during password resets. " +
+                                "If you do not need the reset feature, you can leave this blank.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(bottom = 12.dp)
+                    )
+                    OutlinedTextField(
+                        value = emailInput,
+                        onValueChange = { emailInput = it },
+                        label = { Text("Email Address") },
+                        placeholder = { Text("example@mail.com") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    // [NEW] Remove Button - Only visible if an email is already set
+                    if (recoveryEmail != "Not Set" && recoveryEmail.isNotBlank()) {
+                        Spacer(Modifier.height(16.dp))
+                        OutlinedButton(
+                            onClick = {
+                                // Save empty string to clear it on server
+                                viewModel.saveRecoveryEmail(context, "") {
+                                    recoveryEmail = "Not Set"
+                                    prefs.edit().remove("recovery_email").apply()
+                                    showEmailDialog = false
+                                    Toast.makeText(context, "Recovery email removed", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.error)
+                        ) {
+                            Icon(Icons.Default.Delete, null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("REMOVE LINKED EMAIL")
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    viewModel.saveRecoveryEmail(context, emailInput) {
+                        // On success callback
+                        recoveryEmail = if (emailInput.isBlank()) "Not Set" else emailInput
+                        if (emailInput.isBlank()) {
+                            prefs.edit().remove("recovery_email").apply()
+                        } else {
+                            prefs.edit().putString("recovery_email", emailInput).apply()
+                        }
+                        showEmailDialog = false
+                    }
+                }) { Text("SAVE") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEmailDialog = false }) { Text("CANCEL") }
             }
         )
     }

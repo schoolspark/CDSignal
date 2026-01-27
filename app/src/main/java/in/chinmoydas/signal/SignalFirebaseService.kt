@@ -7,18 +7,35 @@ import android.os.PowerManager
 import android.util.Log
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
+import `in`.chinmoydas.signal.data.MainRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 class SignalFirebaseService : FirebaseMessagingService() {
 
     override fun onNewToken(token: String) {
         super.onNewToken(token)
-        Log.d("FCM", "New Token: $token")
+        Log.d("FCM", "New Token Generated: $token")
 
-        // Save my token securely so I can share it via UDP later
+        // 1. Save to Local Storage (Source of Truth)
+        // We use "my_fcm_token" to match MainRepository.syncFcmTokenToServer()
         getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
             .edit()
             .putString("my_fcm_token", token)
             .apply()
+
+        // 2. [CRITICAL FIX] Sync to Server Immediately
+        // If the token changes while the app is in the background, we must tell the server.
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val repository = MainRepository(applicationContext)
+                repository.syncFcmTokenToServer()
+                Log.d("FCM", "Rotated Token Synced to Server Successfully")
+            } catch (e: Exception) {
+                Log.e("FCM", "Failed to Sync Rotated Token: ${e.message}")
+            }
+        }
     }
 
     override fun onMessageReceived(remoteMessage: RemoteMessage) {
@@ -26,7 +43,8 @@ class SignalFirebaseService : FirebaseMessagingService() {
         val data = remoteMessage.data
         if (data["action"] == "WAKE_RADIO") {
 
-            Log.d("FCM", "Wake Signal Received from: ${data["sender"]}")
+            val sender = data["sender"] ?: "Unknown"
+            Log.d("FCM", "Wake Signal Received from: $sender")
 
             // 1. Acquire a temporary CPU WakeLock (10 seconds)
             // This guarantees the CPU stays awake long enough to start the Radio
@@ -35,13 +53,14 @@ class SignalFirebaseService : FirebaseMessagingService() {
                 PowerManager.PARTIAL_WAKE_LOCK,
                 "Signal:CloudWakeLock"
             )
-            wakeLock.acquire(10 * 1000L) // 10 seconds timeout
+            // Safety: Set a timeout so we don't drain battery if service fails to start
+            wakeLock.acquire(10 * 1000L)
 
             // 2. Start the VoiceService (The "Main Highway")
             val intent = Intent(this, VoiceService::class.java).apply {
                 action = "START_SERVICE"
                 putExtra("is_cloud_wake", true) // Tell service it was woken by cloud
-                putExtra("woken_by", data["sender"])
+                putExtra("woken_by", sender)
             }
 
             try {
@@ -51,7 +70,7 @@ class SignalFirebaseService : FirebaseMessagingService() {
                     startService(intent)
                 }
             } catch (e: Exception) {
-                e.printStackTrace()
+                Log.e("FCM", "Failed to start VoiceService", e)
             }
 
             // Note: The WakeLock releases automatically after 10s,

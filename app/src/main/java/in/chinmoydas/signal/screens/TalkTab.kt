@@ -163,6 +163,7 @@ fun TalkTab(
                             Button(
                                 onClick = {
                                     if (targetContact != null) {
+                                        // Pass the targetContact (which is a ContactEntity) to the function
                                         viewModel.sendCloudWakeUp(context, targetContact)
                                     }
                                 },

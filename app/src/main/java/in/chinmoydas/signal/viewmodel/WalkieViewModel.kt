@@ -552,36 +552,99 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     fun performHealthCheck(context: Context, service: VoiceService?) =
         `in`.chinmoydas.signal.utils.SystemDiagnostics.runChecks(context, service)
 
+    /**
+     * Triggers a high-priority FCM wake signal via the PHP backend.
+     * Gracefully handles JWT authentication and UI feedback.
+     */
     fun sendCloudWakeUp(context: Context, contact: Contact) {
+        // 1. PRE-FLIGHT CHECK: Verify we have a token to send to.
         if (contact.fcmToken.isBlank()) {
-            android.widget.Toast.makeText(context, "No Cloud Token for this user", android.widget.Toast.LENGTH_SHORT).show()
+            android.widget.Toast.makeText(context, "Cloud Wake unavailable: No token for ${contact.name}", android.widget.Toast.LENGTH_SHORT).show()
             return
         }
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // 1. Get my name
-                val myName = repository.myUsername.firstOrNull() ?: "Walkie User"
+                // 2. AUTHENTICATION: Fetch the 1-year JWT token from storage.
+                val jwt = repository.getToken()
+                val myName = repository.myUsername.value // Use the current state-flow value.
 
-                // 2. Call via Repository (NEW - CORRECT)
+                if (jwt.isNullOrEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        android.widget.Toast.makeText(context, "Session expired. Please log in.", android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                    return@launch
+                }
+
+                // 3. NETWORK CALL: Execute the POST request to fcm_wake.php.
+                val authHeader = "Bearer $jwt"
                 val response = repository.sendWakeSignal(
+                    authHeader = authHeader,
                     senderName = myName,
                     targetToken = contact.fcmToken
                 )
 
-                // 3. Handle Result
+                // 4. UI DISPATCH: Handle the server response on the Main thread.
                 withContext(Dispatchers.Main) {
-                    if (response.isSuccessful && response.body()?.status == "success") {
-                        android.widget.Toast.makeText(context, "Wake Signal Sent! ⚡", android.widget.Toast.LENGTH_SHORT).show()
+                    if (response.isSuccessful) {
+                        val body = response.body()
+                        if (body?.status == "success") {
+                            // Success: Signal reached your PHP script and was sent to FCM.
+                            android.widget.Toast.makeText(context, "Wake signal sent to ${contact.name}! ⚡", android.widget.Toast.LENGTH_SHORT).show()
+                        } else {
+                            // Logic Error: Handled by your PHP script (e.g., Google Auth failed).
+                            val errorDetail = body?.error ?: body?.message ?: "Wake request rejected"
+                            android.widget.Toast.makeText(context, "Failed: $errorDetail", android.widget.Toast.LENGTH_LONG).show()
+                        }
                     } else {
-                        val errorMsg = response.body()?.error ?: "Server Error: ${response.code()}"
+                        // HTTP Error: 401 Unauthorized, 404 Not Found, or 500 Server Error.
+                        val errorMsg = when (response.code()) {
+                            401 -> "Unauthorized: Please log in again."
+                            500 -> "Server Error: Check PHP logs."
+                            else -> "Server returned code ${response.code()}"
+                        }
                         android.widget.Toast.makeText(context, errorMsg, android.widget.Toast.LENGTH_SHORT).show()
                     }
                 }
             } catch (e: Exception) {
+                // 5. EXCEPTION HANDLING: Handle timeouts or lost internet connection.
                 e.printStackTrace()
                 withContext(Dispatchers.Main) {
-                    android.widget.Toast.makeText(context, "Failed: Check Internet", android.widget.Toast.LENGTH_SHORT).show()
+                    android.widget.Toast.makeText(context, "Connection failed. Check your internet.", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+    fun saveRecoveryEmail(context: Context, email: String, onSuccess: () -> Unit) {
+
+        // 1. Validation Logic
+        // IF email is NOT empty AND it does NOT match the pattern -> Show Error
+        // This allows "" (empty string) to pass through successfully.
+        if (email.isNotEmpty() && !android.util.Patterns.EMAIL_ADDRESS.matcher(email).matches()) {
+            android.widget.Toast.makeText(context, "Invalid Email Format", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // 2. Call Repository (which calls Retrofit -> update_email.php)
+                // Note: Ensure your MainRepository has the 'updateRecoveryEmail' function defined
+                val response = repository.updateRecoveryEmail(email)
+
+                withContext(Dispatchers.Main) {
+                    if (response.isSuccessful && response.body()?.status == "success") {
+                        val msg = response.body()?.message ?: "Success"
+                        android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_SHORT).show()
+                        onSuccess()
+                    } else {
+                        val error = response.body()?.message ?: "Failed to save"
+                        android.widget.Toast.makeText(context, error, android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    android.widget.Toast.makeText(context, "Connection Error", android.widget.Toast.LENGTH_SHORT).show()
+                    e.printStackTrace()
                 }
             }
         }
