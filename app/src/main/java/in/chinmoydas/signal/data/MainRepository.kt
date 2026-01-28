@@ -33,6 +33,9 @@ class MainRepository(context: Context) {
     private val _configTrigger = MutableStateFlow(0)
     val configTrigger: StateFlow<Int> = _configTrigger.asStateFlow()
 
+    private val _recoveryEmail = MutableStateFlow(prefs.getString("recovery_email", "Not Set") ?: "Not Set")
+    val recoveryEmail: StateFlow<String> = _recoveryEmail.asStateFlow()
+
     // [NEW] Expose Pager Entries as a Flow for Real-time UI updates
     val pagerEntries: Flow<List<PagerEntry>> = pagerDao.getAllEntries()
 
@@ -194,5 +197,18 @@ class MainRepository(context: Context) {
             channel,
             key
         )
+    }
+
+    fun setRecoveryEmail(email: String) {
+        val valueToSave = if (email.isBlank()) "Not Set" else email
+
+        if (email.isBlank()) {
+            prefs.edit().remove("recovery_email").apply()
+        } else {
+            prefs.edit().putString("recovery_email", email).apply()
+        }
+
+        // Update the private mutable flow
+        _recoveryEmail.value = valueToSave
     }
 }

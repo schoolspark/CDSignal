@@ -32,7 +32,7 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
     val context = LocalContext.current
     val prefs = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
     var showEmailDialog by remember { mutableStateOf(false) }
-    var recoveryEmail by remember { mutableStateOf(prefs.getString("recovery_email", "Not Set") ?: "Not Set") }
+    val recoveryEmail by viewModel.recoveryEmail.collectAsState()
     var showBlockedDialog by remember { mutableStateOf(false) }
     var showGuardianConsent by remember { mutableStateOf(false) }
     val myCode by viewModel.myPairingCode.collectAsState()
@@ -324,8 +324,9 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
             }
         )
     }
-    // 3. RECOVERY EMAIL DIALOG ---
+    // 3. RECOVERY EMAIL DIALOG (Fixed)
     if (showEmailDialog) {
+        // Initialize with the current value from the ViewModel
         var emailInput by remember { mutableStateOf(if(recoveryEmail == "Not Set") "" else recoveryEmail) }
 
         AlertDialog(
@@ -334,9 +335,7 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
             text = {
                 Column {
                     Text(
-                        "Data Privacy: Providing a recovery email is completely optional. " +
-                                "It is stored securely and used ONLY for verifying your identity during password resets. " +
-                                "If you do not need the reset feature, you can leave this blank.",
+                        "Data Privacy: Optional. Used securely for account recovery.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(bottom = 12.dp)
@@ -345,27 +344,22 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
                         value = emailInput,
                         onValueChange = { emailInput = it },
                         label = { Text("Email Address") },
-                        placeholder = { Text("example@mail.com") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
 
-                    // [NEW] Remove Button - Only visible if an email is already set
+                    // Remove Button
                     if (recoveryEmail != "Not Set" && recoveryEmail.isNotBlank()) {
                         Spacer(Modifier.height(16.dp))
                         OutlinedButton(
                             onClick = {
-                                // Save empty string to clear it on server
+                                // Save empty string to clear
                                 viewModel.saveRecoveryEmail(context, "") {
-                                    recoveryEmail = "Not Set"
-                                    prefs.edit().remove("recovery_email").apply()
                                     showEmailDialog = false
-                                    Toast.makeText(context, "Recovery email removed", Toast.LENGTH_SHORT).show()
                                 }
                             },
                             modifier = Modifier.fillMaxWidth(),
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
-                            border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.error)
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
                         ) {
                             Icon(Icons.Default.Delete, null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(8.dp))
@@ -377,14 +371,8 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
             confirmButton = {
                 Button(onClick = {
                     viewModel.saveRecoveryEmail(context, emailInput) {
-                        // On success callback
-                        recoveryEmail = if (emailInput.isBlank()) "Not Set" else emailInput
-                        if (emailInput.isBlank()) {
-                            prefs.edit().remove("recovery_email").apply()
-                        } else {
-                            prefs.edit().putString("recovery_email", emailInput).apply()
-                        }
                         showEmailDialog = false
+                        // No manual Prefs update needed here!
                     }
                 }) { Text("SAVE") }
             },

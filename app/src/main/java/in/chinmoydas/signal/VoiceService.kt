@@ -243,9 +243,7 @@ class VoiceService : Service() {
 
         audioEngine = AudioEngine(this)
         repository = MainRepository(applicationContext)
-        observeRepositoryFlows()
 
-        // [CRITICAL REFACTOR: INITIALIZATION]
         // 1. Init NetworkEngine with STUN Splitter Logic
         networkEngine = NetworkEngine(UDP_PORT) { stunData ->
             // Safety Check: Only route if manager is fully initialized
@@ -267,6 +265,8 @@ class VoiceService : Service() {
                 tts?.language = Locale.US
             }
         }
+
+        observeRepositoryFlows()
 
         scope.launch {
             val principals = repository.getPrincipalContacts()

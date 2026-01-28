@@ -3,6 +3,7 @@ package `in`.chinmoydas.signal.viewmodel
 import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
+import android.widget.Toast
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -13,6 +14,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
+import `in`.chinmoydas.signal.RetrofitClient
 import `in`.chinmoydas.signal.VoiceService
 import `in`.chinmoydas.signal.data.CallLog
 import `in`.chinmoydas.signal.data.MainRepository
@@ -72,6 +74,8 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     private val _callLogs = MutableStateFlow<List<CallLog>>(emptyList())
     val callLogs: StateFlow<List<CallLog>> = _callLogs.asStateFlow()
     private var localManager: LocalLinkManager? = null
+
+    val recoveryEmail = repository.recoveryEmail.stateIn(viewModelScope, SharingStarted.Lazily, "Not Set")
 
     init {
         viewModelScope.launch {
@@ -670,35 +674,38 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
             }
         }
     }
+    // [FIXED] Now saves to local storage so it persists after restart
     fun saveRecoveryEmail(context: Context, email: String, onSuccess: () -> Unit) {
 
         // 1. Validation Logic
-        // IF email is NOT empty AND it does NOT match the pattern -> Show Error
-        // This allows "" (empty string) to pass through successfully.
         if (email.isNotEmpty() && !android.util.Patterns.EMAIL_ADDRESS.matcher(email).matches()) {
-            android.widget.Toast.makeText(context, "Invalid Email Format", android.widget.Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "Invalid Email Format", Toast.LENGTH_SHORT).show()
             return
         }
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // 2. Call Repository (which calls Retrofit -> update_email.php)
-                // Note: Ensure your MainRepository has the 'updateRecoveryEmail' function defined
-                val response = repository.updateRecoveryEmail(email)
+                // 2. Call Server
+                val token = repository.getToken() ?: ""
+                val response = RetrofitClient.api.updateRecoveryEmail("Bearer $token", email)
 
                 withContext(Dispatchers.Main) {
                     if (response.isSuccessful && response.body()?.status == "success") {
-                        val msg = response.body()?.message ?: "Success"
-                        android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_SHORT).show()
+
+                        // [CRITICAL FIX] Save to Local Storage immediately!
+                        // This updates the SharedPreferences so the UI sees it next time.
+                        repository.setRecoveryEmail(email)
+
+                        Toast.makeText(context, "Recovery Email Updated", Toast.LENGTH_SHORT).show()
                         onSuccess()
                     } else {
                         val error = response.body()?.message ?: "Failed to save"
-                        android.widget.Toast.makeText(context, error, android.widget.Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, error, Toast.LENGTH_SHORT).show()
                     }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    android.widget.Toast.makeText(context, "Connection Error", android.widget.Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Connection Error", Toast.LENGTH_SHORT).show()
                     e.printStackTrace()
                 }
             }
