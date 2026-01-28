@@ -312,9 +312,11 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     }
 
     fun startTransmission(onIpsFound: (List<String>, Int) -> Unit, onUpdateIps: (List<String>) -> Unit) {
+        // 1. Safety Checks
         if (_uiState.value is UiState.Transmitting || _uiState.value is UiState.Receiving) return
         _uiState.value = UiState.Transmitting("Connecting...", false)
 
+        // 2. BROADCAST MODE (Always 50005 because it is Local LAN)
         if (isBroadcastMode) {
             val allIps = nearbyUsers.filter { it.ip.isNotEmpty() }.map { it.ip }
             if (allIps.isNotEmpty()) {
@@ -326,6 +328,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
         if (targetUser.isEmpty()) { _uiState.value = UiState.Error("No Target Selected"); return }
 
+        // 3. LOCAL DISCOVERY USER (Always 50005 because it is Local LAN)
         val localUser = nearbyUsers.find { it.name.equals(targetUser, ignoreCase = true) }
         if (localUser != null) {
             _uiState.value = UiState.Transmitting("On Air (Local)", false)
@@ -333,10 +336,13 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
             return
         }
 
+        // --- INTERNET / WAN LOGIC STARTS HERE ---
+
         val contact = savedContacts.find { it.name.equals(targetUser, ignoreCase = true) }
         val token = repository.getToken() ?: ""
         if (token.isBlank() || token == "OFFLINE_TOKEN") { _uiState.value = UiState.Error("Offline"); return }
 
+        // 4. GROUPS (Server-Assisted)
         if (targetUser.startsWith("group:", ignoreCase = true)) {
             val channelName = targetUser.substringAfter(":")
             val passkey = contact?.savedCode ?: ""
@@ -344,9 +350,13 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                 try {
                     val response = repository.findChannel(token, channelName, passkey)
                     if (_uiState.value !is UiState.Transmitting) return@launch
+
+                    // Flatten IPs from the server response
                     val finalIps = response.users?.flatMap { listOfNotNull(it.public_ip, it.local_ip) }?.toSet()
+
                     if (!finalIps.isNullOrEmpty()) {
                         _uiState.value = UiState.Transmitting("On Air", false)
+                        // [NOTE] Groups currently use 50005. If you upgrade channel.php to send ports, update this.
                         onIpsFound(finalIps.toList(), 50005)
                     } else { _uiState.value = UiState.Error("Channel Empty") }
                 } catch (e: Exception) { _uiState.value = UiState.Error("Channel Error") }
@@ -354,44 +364,76 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
             return
         }
 
+        // 5. SAVED CONTACTS (P2P via Internet) - [CRITICAL NAT FIX APPLIED]
         if (contact != null) {
             var speculated = false
+
+            // A. Speculative Execution: Try last known IP/Port immediately for speed
+            // We default to 50005 here because we don't store ports in DB yet.
             if (contact.ip.isNotEmpty() && contact.ip != "SERVER_LINK") {
                 _uiState.value = UiState.Transmitting("On Air", false)
                 onIpsFound(listOf(contact.ip), 50005)
                 speculated = true
             }
+
+            // B. Refresh from Server to get the REAL IP and PORT (STUN)
             if (contact.savedCode.isNotEmpty()) {
                 viewModelScope.launch {
                     try {
                         val response = repository.findPeer(token, contact.name, contact.savedCode)
                         if (_uiState.value !is UiState.Transmitting) return@launch
+
                         val newIp = response.ip
                         val extraIp = response.local_ip
+                        // [THE FIX] Capture the dynamic port (e.g., 24912) from the server
+                        val targetPort = response.port ?: 50005
+
                         if (newIp != null) {
                             val ipList = listOfNotNull(newIp, extraIp).distinct()
+
                             if (!speculated) {
+                                // First attempt: Start with the correct port
                                 _uiState.value = UiState.Transmitting("On Air", false)
-                                onIpsFound(ipList, 50005)
-                            } else { onUpdateIps(ipList) }
+                                onIpsFound(ipList, targetPort)
+                            } else {
+                                // We already started on 50005. If the IP changed, update the list.
+                                // Note: Changing port mid-stream is complex, so we prioritize IP updates here.
+                                onUpdateIps(ipList)
+                            }
+
+                            // Save the new IP to local DB for next time
                             if (newIp != contact.ip) repository.saveContact(contact.name, newIp, contact.savedCode)
-                        } else { if (!speculated) _uiState.value = UiState.Error("User Offline") }
-                    } catch (e: Exception) { if (!speculated) _uiState.value = UiState.Error("Link Failed") }
+                        } else {
+                            if (!speculated) _uiState.value = UiState.Error("User Offline")
+                        }
+                    } catch (e: Exception) {
+                        if (!speculated) _uiState.value = UiState.Error("Link Failed")
+                    }
                 }
             } else if (!speculated) { _uiState.value = UiState.Error("No IP Saved") }
             return
         }
 
+        // 6. UNSAVED SEARCH (P2P via Internet)
         viewModelScope.launch {
             try {
+                // Use default public code "0000" or handle appropriately
                 val response = repository.findPeer(token, targetUser, "0000")
                 if (_uiState.value !is UiState.Transmitting) return@launch
+
                 val ipList = listOfNotNull(response.ip, response.local_ip).distinct()
+
+                // [THE FIX] Use the dynamic port
+                val targetPort = response.port ?: 50005
+
                 if (ipList.isNotEmpty()) {
                     _uiState.value = UiState.Transmitting("On Air", false)
-                    onIpsFound(ipList, response.port ?: 50005)
+                    onIpsFound(ipList, targetPort)
                 } else { _uiState.value = UiState.Error("User Offline") }
-            } catch (e: Exception) { if (_uiState.value !is UiState.Transmitting) return@launch; _uiState.value = UiState.Error("Link Failed") }
+            } catch (e: Exception) {
+                if (_uiState.value !is UiState.Transmitting) return@launch;
+                _uiState.value = UiState.Error("Link Failed")
+            }
         }
     }
 

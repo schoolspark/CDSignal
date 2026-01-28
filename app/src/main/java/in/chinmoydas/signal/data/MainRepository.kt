@@ -185,4 +185,14 @@ class MainRepository(context: Context) {
         // Uses the function you defined in RetrofitClient
         return RetrofitClient.api.updateRecoveryEmail("Bearer $jwt", email)
     }
+    // [NEW] Wrapper for ConnectionManager
+    suspend fun sendHeartbeat(token: String, port: Int, localIp: String, channel: String?, key: String?) {
+        RetrofitClient.api.sendHeartbeat(
+            "Bearer $token",
+            port,
+            localIp,
+            channel,
+            key
+        )
+    }
 }

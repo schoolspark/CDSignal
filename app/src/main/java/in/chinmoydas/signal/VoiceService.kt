@@ -32,6 +32,7 @@ import androidx.media.session.MediaButtonReceiver
 import `in`.chinmoydas.signal.data.AppDatabase
 import `in`.chinmoydas.signal.data.PagerEntry
 import `in`.chinmoydas.signal.data.MainRepository
+import `in`.chinmoydas.signal.utils.ConnectionManager // [NEW] Logic Hub
 import `in`.chinmoydas.signal.utils.AudioEngine
 import `in`.chinmoydas.signal.utils.AudioRouter
 import `in`.chinmoydas.signal.utils.CallEngine
@@ -40,7 +41,6 @@ import `in`.chinmoydas.signal.utils.G711
 import `in`.chinmoydas.signal.utils.LocalLinkManager
 import `in`.chinmoydas.signal.utils.NetworkEngine
 import `in`.chinmoydas.signal.RetrofitClient
-import `in`.chinmoydas.signal.utils.StunClient
 import `in`.chinmoydas.signal.utils.WavUtils
 import `in`.chinmoydas.signal.utils.CallSignaling
 import `in`.chinmoydas.signal.utils.SafetySignaling
@@ -50,9 +50,6 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -90,6 +87,7 @@ class VoiceService : Service() {
     private lateinit var networkEngine: NetworkEngine
     private lateinit var audioRouter: AudioRouter
     private lateinit var repository: MainRepository
+    private lateinit var connectionManager: ConnectionManager // [NEW]
 
     private var sensorHelper: SensorHelper? = null
     private var voxHelper: VoxHelper? = null
@@ -105,7 +103,6 @@ class VoiceService : Service() {
     private val PONG_SIGNAL = "__PONG__"
 
     private val UDP_PORT = 50005
-    @Volatile private var myPublicPort: Int = UDP_PORT
     @Volatile private var isOnWifi = false
     @Volatile private var dataSaverEnabled = false
     @Volatile private var activeKeySpec: javax.crypto.spec.SecretKeySpec? = null
@@ -176,7 +173,9 @@ class VoiceService : Service() {
     }
     private val multicastLock by lazy { (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).createMulticastLock("CDSignal:MulticastLock") }
     private val activeCalls = AtomicInteger(0)
-    private var heartbeatJob: Job? = null
+
+    // [REMOVED] heartbeatJob, stunServers (Handled by ConnectionManager now)
+
     private var signalingJob: Job? = null
     private var currentSequenceNumber = 0
     private var localLinkManager: LocalLinkManager? = null
@@ -200,15 +199,8 @@ class VoiceService : Service() {
                     try { networkEngine.stop() } catch (e: Exception) {}
                     delay(500)
 
+                    // Restart Network Engine with Traffic Splitter
                     networkEngine.start { packet ->
-                        if (StunClient.isStunResponse(packet.data)) {
-                            val result = StunClient.parseResponse(packet.data)
-                            if (result != null && myPublicPort != result.publicPort) {
-                                myPublicPort = result.publicPort
-                                triggerHeartbeat()
-                            }
-                            return@start
-                        }
                         handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
                     }
 
@@ -217,7 +209,10 @@ class VoiceService : Service() {
                     principalCache.addAll(principals.map { it.name })
 
                     _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
-                    triggerHeartbeat()
+
+                    // [NEW] Restart Heartbeat Loop
+                    connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
+
                     broadcastHello()
                     localLinkManager?.startAdvertising(myUsername, UDP_PORT)
                 }
@@ -247,9 +242,20 @@ class VoiceService : Service() {
         }
 
         audioEngine = AudioEngine(this)
-        networkEngine = NetworkEngine(UDP_PORT)
         repository = MainRepository(applicationContext)
         observeRepositoryFlows()
+
+        // [CRITICAL REFACTOR: INITIALIZATION]
+        // 1. Init NetworkEngine with STUN Splitter Logic
+        networkEngine = NetworkEngine(UDP_PORT) { stunData ->
+            // Safety Check: Only route if manager is fully initialized
+            if (::connectionManager.isInitialized) {
+                connectionManager.handleStunResponse(stunData)
+            }
+        }
+
+        // 2. Init Connection Manager (Dependencies are ready)
+        connectionManager = ConnectionManager(repository, networkEngine)
 
         val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
         dataSaverEnabled = prefs.getBoolean("data_saver", false)
@@ -421,7 +427,10 @@ class VoiceService : Service() {
                     val savedContact = repository.getAllContacts().find { it.name == target }
                     if (savedContact != null) targetContactKey = savedContact.savedCode else targetContactKey = null
                 }
-                triggerHeartbeat()
+
+                // [NEW] Trigger dynamic heartbeat when target changes
+                connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
+
                 val ip = activeIpCache[target] ?: repository.getAllContacts().find { it.name == target }?.ip
                 if (!ip.isNullOrBlank() && ip != "SERVER_LINK") sendPing(ip)
             }
@@ -505,18 +514,16 @@ class VoiceService : Service() {
             }
 
             "TOGGLE_VOX" -> {
-                // [FIX] Read the specific state requested from the intent
                 val requestedState = if (intent.hasExtra("state")) {
                     intent.getBooleanExtra("state", false)
                 } else {
-                    !_voiceServiceState.value.isVoxEnabled // Fallback to toggle
+                    !_voiceServiceState.value.isVoxEnabled
                 }
 
                 _voiceServiceState.update { it.copy(isVoxEnabled = requestedState) }
 
                 if (requestedState) {
                     startVoxMonitoring()
-                    // Only show Toast if it was a manual toggle (not a programmatic reset)
                     if (!intent.hasExtra("state")) {
                         Toast.makeText(this, "VOX: Auto-Transmit ON", Toast.LENGTH_SHORT).show()
                     }
@@ -549,8 +556,6 @@ class VoiceService : Service() {
         if (intent?.getBooleanExtra("is_cloud_wake", false) == true) {
             val wokenBy = intent.getStringExtra("woken_by")
             Log.d(tag, "Service woken by Cloud. Identifying myself to $wokenBy")
-
-            // This tells User A: "I am awake now, here is my current IP!"
             broadcastHello()
         }
 
@@ -565,15 +570,12 @@ class VoiceService : Service() {
             try {
                 if (!multicastLock.isHeld) multicastLock.acquire()
                 audioEngine.startPlayback()
+
+                // [CRITICAL REFACTOR: STARTUP]
+                // 1. Start Network Listening (Traffic Filtered)
                 val networkStarted = networkEngine.start { packet ->
-                    if (StunClient.isStunResponse(packet.data)) {
-                        val result = StunClient.parseResponse(packet.data)
-                        if (result != null && myPublicPort != result.publicPort) {
-                            myPublicPort = result.publicPort
-                            triggerHeartbeat()
-                        }
-                        return@start
-                    }
+                    // Note: STUN packets never reach here. They go to ConnectionManager.
+                    // Only Audio/Data packets arrive here.
                     handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
                 }
 
@@ -585,7 +587,10 @@ class VoiceService : Service() {
 
                 _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
                 updateNotification("Online & Ready", null)
-                startHeartbeatLoop()
+
+                // 2. Start the Smart Heartbeat Loop (Handles STUN & PHP)
+                connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
+
                 startSignalLoop()
 
             } catch (e: Exception) { Log.e(tag, "Startup Error: ${e.message}") }
@@ -612,51 +617,11 @@ class VoiceService : Service() {
         }
     }
 
-    private val stunServers = listOf(
-        Pair("stun.l.google.com", 19302),
-        Pair("stun1.l.google.com", 19302),
-        Pair("stun2.l.google.com", 19302),
-        Pair("stun.services.mozilla.com", 3478)
-    )
-
-    private fun startHeartbeatLoop() {
-        heartbeatJob?.cancel()
-        heartbeatJob = scope.launch {
-            var serverIndex = 0
-            while (isActive) {
-                delay(15_000)
-                if (networkEngine.isBound()) {
-                    try {
-                        val (host, port) = stunServers[serverIndex]
-                        val stunReq = StunClient.createBindRequest(host, port)
-                        if (stunReq != null) networkEngine.sendRawPacket(stunReq)
-                        triggerHeartbeat()
-                    } catch (e: Exception) {
-                        serverIndex = (serverIndex + 1) % stunServers.size
-                    }
-                }
-            }
-        }
-    }
-
+    // Bridge method for UI/Channel changes
     fun triggerHeartbeat(status: String = "online") {
-        scope.launch {
-            val stunReq = StunClient.createBindRequest()
-            if (stunReq != null) networkEngine.sendRawPacket(stunReq)
-
-            val token = repository.getToken()
-            if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
-                try {
-                    RetrofitClient.api.sendHeartbeat(
-                        "Bearer $token",
-                        myPublicPort,
-                        getLocalIpAddress(),
-                        currentChannel,
-                        currentChannelKey,
-                        status
-                    )
-                } catch (e: Exception) { }
-            }
+        if (::connectionManager.isInitialized) {
+            // Restart loop to force immediate refresh
+            connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
         }
     }
 
@@ -678,7 +643,6 @@ class VoiceService : Service() {
         }
     }
 
-    // [NEW] v5.3.0: Broadcasts my Identity + FCM Token to peers
     fun broadcastHello() {
         scope.launch(Dispatchers.IO) {
             val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
@@ -688,18 +652,13 @@ class VoiceService : Service() {
             val payloadString = "HELLO:$myUsername:$myToken"
             val payloadBytes = payloadString.toByteArray(Charsets.UTF_8)
 
-            // Construct Packet (Standard Protocol)
-            // [Len][Payload (Name area used for Hello data)][Seq][Empty Body]
             val buf = ByteArray(1 + payloadBytes.size + 4)
-            buf[0] = payloadBytes.size.toByte() // Length of the "Hello" string
+            buf[0] = payloadBytes.size.toByte()
             System.arraycopy(payloadBytes, 0, buf, 1, payloadBytes.size)
-            // Sequence number 0 for hello
             ByteBuffer.wrap(buf, 1 + payloadBytes.size, 4).putInt(0)
 
-            // Send to Broadcast Address (Discovery)
             networkEngine.send(buf, listOf("255.255.255.255"), UDP_PORT)
 
-            // Also send to all known contacts (Reliability)
             val contacts = repository.getAllContacts()
             val knownIps = contacts.mapNotNull { it.ip }.filter { it != "SERVER_LINK" && it.isNotEmpty() }
             if (knownIps.isNotEmpty()) {
@@ -721,11 +680,9 @@ class VoiceService : Service() {
     fun sendTextMessage(targetIp: String, message: String) {
         scope.launch(Dispatchers.IO) {
             try {
-                // 1. Prepare Payload (Same as before)
                 val rawPayload = "TXT:$message".toByteArray(Charsets.UTF_8)
                 val seqNum = (System.currentTimeMillis() % 1000000).toInt()
 
-                // 2. Encryption (Same as before)
                 val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
                 val isSecureMode = prefs.getBoolean("secure_mode", false)
                 val finalPayload = if (isSecureMode) {
@@ -735,7 +692,6 @@ class VoiceService : Service() {
                     CryptoEngine.encrypt(rawPayload, seqNum, secretKeySpec) ?: rawPayload
                 } else { rawPayload }
 
-                // 3. Construct Packet (Same as before)
                 val nameBytes = myUsername.toByteArray(Charsets.UTF_8)
                 val packetSize = 1 + nameBytes.size + 4 + finalPayload.size
                 val buffer = ByteBuffer.allocate(packetSize)
@@ -745,13 +701,7 @@ class VoiceService : Service() {
                 buffer.put(finalPayload)
                 val packetData = buffer.array()
 
-                // [THE FIX] REUSE THE EXISTING NETWORK ENGINE
-                // Do NOT create a new DatagramSocket().
-                // Do NOT call socket.close().
-                // This sends data from Port 50005, keeping the router "door" open.
-
                 repeat(3) {
-                    // UDP_PORT is your constant 50005
                     networkEngine.send(packetData, listOf(targetIp), UDP_PORT)
                     delay(50)
                 }
@@ -766,28 +716,19 @@ class VoiceService : Service() {
         if (nameLen + 5 > length) return
         val senderName = String(data, 1, nameLen)
 
-        // [NEW] v5.3.0: Catch Token Exchange
         if (senderName.startsWith("HELLO:")) {
             val parts = senderName.split(":")
-            // parts[0] = HELLO
-            // parts[1] = Username
-            // parts[2] = Token
-
             if (parts.size >= 3) {
                 val remoteUser = parts[1]
                 val remoteToken = parts[2]
-
-                // If it's a valid user and token, save it
                 if (remoteUser.isNotEmpty() && remoteToken != "NO_TOKEN") {
-                    Log.d(tag, "Received Token from $remoteUser")
                     scope.launch {
                         repository.updateContactToken(remoteUser, remoteToken)
-                        // Optional: Update IP if changed
                         repository.updateContactIp(remoteUser, senderIp)
                     }
                 }
             }
-            return // Stop processing here, don't play audio
+            return
         }
 
         if (senderName == PING_SIGNAL) { sendPong(senderIp); return }
@@ -870,12 +811,9 @@ class VoiceService : Service() {
                             }
 
                             if (cleanMessage.startsWith("CMD:CALL")) {
-
-                                // [BATTERY FIX] Wake Screen ONLY for Call Requests (Ringing)
                                 if (cleanMessage == "CMD:CALL_REQ") {
                                     showIncomingCallNotification(senderName)
                                 }
-
                                 scope.launch { CallSignaling.handlePacket(cleanMessage, senderIp) }
                                 return
                             }
@@ -893,7 +831,6 @@ class VoiceService : Service() {
 
                             if (cleanMessage.startsWith("CMD:REMOTE_")) {
                                 val isRemoteAllowed = prefs.getBoolean("allow_remote_control", false)
-
                                 if (!isRemoteAllowed) {
                                     val now = System.currentTimeMillis()
                                     if (now - lastRejectTime > 5000) {
@@ -926,24 +863,16 @@ class VoiceService : Service() {
                                                 sendTextMessage(senderIp, "LOC:${loc.latitude},${loc.longitude}")
                                                 updateNotification("📍 LOCATION SHARED", "Sent to $senderName")
                                             } else {
-                                                // [IMPROVEMENT] Tell the Guardian that GPS failed instead of staying silent
                                                 sendTextMessage(senderIp, "ERROR: No GPS Signal found")
                                             }
                                         }
                                     }
-                                    // [NOTE] It is cleaner to use 'else if' here to keep the chain together,
-                                    // but a separate 'if' works fine too.
                                     else if (cleanMessage == "CMD:REMOTE_RESTORE") {
-                                        // Reset Flags
                                         isSilenced = false
                                         isTheaterMode = false
                                         _voiceServiceState.update { it.copy(isSilenced = false, isTheaterMode = false) }
-
-                                        // Reset Hardware
                                         toggleSpeaker(true)
                                         if (_voiceServiceState.value.isVoxEnabled) toggleVox(false)
-
-                                        // Confirm
                                         speakText("Device restored to normal mode")
                                         updateNotification("✅ RESTORED", "Reset by $senderName")
                                         sendTextMessage(senderIp, "CONFIRM: Device Restored to Normal")
@@ -1076,11 +1005,10 @@ class VoiceService : Service() {
 
     fun toggleTheaterMode(enabled: Boolean) { toggleSpeaker(!enabled) }
 
-    // [FIX] Updated helper to send explicit state
     fun toggleVox(enabled: Boolean) {
         val intent = Intent(this, VoiceService::class.java).apply {
             action = "TOGGLE_VOX"
-            putExtra("state", enabled) // Pass specific state request
+            putExtra("state", enabled)
         }
         startService(intent)
     }
@@ -1109,15 +1037,9 @@ class VoiceService : Service() {
         dataSaverEnabled = prefs.getBoolean("data_saver", false)
         val isGroupCall = ips.size > 1
 
-        // [LOGIC FIX]
-        // 1. Group Calls: ALWAYS Compress (Bandwidth is shared, sending Raw is dangerous).
-        // 2. Mobile Data: Compress IF the user asked for "Data Saver".
-        // 3. WiFi: User gets "Crystal Clear" (Raw) unless they manually forced Data Saver.
-
         val shouldCompress = if (isGroupCall) {
-            true // Force compression for groups to prevent lag
+            true
         } else {
-            // P2P Call: Obey the toggle + Network Status
             !isOnWifi && dataSaverEnabled
         }
         val isSecureMode = prefs.getBoolean("secure_mode", false)
@@ -1154,7 +1076,6 @@ class VoiceService : Service() {
             releaseResourcesIfNeeded()
         }
 
-        // [FIX] Don't restart VOX if we are just ending a transmission manually
         if (_voiceServiceState.value.isVoxEnabled) startVoxMonitoring()
     }
 
@@ -1206,26 +1127,20 @@ class VoiceService : Service() {
     private fun handleIncomingSignal(callerName: String, isPriority: Boolean = false) {
         val currentTime = System.currentTimeMillis()
 
-        // Logic: Only update state if it's a new burst (>3s silence) or Priority
         if (!isReceiving || (currentTime - lastReceiveTime > 3000) || isPriority) {
             acquireResources()
             isReceiving = true
 
-            // Update internal state
             _voiceServiceState.update { it.copy(incomingCall = callerName, incomingIp = lastIncomingIp) }
 
-            // [BATTERY FIX] DO NOT WAKE SCREEN HERE.
-            // Just update the notification bar so they see who is talking if they look.
             val status = if (isPriority) "⚠️ PRIORITY: $callerName" else if (isSilenced) "Missed: $callerName" else "Incoming: $callerName"
             updateNotification(status, callerName)
 
-            // Vibrate if needed (Haptic feedback for "Incoming Voice")
             if (!isSilenced || isPriority) vibrate()
         }
 
         lastReceiveTime = currentTime
 
-        // Keep the session alive for 5 seconds of silence
         resetJob?.cancel()
         resetJob = scope.launch {
             delay(5000)
@@ -1242,8 +1157,6 @@ class VoiceService : Service() {
 
         _voiceServiceState.update { it.copy(incomingCall = null, networkStatus = "Listening...") }
         updateNotification("Listening...", null)
-
-        // [NEW] Clear the Call Notification
         getSystemService(NotificationManager::class.java).cancel(2)
 
         releaseResourcesIfNeeded()
@@ -1322,13 +1235,11 @@ class VoiceService : Service() {
             .build()
     }
 
-    // [NEW] High Priority Notification that wakes the screen
     private fun showIncomingCallNotification(callerName: String) {
-        // 1. Create the Intent to open MainActivity
         val fullScreenIntent = Intent(this, MainActivity::class.java).apply {
             action = "INCOMING_CALL"
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-            putExtra("auto_connect_channel", callerName) // Optional: Pass caller info
+            putExtra("auto_connect_channel", callerName)
         }
 
         val fullScreenPendingIntent = PendingIntent.getActivity(
@@ -1338,26 +1249,22 @@ class VoiceService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        // 2. Build the Notification
         val notificationBuilder = NotificationCompat.Builder(this, "VoiceChannel")
             .setSmallIcon(R.mipmap.ic_launcher_foreground)
             .setContentTitle("Incoming Call")
             .setContentText(callerName)
-            .setPriority(NotificationCompat.PRIORITY_MAX) // MAX is required for pop-up
-            .setCategory(NotificationCompat.CATEGORY_CALL) // Critical for DND bypass
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC) // Show on lock screen
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setAutoCancel(true)
-            .setFullScreenIntent(fullScreenPendingIntent, true) // <--- THE KEY LINE
+            .setFullScreenIntent(fullScreenPendingIntent, true)
             .setOngoing(true)
-
-            // Add an "Answer" button directly in the notification banner
             .addAction(
                 android.R.drawable.ic_menu_call,
                 "Open",
                 fullScreenPendingIntent
             )
 
-        // 3. Fire it! (Using ID 2 to separate it from the persistent service ID 1)
         val notificationManager = getSystemService(NotificationManager::class.java)
         notificationManager.notify(2, notificationBuilder.build())
     }
@@ -1366,7 +1273,12 @@ class VoiceService : Service() {
         if (tts != null) { tts?.stop(); tts?.shutdown(); tts = null }
         audioRouter.shutdown()
         CallEngine.stopCall()
-        scope.launch { triggerHeartbeat("offline") }
+
+        // [NEW] Trigger offline via manager (fire and forget)
+        if (::connectionManager.isInitialized) {
+            connectionManager.stop()
+        }
+
         sensorHelper?.stop()
         stopVoxMonitoring()
         audioEngine.shutdown()
