@@ -18,6 +18,10 @@
 -keep class in.chinmoydas.signal.ChannelResponse { *; }
 -keep class in.chinmoydas.signal.ChannelUser { *; }
 -keep class in.chinmoydas.signal.ResetResponse { *; }
+-keep class in.chinmoydas.signal.WakeResponse { *; }
+-keep class in.chinmoydas.signal.GenericResponse { *; }
+-keep class in.chinmoydas.signal.SignalResponse { *; }
+-keep class in.chinmoydas.signal.IncomingSignal { *; }
 
 # --- Room & Other Data Layer ---
 -keep class in.chinmoydas.signal.data.** { *; }

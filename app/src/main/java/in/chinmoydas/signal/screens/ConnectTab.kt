@@ -246,7 +246,8 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                         status = "Local Network",
                         isOnline = true,
                         onRadioClick = { viewModel.addContact(user.name, user.ip, ""); onConnected() },
-                        onCallClick = { CallSignaling.startOutgoingCall(user.ip) }
+                        onCallClick = { CallSignaling.startOutgoingCall(user.ip) },
+                        onWakeClick = {} // Wake logic not needed for local peers usually
                     )
                 }
             }
@@ -275,7 +276,9 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                         status = if (contact.isPriority) "⭐ Principal" else "Saved",
                         isOnline = isOnline,
                         onRadioClick = { viewModel.setTarget(contact.name); onConnected() },
-                        onCallClick = { CallSignaling.startOutgoingCall(contact.ip) }
+                        onCallClick = { CallSignaling.startOutgoingCall(contact.ip) },
+                        // [UPDATED] Pass the wake function. Works for any saved contact.
+                        onWakeClick = { viewModel.sendCloudWakeUp(context, contact) }
                     )
                 }
             }
@@ -300,7 +303,8 @@ fun TacticalUserRow(
     status: String,
     isOnline: Boolean,
     onRadioClick: () -> Unit,
-    onCallClick: () -> Unit
+    onCallClick: () -> Unit,
+    onWakeClick: () -> Unit
 ) {
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -331,6 +335,20 @@ fun TacticalUserRow(
                 }
             }
             Row {
+                // [NEW] Wake Button - Always visible for quick access
+                FilledTonalIconButton(
+                    onClick = onWakeClick,
+                    modifier = Modifier.size(40.dp),
+                    colors = IconButtonDefaults.filledTonalIconButtonColors(
+                        containerColor = Color(0xFFFFF8E1), // Light Amber bg
+                        contentColor = Color(0xFFFFA000)    // Deep Amber icon
+                    )
+                ) {
+                    Icon(Icons.Default.Bolt, "Wake Device")
+                }
+
+                Spacer(Modifier.width(8.dp))
+
                 FilledTonalIconButton(
                     onClick = onRadioClick,
                     modifier = Modifier.size(40.dp),
@@ -338,7 +356,9 @@ fun TacticalUserRow(
                 ) {
                     Icon(Icons.Default.GraphicEq, "Radio", tint = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
+
                 Spacer(Modifier.width(8.dp))
+
                 FilledTonalIconButton(
                     onClick = onCallClick,
                     enabled = isOnline,
