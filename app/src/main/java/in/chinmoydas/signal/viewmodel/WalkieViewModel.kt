@@ -299,7 +299,12 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                 } else {
                     val response = repository.findPeer(token, name, code)
                     if (response.ip != null) {
-                        repository.saveContact(name, response.ip, code)
+                        repository.saveContact(
+                            name = name,
+                            ip = response.ip,
+                            code = code,
+                            fcmToken = response.fcm_token ?: "" // Token is now explicitly saved
+                        )
                         repository.saveChannelKey(code)
                         repository.setTargetUser(name)
                         loadData()
@@ -385,6 +390,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
                         val newIp = response.ip
                         val extraIp = response.local_ip
+                        val newToken = response.fcm_token ?: ""
                         // [THE FIX] Capture the dynamic port (e.g., 24912) from the server
                         val targetPort = response.port ?: 50005
 
@@ -402,7 +408,14 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                             }
 
                             // Save the new IP to local DB for next time
-                            if (newIp != contact.ip) repository.saveContact(contact.name, newIp, contact.savedCode)
+                            if (newIp != contact.ip || newToken != contact.fcmToken) {
+                                repository.saveContact(
+                                    name = contact.name,
+                                    ip = newIp,
+                                    code = contact.savedCode,
+                                    fcmToken = newToken
+                                )
+                            }
                         } else {
                             if (!speculated) _uiState.value = UiState.Error("User Offline")
                         }

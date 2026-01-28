@@ -10,67 +10,68 @@ import retrofit2.http.GET
 import retrofit2.http.Header
 import retrofit2.http.POST
 import java.util.concurrent.TimeUnit
+import com.google.gson.annotations.SerializedName
+import retrofit2.Response
 
-// --- RESPONSE MODELS ---
+// --- DATA MODELS (Gson Compatible) ---
+
 data class WakeResponse(
-    val status: String,  // "success" or "error"
-    val message: String?,
-    val error: String?
+    @SerializedName("status") val status: String,
+    @SerializedName("message") val message: String?,
+    @SerializedName("error") val error: String?
 )
+
 data class LoginResponse(
-    val status: String,
-    val token: String,
-    val username: String,
-    val error: String?,
-    val code: String
+    @SerializedName("status") val status: String,
+    @SerializedName("token") val token: String,
+    @SerializedName("username") val username: String,
+    @SerializedName("error") val error: String?,
+    @SerializedName("code") val code: String
 )
 
 data class PeerResponse(
-    val status: String,
-    val ip: String?,
-    val local_ip: String?,
-    val port: Int?,
-    val fcm_token: String? // Added this field
+    @SerializedName("status") val status: String,
+    @SerializedName("ip") val ip: String?,
+    @SerializedName("local_ip") val local_ip: String?, // Keeps WalkieViewModel happy
+    @SerializedName("port") val port: Int?,
+    @SerializedName("fcm_token") val fcm_token: String?
 )
 
 data class ChannelUser(
-    val username: String,
-    val public_ip: String?,
-    val local_ip: String?
+    @SerializedName("username") val username: String,
+    @SerializedName("public_ip") val public_ip: String?, // Keeps WalkieViewModel happy
+    @SerializedName("local_ip") val local_ip: String?
 )
 
 data class ChannelResponse(
-    val status: String,
-    val users: List<ChannelUser>?
+    @SerializedName("status") val status: String,
+    @SerializedName("users") val users: List<ChannelUser>?
 )
 
 data class ResetResponse(
-    val status: String,
-    val new_code: String?
+    @SerializedName("status") val status: String,
+    @SerializedName("new_code") val new_code: String?
 )
 
 data class GenericResponse(
-    val status: String,
-    val message: String?,
-    val error: String?
+    @SerializedName("status") val status: String,
+    @SerializedName("message") val message: String?,
+    @SerializedName("error") val error: String?
 )
 
-// [CRITICAL UPDATE START]
-// This new model holds the IP address sent by the server.
-// Without this, the app receives the signal but doesn't know where to connect.
 data class IncomingSignal(
-    val sender: String,
-    val public_ip: String?,
-    val public_port: Int? // <--- NEW FIELD
+    @SerializedName("sender") val sender: String,
+    @SerializedName("public_ip") val public_ip: String?,
+    @SerializedName("public_port") val public_port: Int?
 )
 
 data class SignalResponse(
-    val callers: List<String>?,        // Legacy support (Old Server)
-    val signals: List<IncomingSignal>? // New robust support (Smart Server)
+    @SerializedName("callers") val callers: List<String>?,
+    @SerializedName("signals") val signals: List<IncomingSignal>?
 )
-// [CRITICAL UPDATE END]
 
 // --- API INTERFACE ---
+
 interface ApiService {
 
     @FormUrlEncoded
@@ -106,7 +107,7 @@ interface ApiService {
         @Field("channel") channel: String?,
         @Field("channel_key") key: String?,
         @Field("status") status: String = "online"
-    ): retrofit2.Response<Unit>
+    ): Response<Unit>
 
     @POST("api/reset_code.php")
     suspend fun resetCode(
@@ -119,21 +120,20 @@ interface ApiService {
         @Header("Authorization") token: String,
         @Field("action") action: String,
         @Field("target") target: String?
-    ): retrofit2.Response<Unit>
+    ): Response<Unit>
 
     @GET("api/signal.php?action=check_signals")
     suspend fun checkSignals(
         @Header("Authorization") token: String
     ): SignalResponse
 
-    // [NEW] The Cloud Wake Method
     @FormUrlEncoded
     @POST("api/fcm_wake.php")
     suspend fun sendWakeSignal(
-        @Header("Authorization") authHeader: String, // Added Auth Header
+        @Header("Authorization") authHeader: String,
         @Field("target_token") token: String,
         @Field("sender_name") sender: String
-    ): retrofit2.Response<WakeResponse>
+    ): Response<WakeResponse>
 
     @FormUrlEncoded
     @POST("api/reset_auth.php")
@@ -156,15 +156,17 @@ interface ApiService {
     suspend fun updateFcmToken(
         @Header("Authorization") token: String,
         @Field("fcm_token") fcmToken: String
-    ): retrofit2.Response<Unit>
+    ): Response<Unit>
 
     @FormUrlEncoded
     @POST("api/update_email.php")
     suspend fun updateRecoveryEmail(
         @Header("Authorization") authHeader: String,
         @Field("email") email: String
-    ): retrofit2.Response<GenericResponse>
+    ): Response<GenericResponse>
 }
+
+// --- RETROFIT CLIENT ---
 
 object RetrofitClient {
     private const val BASE_URL = "https://signal.chinmoydas.in/"
@@ -175,12 +177,6 @@ object RetrofitClient {
 
     private val okHttpClient = OkHttpClient.Builder()
         .addInterceptor(logging)
-        /* .addInterceptor { chain ->
-            val request = chain.request().newBuilder()
-                .addHeader("User-Agent", "CD-Signal-Android/1.0")
-                .build()
-            chain.proceed(request)
-        } */
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
@@ -191,7 +187,7 @@ object RetrofitClient {
         Retrofit.Builder()
             .baseUrl(BASE_URL)
             .client(okHttpClient)
-            .addConverterFactory(GsonConverterFactory.create())
+            .addConverterFactory(GsonConverterFactory.create()) // Using Gson as requested
             .build()
             .create(ApiService::class.java)
     }
