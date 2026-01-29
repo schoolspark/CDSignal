@@ -27,7 +27,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.isActive // [FIX] Added import for isActive
+import kotlinx.coroutines.isActive
 import java.io.File
 import android.graphics.Color as AndroidColor
 
@@ -59,10 +59,8 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
     var connectionStatus by mutableStateOf(ConnectionStatus.IDLE)
         private set
-    private var pingJob: Job? = null
 
     // [MISSION CRITICAL] PTT Job Management
-    // Prevents "Sticky Mic" race condition
     private var transmissionJob: Job? = null
 
     var qrBitmap by mutableStateOf<Bitmap?>(null)
@@ -100,39 +98,30 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         loadData()
     }
 
-    // [FIX] Added Helper to get IP for Calls (Fixes MainActivity error)
     fun getCurrentTargetIp(): String? {
         if (targetUser.isEmpty()) return null
-
-        // 1. Check Saved Contacts
         val saved = savedContacts.find { it.name == targetUser }
         if (saved != null) return saved.ip
-
-        // 2. Check Nearby/Local Users
         val nearby = nearbyUsers.find { it.name == targetUser }
         return nearby?.ip
     }
 
-    // Toggle Priority Logic
     fun togglePriority(name: String) {
         val contact = savedContacts.find { it.name == name } ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) { // [FIX] Move DB write to IO
             repository.setContactPriority(name, !contact.isPriority)
-            loadData()
+            loadData() // loadData handles switching back to Main
         }
     }
 
     fun observeServicePing(service: VoiceService?) {
         viewModelScope.launch {
             service?.voiceServiceState?.collect { state ->
-                // If service says "Listening", we are connected to the network
                 if (state.networkStatus.contains("Listening")) {
                     connectionStatus = ConnectionStatus.READY
                 } else if (state.networkStatus.contains("Waiting")) {
                     connectionStatus = ConnectionStatus.OFFLINE
                 }
-
-                // Fallback: Check ping response time
                 val diff = System.currentTimeMillis() - state.lastPingResponse
                 if (state.lastPingResponse > 0 && diff < 2000) {
                     connectionStatus = ConnectionStatus.READY
@@ -146,31 +135,36 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
             connectionStatus = ConnectionStatus.IDLE
             return
         }
-
         connectionStatus = ConnectionStatus.CHECKING
-
-        // [FIX] Use Extension function to send Heartbeat via Intent
         service?.triggerHeartbeat()
     }
 
     fun loadData() {
         viewModelScope.launch {
+            // [CRITICAL FIX] Heavy Lifting (DB Fetch + Mapping) moved to IO Thread
+            // This prevents the 100+ frames skipped error during startup/refresh
+            val (saved, blocked, logs) = withContext(Dispatchers.IO) {
+                val s = repository.getAllContacts().map {
+                    Contact(it.name, it.ip, true, it.savedCode, it.isPriority, it.fcmToken)
+                }
+                val b = repository.getBlockedContacts().map {
+                    Contact(it.name, it.ip, true, it.savedCode, it.isPriority, it.fcmToken)
+                }
+                val l = repository.getAllLogs()
+                Triple(s, b, l)
+            }
+
+            // Apply changes on Main Thread
             savedContacts.clear()
-            savedContacts.addAll(repository.getAllContacts().map {
-                Contact(it.name, it.ip, true, it.savedCode, it.isPriority, it.fcmToken)
-            })
-
+            savedContacts.addAll(saved)
             blockedContacts.clear()
-            blockedContacts.addAll(repository.getBlockedContacts().map {
-                Contact(it.name, it.ip, true, it.savedCode, it.isPriority, it.fcmToken)
-            })
-
-            _callLogs.value = repository.getAllLogs()
+            blockedContacts.addAll(blocked)
+            _callLogs.value = logs
         }
     }
 
     fun deletePagerEntry(entry: PagerEntry) {
-        viewModelScope.launch(Dispatchers.IO) { // [FIX] IO Dispatcher
+        viewModelScope.launch(Dispatchers.IO) {
             repository.deletePagerEntry(entry)
         }
     }
@@ -181,20 +175,15 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
     fun sendTextPayload(service: VoiceService?, text: String) {
         if (text.isBlank()) return
-
         val ip = getCurrentTargetIp()
 
         if (ip != null && ip != "SERVER_LINK") {
+            // UDP Send is fast/non-blocking, fine on Main or IO
             service?.sendTextMessage(ip, text)
 
-            // [FIX] Filter out System Commands from Chat History
-            // We don't want "CMD:REMOTE_MIC_ON" cluttering the UI
-            if (text.startsWith("CMD:") || text.startsWith("LOC:")) {
-                return
-            }
+            if (text.startsWith("CMD:") || text.startsWith("LOC:")) return
 
-            // Only save actual human messages
-            viewModelScope.launch {
+            viewModelScope.launch(Dispatchers.IO) { // [FIX] DB Insert on IO
                 repository.insertPagerEntry(
                     PagerEntry(sender = "Me", type = "TEXT", content = text, isRead = true)
                 )
@@ -204,16 +193,11 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         }
     }
 
-    // [FIX] Dynamic SOS Trigger (Always targets the CURRENT user)
-    // This fixes the issue where the button was stuck on the previous user's IP
     fun triggerCurrentSos(service: VoiceService?) {
         val ip = getCurrentTargetIp()
-
         if (ip != null && ip != "SERVER_LINK") {
-            // Target specific user
             service?.sendTextMessage(ip, "CMD:SOS")
         } else {
-            // If no specific target, use the Service's "Broadcast Mode"
             service?.sendPanicAlert()
         }
     }
@@ -251,23 +235,45 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     }
 
     fun addContact(name: String, ip: String, code: String) {
-        viewModelScope.launch { repository.saveContact(name, ip, code); loadData(); setTarget(name) }
+        viewModelScope.launch(Dispatchers.IO) { // [FIX] DB Write on IO
+            repository.saveContact(name, ip, code)
+            loadData() // loadData manages its own context switching
+            withContext(Dispatchers.Main) { setTarget(name) }
+        }
     }
 
     fun blockContact(name: String) {
-        viewModelScope.launch { repository.setBlockedStatus(name, true); loadData(); if (targetUser == name) setTarget("") }
+        viewModelScope.launch(Dispatchers.IO) { // [FIX] DB Write on IO
+            repository.setBlockedStatus(name, true)
+            loadData()
+            withContext(Dispatchers.Main) {
+                if (targetUser == name) setTarget("")
+            }
+        }
     }
 
     fun unblockContact(name: String) {
-        viewModelScope.launch { repository.setBlockedStatus(name, false); loadData() }
+        viewModelScope.launch(Dispatchers.IO) { // [FIX] DB Write on IO
+            repository.setBlockedStatus(name, false)
+            loadData()
+        }
     }
 
     fun deleteContact(name: String) {
-        viewModelScope.launch { repository.deleteContact(name); loadData(); if (targetUser == name) setTarget("") }
+        viewModelScope.launch(Dispatchers.IO) { // [FIX] DB Write on IO
+            repository.deleteContact(name)
+            loadData()
+            withContext(Dispatchers.Main) {
+                if (targetUser == name) setTarget("")
+            }
+        }
     }
 
     fun clearHistory() {
-        viewModelScope.launch { repository.clearLogs(); _callLogs.value = emptyList() }
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.clearLogs()
+            _callLogs.value = emptyList()
+        }
     }
 
     fun startLocalDiscovery(context: Context) {
@@ -291,17 +297,23 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
     fun saveInternetContact(name: String, code: String, onSuccess: () -> Unit, onError: () -> Unit) {
         _uiState.value = UiState.Error("Verifying...")
-        viewModelScope.launch {
+
+        viewModelScope.launch(Dispatchers.IO) { // [FIX] Network Verification on IO
             val token = repository.getToken() ?: ""
-            if (token.isBlank() || token == "OFFLINE_TOKEN") { _uiState.value = UiState.Error("Need Internet"); onError(); return@launch }
+            if (token.isBlank() || token == "OFFLINE_TOKEN") {
+                withContext(Dispatchers.Main) { _uiState.value = UiState.Error("Need Internet"); onError() }
+                return@launch
+            }
             try {
                 if (name.startsWith("group:", true)) {
                     repository.saveContact(name, "SERVER_LINK", code)
                     repository.saveChannelKey(code)
                     repository.setTargetUser(name)
                     loadData()
-                    _uiState.value = UiState.Connected(name)
-                    onSuccess()
+                    withContext(Dispatchers.Main) {
+                        _uiState.value = UiState.Connected(name)
+                        onSuccess()
+                    }
                 } else {
                     val response = repository.findPeer(token, name, code)
                     if (response.ip != null) {
@@ -309,25 +321,29 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                             name = name,
                             ip = response.ip,
                             code = code,
-                            fcmToken = response.fcm_token ?: "" // Token is now explicitly saved
+                            fcmToken = response.fcm_token ?: ""
                         )
                         repository.saveChannelKey(code)
                         repository.setTargetUser(name)
                         loadData()
-                        _uiState.value = UiState.Connected(name)
-                        onSuccess()
-                    } else { _uiState.value = UiState.Error("Access Denied"); onError() }
+                        withContext(Dispatchers.Main) {
+                            _uiState.value = UiState.Connected(name)
+                            onSuccess()
+                        }
+                    } else {
+                        withContext(Dispatchers.Main) { _uiState.value = UiState.Error("Access Denied"); onError() }
+                    }
                 }
-            } catch (e: Exception) { _uiState.value = UiState.Error("Link Error"); onError() }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { _uiState.value = UiState.Error("Link Error"); onError() }
+            }
         }
     }
 
     fun startTransmission(onIpsFound: (List<String>, Int) -> Unit, onUpdateIps: (List<String>) -> Unit) {
-        // 1. Safety Checks
         if (_uiState.value is UiState.Transmitting || _uiState.value is UiState.Receiving) return
         _uiState.value = UiState.Transmitting("Connecting...", false)
 
-        // 2. BROADCAST MODE (Always 50005 because it is Local LAN)
         if (isBroadcastMode) {
             val allIps = nearbyUsers.filter { it.ip.isNotEmpty() }.map { it.ip }
             if (allIps.isNotEmpty()) {
@@ -339,7 +355,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
         if (targetUser.isEmpty()) { _uiState.value = UiState.Error("No Target Selected"); return }
 
-        // 3. LOCAL DISCOVERY USER (Always 50005 because it is Local LAN)
         val localUser = nearbyUsers.find { it.name.equals(targetUser, ignoreCase = true) }
         if (localUser != null) {
             _uiState.value = UiState.Transmitting("On Air (Local)", false)
@@ -347,111 +362,64 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
             return
         }
 
-        // --- INTERNET / WAN LOGIC STARTS HERE ---
-
         val contact = savedContacts.find { it.name.equals(targetUser, ignoreCase = true) }
         val token = repository.getToken() ?: ""
         if (token.isBlank() || token == "OFFLINE_TOKEN") { _uiState.value = UiState.Error("Offline"); return }
 
-        // 4. GROUPS (Server-Assisted)
-        if (targetUser.startsWith("group:", ignoreCase = true)) {
-            val channelName = targetUser.substringAfter(":")
-            val passkey = contact?.savedCode ?: ""
-            viewModelScope.launch {
-                try {
-                    val response = repository.findChannel(token, channelName, passkey)
-                    if (_uiState.value !is UiState.Transmitting) return@launch
-
-                    // Flatten IPs from the server response
-                    val finalIps = response.users?.flatMap { listOfNotNull(it.public_ip, it.local_ip) }?.toSet()
-
-                    if (!finalIps.isNullOrEmpty()) {
-                        _uiState.value = UiState.Transmitting("On Air", false)
-                        // [NOTE] Groups currently use 50005. If you upgrade channel.php to send ports, update this.
-                        onIpsFound(finalIps.toList(), 50005)
-                    } else { _uiState.value = UiState.Error("Channel Empty") }
-                } catch (e: Exception) { _uiState.value = UiState.Error("Channel Error") }
-            }
-            return
+        // [OPTIMIZATION] Speculative Execution
+        // Start transmitting immediately to last known IP while we verify with server
+        var speculated = false
+        if (contact != null && contact.ip.isNotEmpty() && contact.ip != "SERVER_LINK") {
+            _uiState.value = UiState.Transmitting("On Air", false)
+            onIpsFound(listOf(contact.ip), 50005)
+            speculated = true
         }
 
-        // 5. SAVED CONTACTS (P2P via Internet) - [CRITICAL NAT FIX APPLIED]
-        if (contact != null) {
-            var speculated = false
+        // [FIX] Parallel Server Refresh on IO Thread
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                if (targetUser.startsWith("group:", true)) {
+                    val response = repository.findChannel(token, targetUser.substringAfter(":"), contact?.savedCode ?: "")
+                    if (_uiState.value !is UiState.Transmitting) return@launch
+                    val finalIps = response.users?.flatMap { listOfNotNull(it.public_ip, it.local_ip) }?.toSet()
 
-            // A. Speculative Execution: Try last known IP/Port immediately for speed
-            // We default to 50005 here because we don't store ports in DB yet.
-            if (contact.ip.isNotEmpty() && contact.ip != "SERVER_LINK") {
-                _uiState.value = UiState.Transmitting("On Air", false)
-                onIpsFound(listOf(contact.ip), 50005)
-                speculated = true
-            }
+                    withContext(Dispatchers.Main) {
+                        if (!finalIps.isNullOrEmpty()) {
+                            _uiState.value = UiState.Transmitting("On Air", false)
+                            onIpsFound(finalIps.toList(), 50005)
+                        } else if (!speculated) {
+                            _uiState.value = UiState.Error("Channel Empty")
+                        }
+                    }
+                } else if (contact != null) {
+                    val response = repository.findPeer(token, contact.name, contact.savedCode)
+                    if (_uiState.value !is UiState.Transmitting) return@launch
 
-            // B. Refresh from Server to get the REAL IP and PORT (STUN)
-            if (contact.savedCode.isNotEmpty()) {
-                viewModelScope.launch {
-                    try {
-                        val response = repository.findPeer(token, contact.name, contact.savedCode)
-                        if (_uiState.value !is UiState.Transmitting) return@launch
+                    val ipList = listOfNotNull(response.ip, response.local_ip).distinct()
+                    val targetPort = response.port ?: 50005
 
-                        val newIp = response.ip
-                        val extraIp = response.local_ip
-                        val newToken = response.fcm_token ?: ""
-                        // [THE FIX] Capture the dynamic port (e.g., 24912) from the server
-                        val targetPort = response.port ?: 50005
-
-                        if (newIp != null) {
-                            val ipList = listOfNotNull(newIp, extraIp).distinct()
-
+                    withContext(Dispatchers.Main) {
+                        if (ipList.isNotEmpty()) {
                             if (!speculated) {
-                                // First attempt: Start with the correct port
                                 _uiState.value = UiState.Transmitting("On Air", false)
                                 onIpsFound(ipList, targetPort)
                             } else {
-                                // We already started on 50005. If the IP changed, update the list.
-                                // Note: Changing port mid-stream is complex, so we prioritize IP updates here.
                                 onUpdateIps(ipList)
                             }
-
-                            // Save the new IP to local DB for next time
-                            if (newIp != contact.ip || newToken != contact.fcmToken) {
-                                repository.saveContact(
-                                    name = contact.name,
-                                    ip = newIp,
-                                    code = contact.savedCode,
-                                    fcmToken = newToken
-                                )
-                            }
-                        } else {
-                            if (!speculated) _uiState.value = UiState.Error("User Offline")
+                        } else if (!speculated) {
+                            _uiState.value = UiState.Error("User Offline")
                         }
-                    } catch (e: Exception) {
-                        if (!speculated) _uiState.value = UiState.Error("Link Failed")
+                    }
+
+                    // Silent update of local DB
+                    if (response.ip != contact.ip) {
+                        repository.saveContact(contact.name, response.ip!!, contact.savedCode, response.fcm_token ?: "")
                     }
                 }
-            } else if (!speculated) { _uiState.value = UiState.Error("No IP Saved") }
-            return
-        }
-
-        // 6. UNSAVED SEARCH (P2P via Internet)
-        viewModelScope.launch {
-            try {
-                // Use default public code "0000" or handle appropriately
-                val response = repository.findPeer(token, targetUser, "0000")
-                if (_uiState.value !is UiState.Transmitting) return@launch
-
-                val ipList = listOfNotNull(response.ip, response.local_ip).distinct()
-
-                // [THE FIX] Use the dynamic port
-                val targetPort = response.port ?: 50005
-
-                if (ipList.isNotEmpty()) {
-                    _uiState.value = UiState.Transmitting("On Air", false)
-                    onIpsFound(ipList, targetPort)
-                } else { _uiState.value = UiState.Error("User Offline") }
             } catch (e: Exception) {
-                if (_uiState.value !is UiState.Transmitting) return@launch;
-                _uiState.value = UiState.Error("Link Failed")
+                withContext(Dispatchers.Main) {
+                    if (!speculated) _uiState.value = UiState.Error("Link Failed")
+                }
             }
         }
     }
@@ -463,39 +431,20 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
     fun hangUp(service: VoiceService?) {
         _uiState.value = if (targetUser.isNotEmpty()) UiState.Connected(targetUser) else UiState.Ready
-
         if (service == null) return
-
         val state = service.voiceServiceState.value
-
-        if (state.isTransmitting) {
-            service.stopTalk()
-        } else if (state.incomingCall != null) {
-            service.sendRemoteHangup()
-        } else {
-            service.stopReceiving()
-        }
+        if (state.isTransmitting) service.stopTalk()
+        else if (state.incomingCall != null) service.sendRemoteHangup()
+        else service.stopReceiving()
     }
 
     fun onReceptionStarted(from: String, ip: String) {
-        if (_uiState.value !is UiState.Transmitting) {
-            _uiState.value = UiState.Receiving(from)
-        }
+        if (_uiState.value !is UiState.Transmitting) _uiState.value = UiState.Receiving(from)
         if (ip.isNotEmpty() && !from.startsWith("group:", true)) {
-            viewModelScope.launch {
-                val existing = nearbyUsers.find { it.name == from }
-                if (existing != null) {
-                    if (existing.ip != ip) {
-                        val index = nearbyUsers.indexOf(existing)
-                        if (index != -1) nearbyUsers[index] = existing.copy(ip = ip)
-                    }
-                } else { nearbyUsers.add(Contact(from, ip, false)) }
-
+            viewModelScope.launch(Dispatchers.IO) { // [FIX] Silent DB update on IO
                 val saved = savedContacts.find { it.name == from }
                 if (saved != null && saved.ip != ip) {
-                    repository.saveContact(from, ip, saved.savedCode)
-                    val idx = savedContacts.indexOf(saved)
-                    if (idx != -1) savedContacts[idx] = saved.copy(ip = ip)
+                    repository.updateContactIp(from, ip)
                 }
             }
         }
@@ -509,8 +458,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
     fun toggleSilence(service: VoiceService?) {
         service?.let {
-            val intent = android.content.Intent(service, VoiceService::class.java)
-            intent.action = "TOGGLE_MUTE"
+            val intent = android.content.Intent(service, VoiceService::class.java).apply { action = "TOGGLE_MUTE" }
             service.startService(intent)
         }
     }
@@ -544,60 +492,52 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     }
 
     fun resetPairingCode(myName: String) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) { // [FIX] Network call on IO
             val token = repository.getToken() ?: ""
             if (token.isBlank() || token == "OFFLINE_TOKEN") return@launch
             try {
                 val response = repository.resetCode(token)
                 if (response.status == "success") {
                     response.new_code?.let { code ->
-                        repository.saveMyPairingCode(code)
-                        qrBitmap = generateQr("$myName|$code")
+                        withContext(Dispatchers.Main) {
+                            repository.saveMyPairingCode(code)
+                            qrBitmap = generateQr("$myName|$code")
+                        }
                     }
                 }
             } catch (e: Exception) { Log.e("WalkieViewModel", "Pairing code reset failed", e) }
         }
     }
 
-    // [NEW] 2. Link the Receiver
     fun handleIncomingPacket(text: String, ip: String): Boolean {
-        // 1. Calls
         if (text.startsWith("CMD:CALL")) {
             viewModelScope.launch {
                 `in`.chinmoydas.signal.utils.CallSignaling.handleSignal(text, ip)
             }
             return true
         }
-
-        // 2. SOS / Panic
         if (text.startsWith("CMD:SOS") || text.startsWith("CMD:PANIC")) {
             `in`.chinmoydas.signal.utils.SafetySignaling.triggerSOS(ip)
-            // [FIX] Return FALSE so this packet falls through and gets saved
-            // to the History/Pager database as a text message.
             return false
         }
-
-        // 3. Location
         if (text.startsWith("LOC:")) {
             val coords = text.removePrefix("LOC:")
             `in`.chinmoydas.signal.utils.SafetySignaling.triggerLocation(ip, coords)
-            return false // Keep false to save to history
+            return false
         }
-
         return false
     }
+
     fun toggleStealth(service: VoiceService?) {
         service?.let {
-            val intent = android.content.Intent(it, VoiceService::class.java)
-            intent.action = "TOGGLE_STEALTH"
+            val intent = android.content.Intent(it, VoiceService::class.java).apply { action = "TOGGLE_STEALTH" }
             it.startService(intent)
         }
     }
 
     fun toggleVox(service: VoiceService?) {
         service?.let {
-            val intent = android.content.Intent(it, VoiceService::class.java)
-            intent.action = "TOGGLE_VOX"
+            val intent = android.content.Intent(it, VoiceService::class.java).apply { action = "TOGGLE_VOX" }
             it.startService(intent)
         }
     }
@@ -605,31 +545,24 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     fun performHealthCheck(context: Context, service: VoiceService?) =
         `in`.chinmoydas.signal.utils.SystemDiagnostics.runChecks(context, service)
 
-    /**
-     * Triggers a high-priority FCM wake signal via the PHP backend.
-     * Gracefully handles JWT authentication and UI feedback.
-     */
     fun sendCloudWakeUp(context: Context, contact: Contact) {
-        // 1. PRE-FLIGHT CHECK: Verify we have a token to send to.
         if (contact.fcmToken.isBlank()) {
-            android.widget.Toast.makeText(context, "Cloud Wake unavailable: No token for ${contact.name}", android.widget.Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "Cloud Wake unavailable: No token for ${contact.name}", Toast.LENGTH_SHORT).show()
             return
         }
 
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO) { // [FIX] Guaranteed IO Thread
             try {
-                // 2. AUTHENTICATION: Fetch the 1-year JWT token from storage.
                 val jwt = repository.getToken()
-                val myName = repository.myUsername.value // Use the current state-flow value.
+                val myName = repository.myUsername.value
 
                 if (jwt.isNullOrEmpty()) {
                     withContext(Dispatchers.Main) {
-                        android.widget.Toast.makeText(context, "Session expired. Please log in.", android.widget.Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Session expired. Please log in.", Toast.LENGTH_SHORT).show()
                     }
                     return@launch
                 }
 
-                // 3. NETWORK CALL: Execute the POST request to fcm_wake.php.
                 val authHeader = "Bearer $jwt"
                 val response = repository.sendWakeSignal(
                     authHeader = authHeader,
@@ -637,59 +570,41 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                     targetToken = contact.fcmToken
                 )
 
-                // 4. UI DISPATCH: Handle the server response on the Main thread.
                 withContext(Dispatchers.Main) {
                     if (response.isSuccessful) {
                         val body = response.body()
                         if (body?.status == "success") {
-                            // Success: Signal reached your PHP script and was sent to FCM.
-                            android.widget.Toast.makeText(context, "Wake signal sent to ${contact.name}! ⚡", android.widget.Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "Wake signal sent to ${contact.name}! ⚡", Toast.LENGTH_SHORT).show()
                         } else {
-                            // Logic Error: Handled by your PHP script (e.g., Google Auth failed).
                             val errorDetail = body?.error ?: body?.message ?: "Wake request rejected"
-                            android.widget.Toast.makeText(context, "Failed: $errorDetail", android.widget.Toast.LENGTH_LONG).show()
+                            Toast.makeText(context, "Failed: $errorDetail", Toast.LENGTH_LONG).show()
                         }
                     } else {
-                        // HTTP Error: 401 Unauthorized, 404 Not Found, or 500 Server Error.
-                        val errorMsg = when (response.code()) {
-                            401 -> "Unauthorized: Please log in again."
-                            500 -> "Server Error: Check PHP logs."
-                            else -> "Server returned code ${response.code()}"
-                        }
-                        android.widget.Toast.makeText(context, errorMsg, android.widget.Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Server returned code ${response.code()}", Toast.LENGTH_SHORT).show()
                     }
                 }
             } catch (e: Exception) {
-                // 5. EXCEPTION HANDLING: Handle timeouts or lost internet connection.
-                e.printStackTrace()
                 withContext(Dispatchers.Main) {
-                    android.widget.Toast.makeText(context, "Connection failed. Check your internet.", android.widget.Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Connection failed. Check your internet.", Toast.LENGTH_SHORT).show()
                 }
             }
         }
     }
-    // [FIXED] Now saves to local storage so it persists after restart
-    fun saveRecoveryEmail(context: Context, email: String, onSuccess: () -> Unit) {
 
-        // 1. Validation Logic
+    fun saveRecoveryEmail(context: Context, email: String, onSuccess: () -> Unit) {
         if (email.isNotEmpty() && !android.util.Patterns.EMAIL_ADDRESS.matcher(email).matches()) {
             Toast.makeText(context, "Invalid Email Format", Toast.LENGTH_SHORT).show()
             return
         }
 
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO) { // [FIX] Guaranteed IO Thread
             try {
-                // 2. Call Server
                 val token = repository.getToken() ?: ""
                 val response = RetrofitClient.api.updateRecoveryEmail("Bearer $token", email)
 
                 withContext(Dispatchers.Main) {
                     if (response.isSuccessful && response.body()?.status == "success") {
-
-                        // [CRITICAL FIX] Save to Local Storage immediately!
-                        // This updates the SharedPreferences so the UI sees it next time.
                         repository.setRecoveryEmail(email)
-
                         Toast.makeText(context, "Recovery Email Updated", Toast.LENGTH_SHORT).show()
                         onSuccess()
                     } else {

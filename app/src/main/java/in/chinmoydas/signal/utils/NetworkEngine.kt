@@ -4,6 +4,7 @@ import android.util.Log
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -15,66 +16,61 @@ class NetworkEngine(
     private var socket: DatagramSocket? = null
     private val isRunning = AtomicBoolean(false)
 
-    // [MISSION CRITICAL] Queue Size Limit
-    // 200 packets @ 40ms = 8 seconds of audio buffer max.
-    private val sendQueue = LinkedBlockingQueue<DatagramPacket>(200)
+    // [FIX] Limit queue size to prevent memory leaks if network is slow
+    private val sendQueue = LinkedBlockingQueue<DatagramPacket>(100)
+
+    // [CRITICAL] Fixed Thread Pool (4 threads).
+    // This handles high-speed audio packets without crashing the CPU.
+    private val sendExecutor = Executors.newFixedThreadPool(4)
 
     fun start(onPacketReceived: (DatagramPacket) -> Unit): Boolean {
         if (isRunning.getAndSet(true)) return true
 
-        // [AUDIT FIX] Bind Retry Mechanism
-        // Sometimes Android holds the port for a few ms after a network switch.
-        // We try 3 times before failing.
+        // Retry logic for port binding (Robustness)
         var attempt = 0
         var bound = false
-
         while (attempt < 3 && !bound) {
             try {
                 socket = DatagramSocket(port).apply {
                     reuseAddress = true
-                    receiveBufferSize = 256 * 1024 // Increased buffer for stability
+                    receiveBufferSize = 256 * 1024
                     soTimeout = 0
                 }
                 bound = true
             } catch (e: Exception) {
-                Log.w(tag, "Bind attempt $attempt failed: ${e.message}")
                 attempt++
-                try { Thread.sleep(300) } catch (x: Exception) {}
+                try { Thread.sleep(200) } catch (e: Exception) {}
             }
         }
 
         if (!bound) {
-            Log.e(tag, "FATAL: Could not bind UDP port $port after 3 attempts.")
             isRunning.set(false)
             return false
         }
 
-        // Sender Thread
+        // 1. Sender Thread (Consumes the queue)
         Thread {
             while (isRunning.get()) {
                 try {
                     val packet = sendQueue.take()
                     socket?.send(packet)
-                } catch (e: Exception) {
-                    // Socket closed or network error
-                }
+                } catch (e: Exception) { /* socket closed */ }
             }
         }.start()
 
-        // Receiver Thread
+        // 2. Receiver Thread (Listens for data)
         Thread {
-            val buffer = ByteArray(4096) // Large enough for any MTU
+            val buffer = ByteArray(4096)
             val packet = DatagramPacket(buffer, buffer.size)
 
             while (isRunning.get()) {
                 try {
-                    // Reset packet length for next read
-                    packet.length = buffer.size
+                    packet.setData(buffer)
                     socket?.receive(packet)
 
                     val dataCopy = packet.data.copyOf(packet.length)
 
-                    // Traffic Splitter: STUN vs Audio/Data
+                    // Traffic Splitter: STUN vs Audio
                     if (StunClient.isStunResponse(dataCopy)) {
                         onStunPacket(dataCopy)
                     } else {
@@ -82,40 +78,35 @@ class NetworkEngine(
                         onPacketReceived(forwardingPacket)
                     }
                 } catch (e: Exception) {
-                    if (isRunning.get()) Log.w(tag, "UDP Receive Error: ${e.message}")
+                    if (isRunning.get()) Log.w(tag, "Receive Error: ${e.message}")
                 }
             }
         }.start()
 
-        Log.i(tag, "Network Engine Started on Port $port")
         return true
     }
 
-    // Allow sending raw packets (needed for STUN requests)
     fun sendRawPacket(packet: DatagramPacket) {
-        queuePacketSafe(packet)
+        if (isRunning.get()) sendQueue.offer(packet)
     }
 
+    // [CRITICAL FIX] Efficient Sending
+    // Offloads IP resolution to the thread pool so the UI/Audio thread never waits.
     fun send(data: ByteArray, targets: List<String>, targetPort: Int) {
-        if (!isRunning.get()) return
-        Thread {
+        if (!isRunning.get() || targets.isEmpty()) return
+
+        sendExecutor.execute {
             targets.forEach { ip ->
                 try {
                     val address = InetAddress.getByName(ip)
                     val packet = DatagramPacket(data, data.size, address, targetPort)
-                    queuePacketSafe(packet)
+                    // If queue is full, drop oldest packet to keep audio "real-time"
+                    if (!sendQueue.offer(packet)) {
+                        sendQueue.poll()
+                        sendQueue.offer(packet)
+                    }
                 } catch (e: Exception) { }
             }
-        }.start()
-    }
-
-    // [MISSION CRITICAL] Safe Queue Logic
-    // If queue is full (network congestion), Drop the Oldest packet.
-    // This favors "Real-Time" audio over "Complete" audio.
-    private fun queuePacketSafe(packet: DatagramPacket) {
-        if (!sendQueue.offer(packet)) {
-            sendQueue.poll() // Discard oldest packet (Latency preservation)
-            sendQueue.offer(packet) // Add new packet
         }
     }
 

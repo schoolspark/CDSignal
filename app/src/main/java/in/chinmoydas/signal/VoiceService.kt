@@ -1,13 +1,16 @@
 package `in`.chinmoydas.signal
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.AlarmManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioFormat
@@ -80,6 +83,8 @@ class VoiceService : Service() {
 
     private var lastRejectTime: Long = 0
     private var isTheaterMode = false
+
+    // [FIX] Interceptor is the primary way UI handles logic now
     var packetInterceptor: ((String, String) -> Boolean)? = null
 
     // Engines & Routers
@@ -123,6 +128,10 @@ class VoiceService : Service() {
     @Volatile private var myIdentityKey: String? = null
     @Volatile private var currentSpeakerName: String? = null
 
+    // [FIX] Added activeTargets to support multi-cast PTT
+    @Volatile private var activeTargets: List<String> = emptyList()
+    @Volatile private var lastPort: Int = UDP_PORT
+
     private var lastStatusMessage: String = "Initializing..."
 
     var isSilenced: Boolean = false
@@ -152,8 +161,6 @@ class VoiceService : Service() {
     private val principalCache = ConcurrentHashMap.newKeySet<String>()
 
     @Volatile private var ignoredSender: String? = null
-    @Volatile private var activeTargets: List<String> = emptyList()
-    @Volatile private var lastPort: Int = UDP_PORT
 
     private val incomingBuffer = java.io.ByteArrayOutputStream(512 * 1024)
     private val bufferLock = Any()
@@ -177,6 +184,20 @@ class VoiceService : Service() {
     private var signalingJob: Job? = null
     private var currentSequenceNumber = 0
     private var localLinkManager: LocalLinkManager? = null
+
+    // [CRITICAL] Broadcast Receiver for loose coupling with UI
+    private val signalReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == "in.chinmoydas.signal.SEND_SIGNAL") {
+                val ip = intent.getStringExtra("ip")
+                val cmd = intent.getStringExtra("cmd")
+                if (ip != null && cmd != null) {
+                    Log.d(tag, "Broadcasting Signal: $cmd to $ip")
+                    sendTextMessage(ip, cmd)
+                }
+            }
+        }
+    }
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
@@ -208,8 +229,10 @@ class VoiceService : Service() {
 
                     _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
 
-                    // Restart Heartbeat
-                    connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
+                    // [FIX] Ensure ConnectionManager exists before using it
+                    if (::connectionManager.isInitialized) {
+                        connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
+                    }
 
                     broadcastHello()
                     localLinkManager?.startAdvertising(myUsername, UDP_PORT)
@@ -229,6 +252,7 @@ class VoiceService : Service() {
     inner class LocalBinder : Binder() { fun getService(): VoiceService = this@VoiceService }
     override fun onBind(intent: Intent): IBinder = binder
 
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     override fun onCreate() {
         super.onCreate()
 
@@ -242,18 +266,28 @@ class VoiceService : Service() {
         audioEngine = AudioEngine(this)
         repository = MainRepository(applicationContext)
 
+        // 1. Init NetworkEngine with STUN Splitter Logic
         networkEngine = NetworkEngine(UDP_PORT) { stunData ->
             if (::connectionManager.isInitialized) {
                 connectionManager.handleStunResponse(stunData)
             }
         }
 
+        // 2. Init Connection Manager
         connectionManager = ConnectionManager(repository, networkEngine)
 
         val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
         dataSaverEnabled = prefs.getBoolean("data_saver", false)
 
         initMediaSession()
+
+        // [FIX] Register Receiver with Tiramisu support
+        val filter = IntentFilter("in.chinmoydas.signal.SEND_SIGNAL")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(signalReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(signalReceiver, filter)
+        }
 
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
@@ -301,7 +335,6 @@ class VoiceService : Service() {
         connectivityManager.registerNetworkCallback(NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), networkCallback)
     }
 
-    // Helper to Bridge MainActivity -> AudioRouter
     fun setCallMode(active: Boolean) {
         if (::audioRouter.isInitialized) {
             audioRouter.setCallMode(active)
@@ -544,6 +577,12 @@ class VoiceService : Service() {
                 refreshNotification()
                 return START_STICKY
             }
+            "CMD_HEARTBEAT" -> {
+                if (::connectionManager.isInitialized) {
+                    connectionManager.triggerImmediateHeartbeat()
+                }
+                return START_STICKY
+            }
         }
 
         if (intent?.getBooleanExtra("is_cloud_wake", false) == true) {
@@ -564,7 +603,10 @@ class VoiceService : Service() {
                 if (!multicastLock.isHeld) multicastLock.acquire()
                 audioEngine.startPlayback()
 
+                // [CRITICAL] 1. Start Network Listening
                 val networkStarted = networkEngine.start { packet ->
+                    // Note: STUN packets never reach here. They go to ConnectionManager.
+                    // Only Audio/Data packets arrive here.
                     handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
                 }
 
@@ -577,6 +619,7 @@ class VoiceService : Service() {
                 _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
                 updateNotification("Online & Ready", null)
 
+                // [CRITICAL] 2. Start Smart Heartbeat Loop
                 connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
 
                 startSignalLoop()
@@ -792,26 +835,8 @@ class VoiceService : Service() {
                             val cleanMessage = textData.substring(4)
 
                             // [CRITICAL FIX] Intercept Call Signals
+                            // This delegates logic to the UI/ViewModel layer via MainActivity
                             if (packetInterceptor?.invoke(cleanMessage, senderIp) == true) {
-                                return
-                            }
-
-                            if (cleanMessage.startsWith("CMD:CALL")) {
-                                if (cleanMessage == "CMD:CALL_REQ") {
-                                    showIncomingCallNotification(senderName)
-                                }
-                                scope.launch { CallSignaling.handleSignal(cleanMessage, senderIp) }
-                                return
-                            }
-
-                            if (cleanMessage.startsWith("CMD:SOS") || cleanMessage.startsWith("CMD:PANIC")) {
-                                scope.launch { SafetySignaling.triggerSOS(senderIp) }
-                                return
-                            }
-
-                            if (cleanMessage.startsWith("LOC:")) {
-                                val coords = cleanMessage.removePrefix("LOC:")
-                                scope.launch { SafetySignaling.triggerLocation(senderIp, coords) }
                                 return
                             }
 
@@ -1011,8 +1036,19 @@ class VoiceService : Service() {
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     fun startTalk(ips: List<String>, port: Int) {
         if (isSending) return
+
+        // [FIX] Validating Targets
+        if (ips.isEmpty()) {
+            Log.e(tag, "No Target IPs!")
+            return
+        }
+
         stopVoxMonitoring()
         acquireResources(forceAudio = true)
+
+        // [FIX] Enable Hardware Echo Cancellation (Fixes "Noise when together")
+        audioRouter.setCallMode(true)
+
         isSending = true
         currentSequenceNumber = 0
         activeTargets = ips
@@ -1031,8 +1067,12 @@ class VoiceService : Service() {
         val isSecureMode = prefs.getBoolean("secure_mode", false)
         val secretKey = if (isSecureMode) getEncryptionKey() else null
 
+        // [FIX] Confirmation Vibrate (Since we don't have the beep sound)
+        vibrate()
+
         audioEngine.startRecording(shouldCompress) { rawBuffer ->
             if (_voiceServiceState.value.isVoxEnabled) voxHelper?.process(rawBuffer)
+
             val payloadToSend = if (isSecureMode && secretKey != null) {
                 CryptoEngine.encrypt(rawBuffer, currentSequenceNumber, secretKey) ?: rawBuffer
             } else { rawBuffer }
@@ -1044,6 +1084,7 @@ class VoiceService : Service() {
             System.arraycopy(nameBytes, 0, sendBuf, 1, nameBytes.size)
             ByteBuffer.wrap(sendBuf, 1 + nameBytes.size, 4).putInt(currentSequenceNumber++)
             System.arraycopy(payloadToSend, 0, sendBuf, headerLen, payloadToSend.size)
+
             networkEngine.send(sendBuf, activeTargets, port)
         }
     }
@@ -1052,7 +1093,12 @@ class VoiceService : Service() {
         if (!isSending) return
         isSending = false
         updateState()
+
         audioEngine.stopRecording()
+
+        // [FIX] Disable Echo Cancellation Mode
+        audioRouter.setCallMode(false)
+
         scope.launch {
             val endNameBytes = END_STREAM_SIGNAL.toByteArray()
             val buf = ByteArray(1 + endNameBytes.size + 4)

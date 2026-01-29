@@ -1,11 +1,13 @@
 package `in`.chinmoydas.signal
 
+import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -49,15 +51,18 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
+    // [FIX] Static flag to prevent double-prompting the battery permission
+    // This survives Activity restarts (like Login -> Home transition)
+    companion object {
+        private var hasAskedBattery = false
+    }
+
     private var voiceService: VoiceService? = null
     private var isBound = false
     private lateinit var walkieViewModel: WalkieViewModel
 
-    // In-App Update Variables
     private lateinit var appUpdateManager: AppUpdateManager
     private val UPDATE_REQUEST_CODE = 123
-
-    // State to pass to Compose triggers
     private val serviceBoundState = mutableStateOf<VoiceService?>(null)
 
     private val exitReceiver = object : BroadcastReceiver() {
@@ -82,7 +87,6 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onServiceDisconnected(arg0: ComponentName) {
-            // [FIX] Clear reference to prevent leaks
             voiceService?.packetInterceptor = null
             isBound = false
             voiceService = null
@@ -92,6 +96,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // [MISSION CRITICAL FIX] Initialize Signaling so Calls work immediately
+        // This connects the "Call" button logic to the Android System
+        `in`.chinmoydas.signal.utils.CallSignaling.initialize(applicationContext)
 
         // [FIX] Allow waking up the screen for incoming calls
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
@@ -107,12 +115,10 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        // 1. Initialize Update Manager
         appUpdateManager = AppUpdateManagerFactory.create(this)
         appUpdateManager.registerListener(installStateUpdatedListener)
         checkForUpdates()
 
-        // 2. Register Receiver Securely
         val filter = IntentFilter("in.chinmoydas.signal.ACTION_EXIT")
         ContextCompat.registerReceiver(
             this,
@@ -121,7 +127,13 @@ class MainActivity : ComponentActivity() {
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
 
+        // [FIX] Check battery, but respect the 'hasAsked' flag
         checkBatteryOptimizations()
+
+        // [CRITICAL] Auto-start radio if permissions exist (Fixes "Disconnected" state)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            startAndBindService()
+        }
 
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT),
@@ -139,7 +151,6 @@ class MainActivity : ComponentActivity() {
                     var startDest by remember { mutableStateOf<String?>(null) }
                     val currentService by serviceBoundState
 
-                    // [NEW] Collect Service State for Overlays (Speaker Status)
                     val serviceState by currentService?.voiceServiceState?.collectAsState(initial = VoiceServiceState())
                         ?: remember { mutableStateOf(VoiceServiceState()) }
 
@@ -152,7 +163,6 @@ class MainActivity : ComponentActivity() {
 
                     LaunchedEffect(startDest) {
                         if (startDest == "home") {
-                            // Sync our latest FCM token to the server so others can "Wake" us
                             lifecycleScope.launch(Dispatchers.IO) {
                                 repository.syncFcmTokenToServer()
                             }
@@ -161,14 +171,12 @@ class MainActivity : ComponentActivity() {
 
                     if (startDest != null) {
                         val navController = rememberNavController()
-
-                        // Initialize ViewModel
                         walkieViewModel = ViewModelProvider(this@MainActivity, factory)[WalkieViewModel::class.java]
 
-                        // Double-check linkage
-                        LaunchedEffect(Unit) {
-                            if (isBound && voiceService != null) {
-                                linkServiceLogic(voiceService!!)
+                        // Double-check linkage if service connects while UI is initializing
+                        LaunchedEffect(currentService) {
+                            if (currentService != null) {
+                                linkServiceLogic(currentService!!)
                             }
                         }
 
@@ -198,21 +206,17 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
-                        // --- OVERLAYS ---
-
                         val nameResolverHelper: (String) -> String = { ip ->
                             val contact = walkieViewModel.savedContacts.find { it.ip == ip }
                             contact?.name ?: if (walkieViewModel.getCurrentTargetIp() == ip) walkieViewModel.targetUser else ip
                         }
 
-                        // 1. Phone Call Screen (Wired to Service Audio)
                         CallOverlay(
                             nameResolver = nameResolverHelper,
                             onSpeakerToggle = { currentService?.toggleSpeaker(!serviceState.isSpeakerOn) },
                             isSpeakerOn = serviceState.isSpeakerOn
                         )
 
-                        // 2. Emergency Alerts
                         SafetyOverlay(nameResolver = nameResolverHelper)
 
                     } else {
@@ -224,8 +228,6 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-
-    // --- IN-APP UPDATE LOGIC ---
 
     private val installStateUpdatedListener = InstallStateUpdatedListener { state ->
         if (state.installStatus() == InstallStatus.DOWNLOADED) {
@@ -279,37 +281,25 @@ class MainActivity : ComponentActivity() {
         appUpdateManager.completeUpdate()
     }
 
-    // --- SERVICE LOGIC ---
-
     private fun linkServiceLogic(service: VoiceService) {
         if (!::walkieViewModel.isInitialized) return
-
-        // [FIX] REMOVED: walkieViewModel.setupCallSupport(service)
-        // CallSignaling now sends Intent broadcasts directly to VoiceService.
 
         service.packetInterceptor = { text, ip ->
             walkieViewModel.handleIncomingPacket(text, ip)
         }
 
-        // [FIX] Enhanced Call State Management
         lifecycleScope.launch {
             CallSignaling.callEvents.collect { event ->
                 when (event) {
                     is CallSignaling.CallEvent.CallConnected -> {
-                        // Stop PTT to allow Full-Duplex Call
                         service.stopTalk()
                         service.toggleVox(false)
-
-                        // [FIXED] Use the public helper method, not the private variable
                         service.setCallMode(true)
                     }
                     is CallSignaling.CallEvent.CallEnded,
                     is CallSignaling.CallEvent.CallRejected -> {
-                        // [FIX] Safety: Force transmission OFF when call ends
                         service.stopTalk()
                         service.toggleVox(false)
-
-                        // [FIXED] Revert to Standard PTT Mode via helper
                         service.setCallMode(false)
                     }
                     else -> {}
@@ -329,23 +319,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleIntent(intent: Intent?) {
-        // 1. Existing Auto-Channel logic (for normal notifications)
         val autoChannel = intent?.getStringExtra("auto_connect_channel")
-
-        // 2. New Cloud Wake logic
         val isCloudWake = intent?.getBooleanExtra("is_cloud_wake", false) == true
         val wokenBy = intent?.getStringExtra("woken_by")
 
         if (::walkieViewModel.isInitialized) {
             if (isCloudWake && wokenBy != null) {
-                // Focus on the person who triggered the Cloud Wake
                 walkieViewModel.setTarget(wokenBy)
                 Toast.makeText(this, "Woken by $wokenBy", Toast.LENGTH_SHORT).show()
             } else if (autoChannel != null) {
                 walkieViewModel.setTarget(autoChannel)
             }
-
-            // Clean up intent to prevent re-triggering on rotation
             intent?.removeExtra("auto_connect_channel")
             intent?.removeExtra("is_cloud_wake")
             intent?.removeExtra("woken_by")
@@ -353,23 +337,22 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun checkBatteryOptimizations() {
-        // 1. Safety Check: Only run on Android 6.0+ (API 23+)
+        // [FIX] Don't ask if we already asked in this session
+        if (hasAskedBattery) return
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
 
-            // 2. Check if we already have the exemption
             if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                // Mark as asked so we don't loop
+                hasAskedBattery = true
                 try {
-                    // 3. Request the exemption
                     val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
                         data = Uri.parse("package:$packageName")
                     }
                     startActivity(intent)
                 } catch (e: Exception) {
-                    // 4. Crash Protection: Some manufacturers (e.g., Xiaomi/Huawei)
-                    // remove this standard Intent, causing a crash without this catch block.
                     Log.e("MainActivity", "Failed to launch Battery Optimization settings", e)
-                    Toast.makeText(this, "Please manually disable Battery Saver for this app", Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -413,7 +396,7 @@ class MainActivity : ComponentActivity() {
         try { unregisterReceiver(exitReceiver) } catch (e: Exception) {}
 
         if (isBound) {
-            voiceService?.packetInterceptor = null // [FIX] Detach interceptor
+            voiceService?.packetInterceptor = null
             try { unbindService(connection) } catch (e: Exception) {
                 Log.e("MainActivity", "Failed to unbind service", e)
             }

@@ -79,6 +79,8 @@ fun TalkTab(
     // UI Interaction States
     var isPressed by remember { mutableStateOf(false) }
     val fusedLocationClient = remember { LocationServices.getFusedLocationProviderClient(context) }
+
+    // [FIX] Correctly observe the Unstable Service State
     val serviceState by service?.voiceServiceState?.collectAsState(initial = VoiceServiceState()) ?: remember { mutableStateOf(VoiceServiceState()) }
     val listState = rememberLazyListState()
 
@@ -95,12 +97,13 @@ fun TalkTab(
 
     // Auto-scroll to new messages
     LaunchedEffect(pagerEntries.size) {
-        if (pagerEntries.isNotEmpty()) listState.animateScrollToItem(pagerEntries.size)
+        if (pagerEntries.isNotEmpty()) listState.animateScrollToItem(0) // Scroll to top (newest)
     }
 
     LaunchedEffect(service) { viewModel.observeServicePing(service) }
     LaunchedEffect(viewModel.targetUser) { if (viewModel.targetUser.isNotEmpty()) viewModel.triggerPing(service) }
 
+    // [FIX] Permissions for Unstable Core (Android 14+ Microphone Service)
     LaunchedEffect(Unit) {
         val perms = mutableListOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.VIBRATE, Manifest.permission.ACCESS_FINE_LOCATION)
         if (Build.VERSION.SDK_INT >= 34) perms.add(Manifest.permission.FOREGROUND_SERVICE_MICROPHONE)
@@ -109,7 +112,7 @@ fun TalkTab(
         permLauncher.launch(perms.toTypedArray())
     }
 
-    // SOS Overlay
+    // [FIX] Wiring SOS to the new Unstable VoiceService logic
     if (serviceState.isSosPending) {
         SosDialog(onCancel = { service?.cancelSos() }, onSend = { service?.confirmSos() })
     }
@@ -148,26 +151,20 @@ fun TalkTab(
                     }
                     Text(if (isSecureMode) "Encrypted Channel" else "Public Channel", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
 
-                    // [UPDATED] Permanent Cloud Wake/Ping Button
-                    // Shows whenever a Target is selected + Not in Broadcast Mode
+                    // [FIX] Cloud Wake Logic from Unstable ViewModel
                     if (viewModel.targetUser.isNotEmpty() && !viewModel.isBroadcastMode) {
-
                         val targetContact = viewModel.savedContacts.find { it.name == viewModel.targetUser }
-                        // Check if we have a token (allow the button even if status is 'Ready' just in case)
                         val hasToken = targetContact?.fcmToken?.isNotBlank() == true
 
                         if (hasToken) {
                             val isOffline = viewModel.connectionStatus == ConnectionStatus.OFFLINE
-
                             Spacer(modifier = Modifier.height(12.dp))
                             Button(
                                 onClick = {
                                     if (targetContact != null) {
-                                        // Pass the targetContact (which is a ContactEntity) to the function
                                         viewModel.sendCloudWakeUp(context, targetContact)
                                     }
                                 },
-                                // Amber for Wake (Offline), Grey for Ping (Online)
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = if (isOffline) Color(0xFFFFA000) else Color.LightGray,
                                     contentColor = if (isOffline) Color.Black else Color.DarkGray
@@ -179,15 +176,6 @@ fun TalkTab(
                                 Spacer(Modifier.width(8.dp))
                                 Text(if (isOffline) "WAKE DEVICE (CLOUD)" else "SEND CLOUD PING", fontWeight = FontWeight.Bold)
                             }
-
-                            // Helper text below button
-                            Text(
-                                if (isOffline) "Target is offline. Tap to wake them." else "Target is online. Tap to ping.",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = Color.Gray,
-                                fontSize = 10.sp,
-                                modifier = Modifier.padding(top = 4.dp)
-                            )
                         }
                     }
                 }
@@ -200,7 +188,6 @@ fun TalkTab(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // Guardian Remote Button
                     IconButton(onClick = {
                         if (viewModel.targetUser.isNotBlank() && viewModel.targetUser != "SERVER_LINK") {
                             showGuardianControls = true
@@ -211,21 +198,19 @@ fun TalkTab(
                         Icon(Icons.Default.SettingsRemote, "Guardian Remote", tint = MaterialTheme.colorScheme.error)
                     }
 
-                    // Sync
+                    // [FIX] Calls Unstable Service heartbeat to force update IPs
                     IconButton(onClick = { service?.triggerHeartbeat(); viewModel.triggerPing(service); Toast.makeText(context, "Synced", Toast.LENGTH_SHORT).show() }) {
                         Icon(Icons.Default.Sync, "Sync", tint = MaterialTheme.colorScheme.primary)
                     }
-                    // System Check
+
                     IconButton(onClick = onCheckSystem) {
                         Icon(Icons.Default.VerifiedUser, "System Check", tint = MaterialTheme.colorScheme.primary)
                     }
 
-                    // Message
                     IconButton(onClick = { showTextDialog = true }) {
                         Icon(Icons.Default.Keyboard, "Message", tint = MaterialTheme.colorScheme.primary)
                     }
 
-                    // Speaker (Updates automatically via AudioRouter)
                     FilledTonalIconToggleButton(
                         checked = serviceState.isSpeakerOn,
                         onCheckedChange = { viewModel.toggleSpeaker(service) },
@@ -235,7 +220,6 @@ fun TalkTab(
                         Icon(if (serviceState.isSpeakerOn) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff, null)
                     }
 
-                    // Silent
                     FilledTonalIconToggleButton(
                         checked = serviceState.isSilenced,
                         onCheckedChange = { viewModel.toggleSilence(service) },
@@ -245,7 +229,6 @@ fun TalkTab(
                         Icon(if (serviceState.isSilenced) Icons.Default.NotificationsOff else Icons.Default.NotificationsActive, "Silent")
                     }
 
-                    // Broadcast Mode
                     FilledTonalIconToggleButton(
                         checked = viewModel.isBroadcastMode,
                         onCheckedChange = { viewModel.toggleBroadcastMode() },
@@ -267,7 +250,11 @@ fun TalkTab(
                                 isPressed = true
                                 if (!viewModel.isHandsFree && service != null) {
                                     permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
-                                    viewModel.startTransmission(onIpsFound = { ips, port -> service.startTalk(ips, port) }, onUpdateIps = { newIps -> service.updateTalkTargets(newIps) })
+                                    // [FIX] Matches Unstable WalkieViewModel signature (handling STUN/Dynamic Ports)
+                                    viewModel.startTransmission(
+                                        onIpsFound = { ips, port -> service.startTalk(ips, port) },
+                                        onUpdateIps = { newIps -> service.updateTalkTargets(newIps) }
+                                    )
                                 }
                             }
                             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
@@ -301,7 +288,6 @@ fun TalkTab(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    // Handsfree
                     ElevatedFilterChip(
                         selected = viewModel.isHandsFree,
                         onClick = {
@@ -316,7 +302,6 @@ fun TalkTab(
                         modifier = Modifier.weight(1f)
                     )
 
-                    // Pocket Mode
                     ElevatedFilterChip(
                         selected = serviceState.isHeadsetLinked,
                         onClick = {
@@ -364,7 +349,6 @@ fun TalkTab(
                         FilledIconButton(
                             onClick = {
                                 if (viewModel.targetUser.isNotBlank()) {
-                                    // [FIX] Use ViewModel Dynamic SOS
                                     viewModel.triggerCurrentSos(service)
                                     Toast.makeText(context, "SOS SENT!", Toast.LENGTH_SHORT).show()
                                 }
@@ -397,7 +381,8 @@ fun TalkTab(
             }
         }
 
-        // --- 7. FAB ---
+        // --- 7. FAB (CALL BUTTON) ---
+        // [FIX] Integrated with Unstable CallSignaling
         val targetUser = viewModel.targetUser
         val canCall = targetUser.isNotEmpty() && targetUser != "SERVER_LINK"
         FloatingActionButton(
@@ -464,70 +449,13 @@ fun TalkTab(
                     Text("Only use these commands in emergencies. You must be a 'Principal' on the target device.", style = MaterialTheme.typography.bodySmall)
                     HorizontalDivider()
 
-                    // Command 1: MIC ON
-                    OutlinedButton(
-                        onClick = {
-                            viewModel.sendTextPayload(service, "CMD:REMOTE_MIC_ON")
-                            Toast.makeText(context, "Command Sent: LISTEN IN", Toast.LENGTH_SHORT).show()
-                            showGuardianControls = false
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Red)
-                    ) {
-                        Icon(Icons.Default.Mic, null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("FORCE MIC ON (LISTEN)")
-                    }
-
-                    // Command 2: LOCATION
-                    OutlinedButton(
-                        onClick = {
-                            viewModel.sendTextPayload(service, "CMD:REMOTE_LOCATION")
-                            Toast.makeText(context, "Command Sent: LOCATE", Toast.LENGTH_SHORT).show()
-                            showGuardianControls = false
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF1976D2))
-                    ) {
-                        Icon(Icons.Default.LocationSearching, null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("PING GPS LOCATION")
-                    }
-
-                    // Command 3: STEALTH
-                    OutlinedButton(
-                        onClick = {
-                            viewModel.sendTextPayload(service, "CMD:REMOTE_STEALTH")
-                            Toast.makeText(context, "Command Sent: SILENCE", Toast.LENGTH_SHORT).show()
-                            showGuardianControls = false
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.DarkGray)
-                    ) {
-                        Icon(Icons.Default.VolumeOff, null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("FORCE SILENT MODE")
-                    }
-
-                    // Command 4: RESTORE
-                    OutlinedButton(
-                        onClick = {
-                            viewModel.sendTextPayload(service, "CMD:REMOTE_RESTORE")
-                            Toast.makeText(context, "Command Sent: RESTORE", Toast.LENGTH_SHORT).show()
-                            showGuardianControls = false
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF2E7D32)) // Green
-                    ) {
-                        Icon(Icons.Default.RestartAlt, null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("RESTORE DEVICE (RESET)")
-                    }
+                    OutlinedButton(onClick = { viewModel.sendTextPayload(service, "CMD:REMOTE_MIC_ON"); Toast.makeText(context, "Command Sent", Toast.LENGTH_SHORT).show(); showGuardianControls = false }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Red)) { Icon(Icons.Default.Mic, null); Spacer(Modifier.width(8.dp)); Text("FORCE MIC ON") }
+                    OutlinedButton(onClick = { viewModel.sendTextPayload(service, "CMD:REMOTE_LOCATION"); Toast.makeText(context, "Command Sent", Toast.LENGTH_SHORT).show(); showGuardianControls = false }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF1976D2))) { Icon(Icons.Default.LocationSearching, null); Spacer(Modifier.width(8.dp)); Text("PING GPS LOCATION") }
+                    OutlinedButton(onClick = { viewModel.sendTextPayload(service, "CMD:REMOTE_STEALTH"); Toast.makeText(context, "Command Sent", Toast.LENGTH_SHORT).show(); showGuardianControls = false }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.DarkGray)) { Icon(Icons.Default.VolumeOff, null); Spacer(Modifier.width(8.dp)); Text("FORCE SILENT MODE") }
+                    OutlinedButton(onClick = { viewModel.sendTextPayload(service, "CMD:REMOTE_RESTORE"); Toast.makeText(context, "Command Sent", Toast.LENGTH_SHORT).show(); showGuardianControls = false }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF2E7D32))) { Icon(Icons.Default.RestartAlt, null); Spacer(Modifier.width(8.dp)); Text("RESTORE DEVICE") }
                 }
             },
-            confirmButton = {
-                TextButton(onClick = { showGuardianControls = false }) { Text("CLOSE") }
-            }
+            confirmButton = { TextButton(onClick = { showGuardianControls = false }) { Text("CLOSE") } }
         )
     }
 }
@@ -561,13 +489,11 @@ fun PagerItem(entry: PagerEntry, onPlay: () -> Unit, onDelete: () -> Unit) {
             Spacer(modifier = Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(text = entry.sender, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
-
                 val displayText = when {
                     isLocation -> "📍 Shared Location"
                     isAudio -> "▶ Voice Message"
                     else -> entry.content
                 }
-
                 Text(text = displayText, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             Column(horizontalAlignment = Alignment.End) {

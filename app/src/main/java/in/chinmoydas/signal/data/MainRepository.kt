@@ -5,17 +5,19 @@ import android.content.SharedPreferences
 import android.util.Log
 import `in`.chinmoydas.signal.GenericResponse
 import `in`.chinmoydas.signal.RetrofitClient
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
 import java.io.File
 
 class MainRepository(context: Context) {
     private val db = AppDatabase.getDatabase(context)
     private val contactDao = db.contactDao()
     private val callLogDao = db.callLogDao()
-    private val pagerDao = db.pagerDao() // [NEW] Pager DAO
+    private val pagerDao = db.pagerDao()
     private val prefs: SharedPreferences = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
 
     private val _targetUser = MutableStateFlow(prefs.getString("current_target", "") ?: "")
@@ -24,7 +26,7 @@ class MainRepository(context: Context) {
     private val _channelKey = MutableStateFlow(prefs.getString("channel_key", "") ?: "")
     val channelKey: StateFlow<String> = _channelKey.asStateFlow()
 
-    private val _myUsername = MutableStateFlow(prefs.getString("username", "User") ?: "User")
+    private val _myUsername = MutableStateFlow(prefs.getString("username", "User") ?: "")
     val myUsername: StateFlow<String> = _myUsername.asStateFlow()
 
     private val _myPairingCode = MutableStateFlow(prefs.getString("my_pairing_code", "----") ?: "----")
@@ -36,7 +38,6 @@ class MainRepository(context: Context) {
     private val _recoveryEmail = MutableStateFlow(prefs.getString("recovery_email", "Not Set") ?: "Not Set")
     val recoveryEmail: StateFlow<String> = _recoveryEmail.asStateFlow()
 
-    // [NEW] Expose Pager Entries as a Flow for Real-time UI updates
     val pagerEntries: Flow<List<PagerEntry>> = pagerDao.getAllEntries()
 
     private val prefsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
@@ -55,58 +56,49 @@ class MainRepository(context: Context) {
 
     // --- PAGER / SILENT COMMS METHODS ---
 
-    suspend fun insertPagerEntry(entry: PagerEntry) {
+    suspend fun insertPagerEntry(entry: PagerEntry) = withContext(Dispatchers.IO) {
         pagerDao.insert(entry)
     }
 
-    suspend fun deletePagerEntry(entry: PagerEntry) {
-        // If it's an audio file, delete the actual file from storage to save space
+    suspend fun deletePagerEntry(entry: PagerEntry) = withContext(Dispatchers.IO) {
         if (entry.type == "AUDIO") {
             try {
                 val file = File(entry.content)
                 if (file.exists()) file.delete()
             } catch (e: Exception) { e.printStackTrace() }
         }
-        // Then delete the database record
         pagerDao.delete(entry)
     }
 
-    suspend fun clearPagerHistory() {
-        // Note: For a true cleanup, you might want to iterate and delete files first,
-        // but for speed, clearing the DB is usually sufficient for the UI.
+    suspend fun clearPagerHistory() = withContext(Dispatchers.IO) {
         pagerDao.clearAll()
     }
 
     // --- CONTACTS ---
 
-    suspend fun getAllContacts() = contactDao.getAllContacts()
-    suspend fun getBlockedContacts() = contactDao.getBlockedContacts()
+    suspend fun getAllContacts() = withContext(Dispatchers.IO) { contactDao.getAllContacts() }
+    suspend fun getBlockedContacts() = withContext(Dispatchers.IO) { contactDao.getBlockedContacts() }
 
-    // Helper used by VoiceService for encryption lookups
-    suspend fun findContactByIp(ip: String): ContactEntity? {
-        return contactDao.getAllContacts().find { it.ip == ip }
+    suspend fun findContactByIp(ip: String): ContactEntity? = withContext(Dispatchers.IO) {
+        contactDao.getAllContacts().find { it.ip == ip }
     }
 
-    // Inside MainRepository.kt
-
-    suspend fun saveContact(name: String, ip: String, code: String, fcmToken: String = "") {
-        val isBlocked = contactDao.isBlocked(name) // Preserve Block Status
-        // [FIX] Pass the fcmToken into the Entity
+    suspend fun saveContact(name: String, ip: String, code: String, fcmToken: String = "") = withContext(Dispatchers.IO) {
+        val isBlocked = contactDao.isBlocked(name)
         contactDao.insert(ContactEntity(name, ip, code, isBlocked = isBlocked, fcmToken = fcmToken))
         triggerConfigRefresh()
     }
 
-    // Silent Update: Updates IP without triggering UI refresh
-    suspend fun updateContactIp(name: String, ip: String) {
+    suspend fun updateContactIp(name: String, ip: String) = withContext(Dispatchers.IO) {
         contactDao.updateIp(name, ip)
     }
 
-    suspend fun deleteContact(name: String) {
+    suspend fun deleteContact(name: String) = withContext(Dispatchers.IO) {
         contactDao.delete(ContactEntity(name, "", ""))
         triggerConfigRefresh()
     }
 
-    suspend fun setBlockedStatus(name: String, blocked: Boolean) {
+    suspend fun setBlockedStatus(name: String, blocked: Boolean) = withContext(Dispatchers.IO) {
         contactDao.setBlockedStatus(name, blocked)
         triggerConfigRefresh()
     }
@@ -118,11 +110,13 @@ class MainRepository(context: Context) {
 
     // --- CALL LOGS ---
 
-    suspend fun getAllLogs() = callLogDao.getAllLogs()
-    suspend fun insertLog(name: String, isIncoming: Boolean) {
+    suspend fun getAllLogs() = withContext(Dispatchers.IO) { callLogDao.getAllLogs() }
+
+    suspend fun insertLog(name: String, isIncoming: Boolean) = withContext(Dispatchers.IO) {
         callLogDao.insert(CallLog(callerName = name, isIncoming = isIncoming))
     }
-    suspend fun clearLogs() = callLogDao.clearAll()
+
+    suspend fun clearLogs() = withContext(Dispatchers.IO) { callLogDao.clearAll() }
 
     // --- PREFS HELPERS ---
 
@@ -141,39 +135,42 @@ class MainRepository(context: Context) {
 
     fun getToken(): String? = prefs.getString("jwt_token", null)
 
-    // --- NETWORK API ---
+    // --- NETWORK API (WRAPPED IN IO) ---
 
-    suspend fun findPeer(token: String, name: String, code: String) =
+    suspend fun findPeer(token: String, name: String, code: String) = withContext(Dispatchers.IO) {
         RetrofitClient.api.findPeer("Bearer $token", name, code)
+    }
 
-    suspend fun findChannel(token: String, name: String, code: String) =
+    suspend fun findChannel(token: String, name: String, code: String) = withContext(Dispatchers.IO) {
         RetrofitClient.api.findChannel("Bearer $token", name, code)
+    }
 
-    suspend fun resetCode(token: String) =
+    suspend fun resetCode(token: String) = withContext(Dispatchers.IO) {
         RetrofitClient.api.resetCode("Bearer $token")
+    }
 
-    suspend fun setContactPriority(name: String, isPriority: Boolean) {
+    suspend fun setContactPriority(name: String, isPriority: Boolean) = withContext(Dispatchers.IO) {
         contactDao.setPriority(name, isPriority)
         triggerConfigRefresh()
     }
 
-    suspend fun getPrincipalContacts() = contactDao.getPrincipalContacts()
+    suspend fun getPrincipalContacts() = withContext(Dispatchers.IO) { contactDao.getPrincipalContacts() }
 
-    suspend fun updateContactToken(name: String, token: String) {
+    suspend fun updateContactToken(name: String, token: String) = withContext(Dispatchers.IO) {
         db.contactDao().updateContactToken(name, token)
     }
 
-    suspend fun sendWakeSignal(authHeader: String, senderName: String, targetToken: String) =
+    suspend fun sendWakeSignal(authHeader: String, senderName: String, targetToken: String) = withContext(Dispatchers.IO) {
         RetrofitClient.api.sendWakeSignal(authHeader, targetToken, senderName)
+    }
 
-
-    suspend fun syncFcmTokenToServer() {
-        val token = prefs.getString("my_fcm_token", null) ?: return
+    suspend fun syncFcmTokenToServer() = withContext(Dispatchers.IO) {
+        val token = prefs.getString("my_fcm_token", null)
         if (token == null) {
-            Log.w("FCM_DEBUG", "Skipping Sync: No FCM Token found in SharedPreferences yet.")
-            return
+            Log.w("FCM_DEBUG", "Skipping Sync: No FCM Token found.")
+            return@withContext
         }
-        val jwt = getToken() ?: return
+        val jwt = getToken() ?: return@withContext
 
         try {
             RetrofitClient.api.updateFcmToken("Bearer $jwt", token)
@@ -183,13 +180,12 @@ class MainRepository(context: Context) {
         }
     }
 
-    suspend fun updateRecoveryEmail(email: String): retrofit2.Response<GenericResponse> {
+    suspend fun updateRecoveryEmail(email: String): retrofit2.Response<GenericResponse> = withContext(Dispatchers.IO) {
         val jwt = getToken() ?: throw Exception("Not logged in")
-        // Uses the function you defined in RetrofitClient
-        return RetrofitClient.api.updateRecoveryEmail("Bearer $jwt", email)
+        RetrofitClient.api.updateRecoveryEmail("Bearer $jwt", email)
     }
-    // [NEW] Wrapper for ConnectionManager
-    suspend fun sendHeartbeat(token: String, port: Int, localIp: String, channel: String?, key: String?) {
+
+    suspend fun sendHeartbeat(token: String, port: Int, localIp: String, channel: String?, key: String?) = withContext(Dispatchers.IO) {
         RetrofitClient.api.sendHeartbeat(
             "Bearer $token",
             port,
@@ -201,14 +197,11 @@ class MainRepository(context: Context) {
 
     fun setRecoveryEmail(email: String) {
         val valueToSave = if (email.isBlank()) "Not Set" else email
-
         if (email.isBlank()) {
             prefs.edit().remove("recovery_email").apply()
         } else {
             prefs.edit().putString("recovery_email", email).apply()
         }
-
-        // Update the private mutable flow
         _recoveryEmail.value = valueToSave
     }
 }
