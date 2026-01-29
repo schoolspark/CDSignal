@@ -284,7 +284,8 @@ class MainActivity : ComponentActivity() {
     private fun linkServiceLogic(service: VoiceService) {
         if (!::walkieViewModel.isInitialized) return
 
-        walkieViewModel.setupCallSupport(service)
+        // [FIX] REMOVED: walkieViewModel.setupCallSupport(service)
+        // CallSignaling now sends Intent broadcasts directly to VoiceService.
 
         service.packetInterceptor = { text, ip ->
             walkieViewModel.handleIncomingPacket(text, ip)

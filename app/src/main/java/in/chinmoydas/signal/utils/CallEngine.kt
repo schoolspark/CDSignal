@@ -1,24 +1,12 @@
 package `in`.chinmoydas.signal.utils
 
 import android.annotation.SuppressLint
-import android.media.AudioFormat
-import android.media.AudioManager
-import android.media.AudioRecord
-import android.media.AudioTrack
-import android.media.MediaRecorder
-import android.media.audiofx.AcousticEchoCanceler
-import android.media.audiofx.AutomaticGainControl
-import android.media.audiofx.NoiseSuppressor
+import android.media.*
+import android.media.audiofx.*
 import android.os.Process
 import android.util.Log
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -28,30 +16,30 @@ object CallEngine {
 
     private const val TAG = "CallEngine"
     private const val SAMPLE_RATE = 16000
-    private const val CHANNEL_CONFIG_IN = AudioFormat.CHANNEL_IN_MONO
-    private const val CHANNEL_CONFIG_OUT = AudioFormat.CHANNEL_OUT_MONO
     private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
     private const val CALL_PORT = 50006
 
-    private var audioRecord: AudioRecord? = null
-    private var audioTrack: AudioTrack? = null
+    // [VOLATILE] Critical for thread safety
+    @Volatile private var audioRecord: AudioRecord? = null
+    @Volatile private var audioTrack: AudioTrack? = null
+    @Volatile private var callSocket: DatagramSocket? = null
 
-    private var echoCanceler: AcousticEchoCanceler? = null
-    private var noiseSuppressor: NoiseSuppressor? = null
-    private var autoGainControl: AutomaticGainControl? = null
+    // Audio Effects
+    private var aec: AcousticEchoCanceler? = null
+    private var ns: NoiseSuppressor? = null
+    private var agc: AutomaticGainControl? = null
 
-    var isCallActive = false
+    // State
+    @Volatile var isCallActive = false
         private set
 
-    // [FIX] StateFlow for UI Synchronization
-    private val _muteStatus = MutableStateFlow(false)
-    val muteStatus: StateFlow<Boolean> = _muteStatus.asStateFlow()
-
+    private var targetIp: String = ""
     private var recordJob: Job? = null
     private var playJob: Job? = null
 
-    private var callSocket: DatagramSocket? = null
-    private var targetIp: String? = null
+    // UI State
+    private val _muteStatus = MutableStateFlow(false)
+    val muteStatus: StateFlow<Boolean> = _muteStatus.asStateFlow()
 
     @SuppressLint("MissingPermission")
     fun startCall(ip: String) {
@@ -60,104 +48,89 @@ object CallEngine {
 
         targetIp = ip
         isCallActive = true
-
-        // [FIX] Always start unmuted
         _muteStatus.value = false
 
-        try {
-            callSocket = DatagramSocket(CALL_PORT)
+        // Launch on IO to avoid blocking Main Thread during hardware init
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                // 1. Setup Network (2s timeout to detect dead connection)
+                callSocket = DatagramSocket(CALL_PORT).apply {
+                    soTimeout = 2000
+                }
 
-            val minBufRec = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG_IN, AUDIO_FORMAT) * 2
-            val minBufTrack = AudioTrack.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG_OUT, AUDIO_FORMAT) * 2
+                // 2. Calculate Buffers
+                val minBufRec = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AUDIO_FORMAT) * 2
+                val minBufTrack = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AUDIO_FORMAT) * 2
 
-            audioTrack = AudioTrack(
-                AudioManager.STREAM_VOICE_CALL,
-                SAMPLE_RATE,
-                CHANNEL_CONFIG_OUT,
-                AUDIO_FORMAT,
-                minBufTrack,
-                AudioTrack.MODE_STREAM
-            )
+                // 3. Init Audio Hardware
+                audioTrack = AudioTrack(
+                    AudioManager.STREAM_VOICE_CALL,
+                    SAMPLE_RATE,
+                    AudioFormat.CHANNEL_OUT_MONO,
+                    AUDIO_FORMAT,
+                    minBufTrack,
+                    AudioTrack.MODE_STREAM
+                )
 
-            audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                SAMPLE_RATE,
-                CHANNEL_CONFIG_IN,
-                AUDIO_FORMAT,
-                minBufRec
-            )
+                audioRecord = AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                    SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AUDIO_FORMAT,
+                    minBufRec
+                )
 
-            val sessionId = audioRecord!!.audioSessionId
+                // [CRITICAL] Verify Hardware Init
+                if (audioRecord?.state != AudioRecord.STATE_INITIALIZED || audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
+                    throw Exception("Audio hardware initialization failed")
+                }
 
-            if (AcousticEchoCanceler.isAvailable()) {
-                echoCanceler = AcousticEchoCanceler.create(sessionId).apply { enabled = true }
+                // 4. Setup Effects (if available)
+                val sessionId = audioRecord!!.audioSessionId
+                if (AcousticEchoCanceler.isAvailable()) aec = AcousticEchoCanceler.create(sessionId)?.apply { enabled = true }
+                if (NoiseSuppressor.isAvailable()) ns = NoiseSuppressor.create(sessionId)?.apply { enabled = true }
+                if (AutomaticGainControl.isAvailable()) agc = AutomaticGainControl.create(sessionId)?.apply { enabled = true }
+
+                // 5. Start Stream
+                audioTrack?.play()
+                audioRecord?.startRecording()
+
+                startSendingLoop(minBufRec)
+                startReceivingLoop(minBufTrack)
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Engine Start Failed: ${e.message}")
+                stopCall()
             }
-            if (NoiseSuppressor.isAvailable()) {
-                noiseSuppressor = NoiseSuppressor.create(sessionId).apply { enabled = true }
-            }
-            if (AutomaticGainControl.isAvailable()) {
-                autoGainControl = AutomaticGainControl.create(sessionId).apply { enabled = true }
-            }
-
-            audioTrack?.play()
-            audioRecord?.startRecording()
-
-            startSendingLoop(minBufRec)
-            startReceivingLoop(minBufTrack)
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Engine Start Failed: ${e.message}")
-            stopCall()
         }
-    }
-
-    fun stopCall() {
-        if (!isCallActive) return
-        Log.d(TAG, "Stopping Call Engine")
-
-        isCallActive = false
-        _muteStatus.value = false // Reset UI
-        recordJob?.cancel()
-        playJob?.cancel()
-
-        try {
-            audioRecord?.stop(); audioRecord?.release()
-            audioTrack?.stop(); audioTrack?.release()
-            echoCanceler?.release()
-            noiseSuppressor?.release()
-            autoGainControl?.release()
-            callSocket?.close()
-        } catch (e: Exception) { }
-
-        audioRecord = null
-        audioTrack = null
-        echoCanceler = null; noiseSuppressor = null; autoGainControl = null
-        callSocket = null
     }
 
     private fun startSendingLoop(bufSize: Int) {
         recordJob = CoroutineScope(Dispatchers.IO).launch {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
 
+            // Resolve once to save CPU
             val address = try { InetAddress.getByName(targetIp) } catch (e: Exception) { null }
-            if (address == null) return@launch
+            if (address == null) { stopCall(); return@launch }
 
             val buffer = ByteArray(bufSize)
 
             while (isActive && isCallActive) {
-                // [FIX] Read directly from StateFlow
                 if (_muteStatus.value) {
+                    // Send silence keep-alive (smaller packet)
                     Arrays.fill(buffer, 0)
                     try {
-                        callSocket?.send(DatagramPacket(buffer, buffer.size, address, CALL_PORT))
-                        Thread.sleep(20)
+                        callSocket?.send(DatagramPacket(buffer, 10, address, CALL_PORT))
+                        Thread.sleep(100) // Lower frequency
                     } catch (e: Exception) {}
                 } else {
                     val read = audioRecord?.read(buffer, 0, bufSize) ?: 0
                     if (read > 0) {
                         try {
                             callSocket?.send(DatagramPacket(buffer, read, address, CALL_PORT))
-                        } catch (e: Exception) { }
+                        } catch (e: Exception) {
+                            if (isCallActive) Log.w(TAG, "Send error: ${e.message}")
+                        }
                     }
                 }
             }
@@ -175,12 +148,45 @@ object CallEngine {
                 try {
                     callSocket?.receive(packet)
                     audioTrack?.write(packet.data, 0, packet.length)
-                } catch (e: Exception) { }
+                } catch (e: Exception) {
+                    // Socket timeout or error - expected loop behavior
+                }
             }
         }
     }
 
     fun toggleMute() {
         _muteStatus.value = !_muteStatus.value
+    }
+
+    fun stopCall() {
+        if (!isCallActive) return
+        Log.d(TAG, "Stopping Call Engine")
+
+        // 1. Set flag first to stop loops
+        isCallActive = false
+        _muteStatus.value = false
+
+        // 2. Kill Coroutines
+        recordJob?.cancel()
+        playJob?.cancel()
+
+        // 3. Safe Socket Close
+        try { callSocket?.close() } catch (e: Exception) {}
+        callSocket = null
+
+        // 4. Safe Audio Release
+        try { audioRecord?.stop(); audioRecord?.release() } catch (e: Exception) {}
+        audioRecord = null
+
+        try { audioTrack?.stop(); audioTrack?.release() } catch (e: Exception) {}
+        audioTrack = null
+
+        // 5. Effects Cleanup
+        try {
+            aec?.release(); aec = null
+            ns?.release(); ns = null
+            agc?.release(); agc = null
+        } catch (e: Exception) {}
     }
 }

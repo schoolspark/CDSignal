@@ -1,5 +1,7 @@
 package `in`.chinmoydas.signal.utils
 
+import android.content.Context
+import android.content.Intent
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -12,7 +14,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
-// Move Enum here so it's accessible globally
+// [GLOBAL ENUM]
 enum class CallStatus { Idle, Ringing, Dialing, Active }
 
 object CallSignaling {
@@ -25,77 +27,102 @@ object CallSignaling {
     const val CMD_END = "CMD:CALL_END"
     const val CMD_BUSY = "CMD:CALL_BUSY"
 
-    // [FIX] Persistent State (Source of Truth)
+    // [SOURCE OF TRUTH] Persistent State for UI
     private val _callStatus = MutableStateFlow(CallStatus.Idle)
     val callStatus: StateFlow<CallStatus> = _callStatus.asStateFlow()
 
-    // Keep events for one-shot triggers (like sounds or toasts)
+    // [EVENTS] One-shot events for Toasts/Sounds
     private val _callEvents = MutableSharedFlow<CallEvent>(replay = 1)
     val callEvents: SharedFlow<CallEvent> = _callEvents
 
     var currentCallerIp: String? = null
-    var isBusy = false
+    private var isBusy = false
+    private val scope = CoroutineScope(Dispatchers.Main)
     private var callTimeoutJob: Job? = null
 
-    var sendUdpTextFunction: ((String, String) -> Unit)? = null
-    private val scope = CoroutineScope(Dispatchers.Main)
+    // [FIX] Context required to launch UI from background
+    private var appContext: Context? = null
 
-    suspend fun handlePacket(text: String, senderIp: String) {
-        if (!text.startsWith("CMD:CALL")) return
+    fun initialize(context: Context) {
+        appContext = context.applicationContext
+    }
 
-        Log.d(TAG, "Signal: $text from $senderIp")
+    // [ENTRY POINT] Called by MainActivity Interceptor
+    fun handleSignal(payload: String, ip: String) {
+        if (!payload.startsWith("CMD:CALL")) return
 
-        when (text) {
+        Log.d(TAG, "Signal: $payload from $ip")
+
+        when (payload) {
             CMD_REQ -> {
                 if (isBusy || CallEngine.isCallActive) {
-                    sendSignal(CMD_BUSY, senderIp)
+                    sendSignal(CMD_BUSY, ip)
                 } else {
                     isBusy = true
-                    currentCallerIp = senderIp
-                    _callStatus.value = CallStatus.Ringing // [FIX] Update State
-                    _callEvents.emit(CallEvent.IncomingCall(senderIp))
+                    currentCallerIp = ip
+                    _callStatus.value = CallStatus.Ringing
+
+                    // [MISSION CRITICAL] Wake Screen immediately
+                    launchIncomingCallUI()
+
+                    scope.launch { _callEvents.emit(CallEvent.IncomingCall(ip)) }
+
+                    callTimeoutJob = scope.launch {
+                        delay(30_000) // 30s Answer Timeout
+                        if (_callStatus.value == CallStatus.Ringing) {
+                            declineCall()
+                        }
+                    }
                 }
             }
             CMD_ACC -> {
-                callTimeoutJob?.cancel()
-                _callStatus.value = CallStatus.Active // [FIX] Update State
-                _callEvents.emit(CallEvent.CallConnected)
-                CallEngine.startCall(senderIp)
+                if (_callStatus.value == CallStatus.Dialing) {
+                    callTimeoutJob?.cancel()
+                    _callStatus.value = CallStatus.Active
+                    scope.launch { _callEvents.emit(CallEvent.CallConnected) }
+                    CallEngine.startCall(ip)
+                }
             }
             CMD_REJ -> {
-                callTimeoutJob?.cancel()
-                _callEvents.emit(CallEvent.CallRejected)
-                reset()
+                if (_callStatus.value == CallStatus.Dialing) {
+                    reset()
+                    scope.launch { _callEvents.emit(CallEvent.CallRejected) }
+                }
             }
             CMD_BUSY -> {
-                callTimeoutJob?.cancel()
-                _callEvents.emit(CallEvent.CallBusy)
-                reset()
+                if (_callStatus.value == CallStatus.Dialing) {
+                    reset()
+                    scope.launch { _callEvents.emit(CallEvent.CallBusy) }
+                }
             }
             CMD_END -> {
-                callTimeoutJob?.cancel()
                 CallEngine.stopCall()
-                _callEvents.emit(CallEvent.CallEnded)
                 reset()
+                scope.launch { _callEvents.emit(CallEvent.CallEnded) }
             }
         }
     }
 
-    private fun sendSignal(cmd: String, ip: String) {
-        scope.launch(Dispatchers.IO) {
-            repeat(5) {
-                sendUdpTextFunction?.invoke(cmd, ip)
-                delay(40)
+    // [UI TRIGGER]
+    // Fires an intent to MainActivity with flags to wake the device
+    private fun launchIncomingCallUI() {
+        appContext?.let { ctx ->
+            val intent = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)?.apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                // These extras trigger the Keyguard dismissal in MainActivity
+                action = "INCOMING_CALL"
+                putExtra("is_call", true)
             }
+            ctx.startActivity(intent)
         }
     }
 
+    // [OUTGOING]
     fun startOutgoingCall(ip: String) {
         if (isBusy) return
         isBusy = true
         currentCallerIp = ip
-
-        // [FIX] Set State IMMEDIATELY
         _callStatus.value = CallStatus.Dialing
 
         sendSignal(CMD_REQ, ip)
@@ -105,8 +132,9 @@ object CallSignaling {
         callTimeoutJob = scope.launch {
             delay(30_000)
             if (isBusy && !CallEngine.isCallActive) {
+                // Timeout logic
                 sendSignal(CMD_END, ip)
-                _callEvents.emit(CallEvent.CallEnded)
+                scope.launch { _callEvents.emit(CallEvent.CallEnded) }
                 reset()
             }
         }
@@ -115,7 +143,7 @@ object CallSignaling {
     fun acceptCall() {
         val ip = currentCallerIp ?: return
         isBusy = true
-        _callStatus.value = CallStatus.Active // [FIX] Update State
+        _callStatus.value = CallStatus.Active
         sendSignal(CMD_ACC, ip)
         scope.launch { _callEvents.emit(CallEvent.CallConnected) }
         CallEngine.startCall(ip)
@@ -140,7 +168,23 @@ object CallSignaling {
         isBusy = false
         currentCallerIp = null
         callTimeoutJob?.cancel()
-        _callStatus.value = CallStatus.Idle // [FIX] Reset State
+        _callStatus.value = CallStatus.Idle
+    }
+
+    // [NETWORK BRIDGE]
+    // Sends Intent to VoiceService to transmit UDP packet (Decoupled Architecture)
+    private fun sendSignal(cmd: String, ip: String) {
+        // Repeat signal 3 times for redundancy over UDP
+        scope.launch(Dispatchers.IO) {
+            repeat(3) {
+                appContext?.sendBroadcast(Intent("in.chinmoydas.signal.SEND_SIGNAL").apply {
+                    putExtra("ip", ip)
+                    putExtra("cmd", cmd)
+                    setPackage(appContext?.packageName)
+                })
+                delay(50)
+            }
+        }
     }
 
     sealed class CallEvent {

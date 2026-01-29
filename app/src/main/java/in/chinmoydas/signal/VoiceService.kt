@@ -32,7 +32,7 @@ import androidx.media.session.MediaButtonReceiver
 import `in`.chinmoydas.signal.data.AppDatabase
 import `in`.chinmoydas.signal.data.PagerEntry
 import `in`.chinmoydas.signal.data.MainRepository
-import `in`.chinmoydas.signal.utils.ConnectionManager // [NEW] Logic Hub
+import `in`.chinmoydas.signal.utils.ConnectionManager
 import `in`.chinmoydas.signal.utils.AudioEngine
 import `in`.chinmoydas.signal.utils.AudioRouter
 import `in`.chinmoydas.signal.utils.CallEngine
@@ -87,7 +87,7 @@ class VoiceService : Service() {
     private lateinit var networkEngine: NetworkEngine
     private lateinit var audioRouter: AudioRouter
     private lateinit var repository: MainRepository
-    private lateinit var connectionManager: ConnectionManager // [NEW]
+    private lateinit var connectionManager: ConnectionManager
 
     private var sensorHelper: SensorHelper? = null
     private var voxHelper: VoxHelper? = null
@@ -174,8 +174,6 @@ class VoiceService : Service() {
     private val multicastLock by lazy { (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).createMulticastLock("CDSignal:MulticastLock") }
     private val activeCalls = AtomicInteger(0)
 
-    // [REMOVED] heartbeatJob, stunServers (Handled by ConnectionManager now)
-
     private var signalingJob: Job? = null
     private var currentSequenceNumber = 0
     private var localLinkManager: LocalLinkManager? = null
@@ -199,7 +197,7 @@ class VoiceService : Service() {
                     try { networkEngine.stop() } catch (e: Exception) {}
                     delay(500)
 
-                    // Restart Network Engine with Traffic Splitter
+                    // Restart Network Engine
                     networkEngine.start { packet ->
                         handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
                     }
@@ -210,7 +208,7 @@ class VoiceService : Service() {
 
                     _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
 
-                    // [NEW] Restart Heartbeat Loop
+                    // Restart Heartbeat
                     connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
 
                     broadcastHello()
@@ -244,15 +242,12 @@ class VoiceService : Service() {
         audioEngine = AudioEngine(this)
         repository = MainRepository(applicationContext)
 
-        // 1. Init NetworkEngine with STUN Splitter Logic
         networkEngine = NetworkEngine(UDP_PORT) { stunData ->
-            // Safety Check: Only route if manager is fully initialized
             if (::connectionManager.isInitialized) {
                 connectionManager.handleStunResponse(stunData)
             }
         }
 
-        // 2. Init Connection Manager (Dependencies are ready)
         connectionManager = ConnectionManager(repository, networkEngine)
 
         val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
@@ -315,10 +310,9 @@ class VoiceService : Service() {
 
     fun speakText(text: String) {
         if (isSilenced || isTheaterMode) {
-            Log.d(tag, "TTS Suppressed: Device is Silenced or in Stealth Mode")
+            Log.d(tag, "TTS Suppressed")
             return
         }
-
         val params = Bundle()
         params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
         tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "ID")
@@ -428,7 +422,6 @@ class VoiceService : Service() {
                     if (savedContact != null) targetContactKey = savedContact.savedCode else targetContactKey = null
                 }
 
-                // [NEW] Trigger dynamic heartbeat when target changes
                 connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
 
                 val ip = activeIpCache[target] ?: repository.getAllContacts().find { it.name == target }?.ip
@@ -496,7 +489,7 @@ class VoiceService : Service() {
                 isHeadsetLinked = newState
                 _voiceServiceState.update { it.copy(isHeadsetLinked = newState) }
                 mediaSession.isActive = newState
-                val msg = if (newState) "Pocket Mode: ON (Keys Active)" else "Pocket Mode: OFF"
+                val msg = if (newState) "Pocket Mode: ON" else "Pocket Mode: OFF"
                 updateNotification(msg, null)
                 Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
                 return START_STICKY
@@ -571,11 +564,7 @@ class VoiceService : Service() {
                 if (!multicastLock.isHeld) multicastLock.acquire()
                 audioEngine.startPlayback()
 
-                // [CRITICAL REFACTOR: STARTUP]
-                // 1. Start Network Listening (Traffic Filtered)
                 val networkStarted = networkEngine.start { packet ->
-                    // Note: STUN packets never reach here. They go to ConnectionManager.
-                    // Only Audio/Data packets arrive here.
                     handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
                 }
 
@@ -588,7 +577,6 @@ class VoiceService : Service() {
                 _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
                 updateNotification("Online & Ready", null)
 
-                // 2. Start the Smart Heartbeat Loop (Handles STUN & PHP)
                 connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
 
                 startSignalLoop()
@@ -617,11 +605,9 @@ class VoiceService : Service() {
         }
     }
 
-    // Bridge method for UI/Channel changes
     fun triggerHeartbeat(status: String = "online") {
         if (::connectionManager.isInitialized) {
-            // Restart loop to force immediate refresh
-            connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
+            connectionManager.triggerImmediateHeartbeat()
         }
     }
 
@@ -648,7 +634,6 @@ class VoiceService : Service() {
             val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
             val myToken = prefs.getString("my_fcm_token", "NO_TOKEN") ?: "NO_TOKEN"
 
-            // Format: HELLO:Username:Token
             val payloadString = "HELLO:$myUsername:$myToken"
             val payloadBytes = payloadString.toByteArray(Charsets.UTF_8)
 
@@ -806,6 +791,7 @@ class VoiceService : Service() {
                         if (textData.startsWith("TXT:")) {
                             val cleanMessage = textData.substring(4)
 
+                            // [CRITICAL FIX] Intercept Call Signals
                             if (packetInterceptor?.invoke(cleanMessage, senderIp) == true) {
                                 return
                             }
@@ -814,7 +800,7 @@ class VoiceService : Service() {
                                 if (cleanMessage == "CMD:CALL_REQ") {
                                     showIncomingCallNotification(senderName)
                                 }
-                                scope.launch { CallSignaling.handlePacket(cleanMessage, senderIp) }
+                                scope.launch { CallSignaling.handleSignal(cleanMessage, senderIp) }
                                 return
                             }
 
@@ -905,7 +891,7 @@ class VoiceService : Service() {
                 }
 
                 if (!isSilenced || isPrincipal) {
-                    try { audioEngine.writeAudio(seqNum, payload) } catch (e: Exception) {}
+                    try { audioEngine.playPcmChunk(payload, seqNum) } catch (e: Exception) {}
                 }
                 if (isRecordingEnabled) {
                     synchronized(bufferLock) { try { incomingBuffer.write(payload) } catch (t: Throwable) {} }

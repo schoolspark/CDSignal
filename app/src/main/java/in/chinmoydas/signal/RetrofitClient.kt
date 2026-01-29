@@ -4,16 +4,12 @@ import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
-import retrofit2.http.Field
-import retrofit2.http.FormUrlEncoded
-import retrofit2.http.GET
-import retrofit2.http.Header
-import retrofit2.http.POST
+import retrofit2.http.*
 import java.util.concurrent.TimeUnit
 import com.google.gson.annotations.SerializedName
 import retrofit2.Response
 
-// --- DATA MODELS (Gson Compatible) ---
+// --- DATA MODELS (Fully Restored) ---
 
 data class WakeResponse(
     @SerializedName("status") val status: String,
@@ -32,14 +28,14 @@ data class LoginResponse(
 data class PeerResponse(
     @SerializedName("status") val status: String,
     @SerializedName("ip") val ip: String?,
-    @SerializedName("local_ip") val local_ip: String?, // Keeps WalkieViewModel happy
+    @SerializedName("local_ip") val local_ip: String?,
     @SerializedName("port") val port: Int?,
     @SerializedName("fcm_token") val fcm_token: String?
 )
 
 data class ChannelUser(
     @SerializedName("username") val username: String,
-    @SerializedName("public_ip") val public_ip: String?, // Keeps WalkieViewModel happy
+    @SerializedName("public_ip") val public_ip: String?,
     @SerializedName("local_ip") val local_ip: String?
 )
 
@@ -175,6 +171,8 @@ object RetrofitClient {
         level = HttpLoggingInterceptor.Level.BODY
     }
 
+    // 1. Standard Client (Login, Large Syncs) - 30s Timeout
+    // Used for heavy operations where waiting is acceptable.
     private val okHttpClient = OkHttpClient.Builder()
         .addInterceptor(logging)
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -183,11 +181,31 @@ object RetrofitClient {
         .retryOnConnectionFailure(true)
         .build()
 
+    // 2. Fast Client (PTT Signaling, Peer Discovery) - 5s Timeout [MISSION CRITICAL]
+    // Fails fast so the UI can switch to "Offline" mode instantly instead of hanging the user.
+    private val fastHttpClient = OkHttpClient.Builder()
+        .addInterceptor(logging)
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .writeTimeout(5, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(false) // Don't retry blindly on real-time actions
+        .build()
+
     val api: ApiService by lazy {
         Retrofit.Builder()
             .baseUrl(BASE_URL)
             .client(okHttpClient)
-            .addConverterFactory(GsonConverterFactory.create()) // Using Gson as requested
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+            .create(ApiService::class.java)
+    }
+
+    // Use this for PTT/Signal calls to ensure responsiveness
+    val fastApi: ApiService by lazy {
+        Retrofit.Builder()
+            .baseUrl(BASE_URL)
+            .client(fastHttpClient)
+            .addConverterFactory(GsonConverterFactory.create())
             .build()
             .create(ApiService::class.java)
     }

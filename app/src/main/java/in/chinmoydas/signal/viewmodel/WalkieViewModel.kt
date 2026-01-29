@@ -20,12 +20,14 @@ import `in`.chinmoydas.signal.data.CallLog
 import `in`.chinmoydas.signal.data.MainRepository
 import `in`.chinmoydas.signal.data.PagerEntry
 import `in`.chinmoydas.signal.utils.LocalLinkManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.isActive // [FIX] Added import for isActive
 import java.io.File
 import android.graphics.Color as AndroidColor
 
@@ -58,6 +60,10 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     var connectionStatus by mutableStateOf(ConnectionStatus.IDLE)
         private set
     private var pingJob: Job? = null
+
+    // [MISSION CRITICAL] PTT Job Management
+    // Prevents "Sticky Mic" race condition
+    private var transmissionJob: Job? = null
 
     var qrBitmap by mutableStateOf<Bitmap?>(null)
     var channelQrBitmap by mutableStateOf<Bitmap?>(null)
@@ -119,6 +125,14 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     fun observeServicePing(service: VoiceService?) {
         viewModelScope.launch {
             service?.voiceServiceState?.collect { state ->
+                // If service says "Listening", we are connected to the network
+                if (state.networkStatus.contains("Listening")) {
+                    connectionStatus = ConnectionStatus.READY
+                } else if (state.networkStatus.contains("Waiting")) {
+                    connectionStatus = ConnectionStatus.OFFLINE
+                }
+
+                // Fallback: Check ping response time
                 val diff = System.currentTimeMillis() - state.lastPingResponse
                 if (state.lastPingResponse > 0 && diff < 2000) {
                     connectionStatus = ConnectionStatus.READY
@@ -134,21 +148,9 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         }
 
         connectionStatus = ConnectionStatus.CHECKING
-        val targetIp = getCurrentTargetIp() // Reused the new helper here
 
-        if (targetIp != null && targetIp != "SERVER_LINK") {
-            service?.sendPing(targetIp)
-
-            pingJob?.cancel()
-            pingJob = viewModelScope.launch {
-                delay(2000)
-                if (connectionStatus == ConnectionStatus.CHECKING) {
-                    connectionStatus = ConnectionStatus.OFFLINE
-                }
-            }
-        } else {
-            connectionStatus = ConnectionStatus.OFFLINE
-        }
+        // [FIX] Use Extension function to send Heartbeat via Intent
+        service?.triggerHeartbeat()
     }
 
     fun loadData() {
@@ -168,13 +170,13 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     }
 
     fun deletePagerEntry(entry: PagerEntry) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) { // [FIX] IO Dispatcher
             repository.deletePagerEntry(entry)
         }
     }
 
     fun clearPagerHistory() {
-        viewModelScope.launch { repository.clearPagerHistory() }
+        viewModelScope.launch(Dispatchers.IO) { repository.clearPagerHistory() }
     }
 
     fun sendTextPayload(service: VoiceService?, text: String) {
@@ -557,20 +559,12 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         }
     }
 
-    // [NEW] 1. Link the Sender
-    fun setupCallSupport(service: VoiceService) {
-        // Tells the Call System how to send data using your existing Service
-        `in`.chinmoydas.signal.utils.CallSignaling.sendUdpTextFunction = { command, ip ->
-            service.sendTextMessage(ip, command)
-        }
-    }
-
     // [NEW] 2. Link the Receiver
     fun handleIncomingPacket(text: String, ip: String): Boolean {
         // 1. Calls
         if (text.startsWith("CMD:CALL")) {
             viewModelScope.launch {
-                `in`.chinmoydas.signal.utils.CallSignaling.handlePacket(text, ip)
+                `in`.chinmoydas.signal.utils.CallSignaling.handleSignal(text, ip)
             }
             return true
         }

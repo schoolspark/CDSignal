@@ -34,92 +34,91 @@ class AudioRouter(private val context: Context) {
         val filter = IntentFilter(AudioManager.ACTION_HEADSET_PLUG)
         context.registerReceiver(headsetReceiver, filter)
         // Initial check
+        isHeadsetPlugged = audioManager.isWiredHeadsetOn || audioManager.isBluetoothA2dpOn
         updateRoute()
     }
 
     // 2. Headset Detection
     private val headsetReceiver = object : BroadcastReceiver() {
-        override fun onReceive(ctx: Context?, intent: Intent?) {
-            if (intent?.action == AudioManager.ACTION_HEADSET_PLUG) {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == AudioManager.ACTION_HEADSET_PLUG) {
                 val state = intent.getIntExtra("state", -1)
-                val previousState = isHeadsetPlugged
                 isHeadsetPlugged = (state == 1)
 
-                if (previousState != isHeadsetPlugged) {
-                    Log.d(tag, "Headset Plugged: $isHeadsetPlugged")
-                    updateRoute()
+                // Hardware override: If headset plugged, speaker is OFF visually
+                if (isHeadsetPlugged) {
+                    setSpeakerphoneOn(false)
+                } else {
+                    // Restore user preference
+                    setSpeakerphoneOn(isSpeakerPreferred)
                 }
+
+                // Notify UI of the forced change
+                onRouteChanged?.invoke(!isHeadsetPlugged && isSpeakerPreferred)
             }
         }
     }
 
-    // [NEW] 2.5 Call Mode Toggle (Critical for VoIP Echo Cancellation)
-    fun setCallMode(active: Boolean) {
-        if (isVoipCallActive == active) return
-        isVoipCallActive = active
-        Log.d(tag, "VoIP Call Mode: $active")
-        updateRoute()
-    }
-
-    // 3. User Preference (The Toggle Button)
-    fun setSpeakerPreferred(preferred: Boolean) {
-        if (isSpeakerPreferred == preferred) return
-        isSpeakerPreferred = preferred
-        updateRoute()
-    }
-
-    // 4. The Core Logic (Decides where audio goes)
+    // 3. Routing Logic (The Brain)
     private fun updateRoute() {
         if (isHeadsetPlugged) {
-            // Headset overrides everything. Always route to it if plugged.
-            // But we must disable speakerphone explicitly.
             setSpeakerphoneOn(false)
-        } else {
-            // No headset? Obey the user's toggle.
-            setSpeakerphoneOn(isSpeakerPreferred)
+            // Use Communication mode for clean voice audio if calling
+            setMode(if (isVoipCallActive) AudioManager.MODE_IN_COMMUNICATION else AudioManager.MODE_NORMAL)
+            return
         }
 
-        // Notify Service/UI of the *actual* resulting state
-        onRouteChanged?.invoke(audioManager.isSpeakerphoneOn)
+        // [UPGRADE] VoIP Call Mode (Full-Duplex) vs PTT
+        if (isVoipCallActive) {
+            // Full Duplex: Must use MODE_IN_COMMUNICATION for Echo Cancellation (AEC)
+            setMode(AudioManager.MODE_IN_COMMUNICATION)
+            setSpeakerphoneOn(isSpeakerPreferred)
+        } else {
+            // PTT Mode: Default to Speaker, but use NORMAL mode to save battery/avoid status bar green dot
+            setMode(AudioManager.MODE_NORMAL)
+            setSpeakerphoneOn(isSpeakerPreferred)
+        }
+    }
+
+    // 4. External Control Methods
+    fun setCallMode(active: Boolean) {
+        isVoipCallActive = active
+        updateRoute()
+    }
+
+    fun setSpeakerPreferred(on: Boolean) {
+        isSpeakerPreferred = on
+        updateRoute()
+    }
+
+    private fun setMode(mode: Int) {
+        if (audioManager.mode != mode) {
+            audioManager.mode = mode
+        }
     }
 
     private fun setSpeakerphoneOn(on: Boolean) {
         if (audioManager.isSpeakerphoneOn != on) {
             audioManager.isSpeakerphoneOn = on
         }
-
-        // [UPGRADE] Diamond State Logic:
-        // 1. PTT Mode (Half-Duplex): MODE_NORMAL is fine for Speaker, saves battery.
-        // 2. VoIP Call Mode (Full-Duplex): We MUST use MODE_IN_COMMUNICATION even on Speaker
-        //    to enable the Hardware Acoustic Echo Canceller (AEC). Without this, echoes occur.
-        if (isVoipCallActive) {
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        } else {
-            if (on) {
-                audioManager.mode = AudioManager.MODE_NORMAL
-            } else {
-                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            }
-        }
     }
 
-    // 5. Audio Focus (The "Shut up Spotify" logic)
+    // 5. Focus Management (Hardened)
     fun requestFocus(): Boolean {
         if (isFocusHeld) return true
 
         val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val attributes = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build()
-
             val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
-                .setAudioAttributes(attributes)
-                .setAcceptsDelayedFocusGain(false)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
                 .setOnAudioFocusChangeListener { focusChange ->
                     if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
                         isFocusHeld = false
-                        // Optional: Notify service to stop transmitting if focus lost hard
+                        // Note: Service should monitor this flag to stop PTT if focus is lost hard
                     }
                 }
                 .build()
@@ -157,14 +156,14 @@ class AudioRouter(private val context: Context) {
         isFocusHeld = false
         // Reset mode to Normal when idle to be a good citizen
         audioManager.mode = AudioManager.MODE_NORMAL
+        audioManager.isSpeakerphoneOn = false
     }
 
     // 6. Cleanup
     fun shutdown() {
         try { context.unregisterReceiver(headsetReceiver) } catch (e: Exception) { }
-
-        // Force cleanup even if call was active
         isVoipCallActive = false
+        isFocusHeld = true // Pretend held so abandon works
         abandonFocus()
     }
 }
