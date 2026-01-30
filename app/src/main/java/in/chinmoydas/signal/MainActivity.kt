@@ -1,7 +1,7 @@
 package `in`.chinmoydas.signal
 
 import android.Manifest
-import android.app.KeyguardManager // [FIX] Added import
+import android.app.KeyguardManager
 import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
@@ -53,7 +53,6 @@ import kotlinx.coroutines.withContext
 class MainActivity : ComponentActivity() {
 
     // [FIX] Static flag to prevent double-prompting the battery permission
-    // This survives Activity restarts (like Login -> Home transition)
     companion object {
         private var hasAskedBattery = false
     }
@@ -99,12 +98,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // [MISSION CRITICAL FIX] Initialize Signaling so Calls work immediately
-        // This connects the "Call" button logic to the Android System
-        `in`.chinmoydas.signal.utils.CallSignaling.initialize(applicationContext)
+        // Initialize Signaling
+        CallSignaling.initialize(applicationContext)
 
         // [FIX] WhatsApp-Style Lock Screen Bypass
-        // This allows the Activity to rise above the Keyguard for Incoming Calls/SOS
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
@@ -132,10 +129,9 @@ class MainActivity : ComponentActivity() {
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
 
-        // [FIX] Check battery, but respect the 'hasAsked' flag
         checkBatteryOptimizations()
 
-        // [CRITICAL] Auto-start radio if permissions exist (Fixes "Disconnected" state)
+        // [CRITICAL] Auto-start radio if permissions exist
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             startAndBindService()
         }
@@ -286,30 +282,13 @@ class MainActivity : ComponentActivity() {
         appUpdateManager.completeUpdate()
     }
 
+    // [FIX] Cleaned up: Removed redundant CallSignaling listener
+    // The VoiceService now handles audio/call mode directly.
     private fun linkServiceLogic(service: VoiceService) {
         if (!::walkieViewModel.isInitialized) return
 
         service.packetInterceptor = { text, ip ->
             walkieViewModel.handleIncomingPacket(text, ip)
-        }
-
-        lifecycleScope.launch {
-            CallSignaling.callEvents.collect { event ->
-                when (event) {
-                    is CallSignaling.CallEvent.CallConnected -> {
-                        service.stopTalk()
-                        service.toggleVox(false)
-                        service.setCallMode(true)
-                    }
-                    is CallSignaling.CallEvent.CallEnded,
-                    is CallSignaling.CallEvent.CallRejected -> {
-                        service.stopTalk()
-                        service.toggleVox(false)
-                        service.setCallMode(false)
-                    }
-                    else -> {}
-                }
-            }
         }
 
         lifecycleScope.launch {
@@ -342,14 +321,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun checkBatteryOptimizations() {
-        // [FIX] Don't ask if we already asked in this session
         if (hasAskedBattery) return
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
 
             if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                // Mark as asked so we don't loop
                 hasAskedBattery = true
                 try {
                     val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
@@ -388,9 +365,8 @@ class MainActivity : ComponentActivity() {
         }
         startService(stopIntent)
 
-        // [LIFECYCLE FIX] Do NOT call finishAffinity() here.
-        // Wait for VoiceService to do its cleanup and send the broadcast.
-        // finishAffinity() is now inside exitReceiver.
+        // UI closes immediately, service cleans up in background
+        finishAffinity()
     }
 
     override fun onNewIntent(intent: Intent) {

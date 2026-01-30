@@ -5,6 +5,7 @@ import android.media.AudioManager
 import android.media.Ringtone
 import android.media.RingtoneManager
 import android.media.ToneGenerator
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -42,16 +43,26 @@ fun CallOverlay(
     onSpeakerToggle: () -> Unit,
     isSpeakerOn: Boolean
 ) {
-    // [FIX] Observe Global State directly (Single Source of Truth)
+    val context = LocalContext.current
     val callState by CallSignaling.callStatus.collectAsState()
-
-    // Track caller IP for name resolution
     var callerIp by remember { mutableStateOf("") }
 
-    // [FIX] Update callerIp when state changes to Ringing/Dialing
+    // Update IP when state changes
     LaunchedEffect(callState) {
         if (callState == CallStatus.Ringing || callState == CallStatus.Dialing) {
             CallSignaling.currentCallerIp?.let { callerIp = it }
+        }
+    }
+
+    // [FIX] Listen for Call Events to show Toasts (Why did it vanish?)
+    LaunchedEffect(Unit) {
+        CallSignaling.callEvents.collect { event ->
+            when (event) {
+                is CallSignaling.CallEvent.CallRejected -> Toast.makeText(context, "Call Declined", Toast.LENGTH_SHORT).show()
+                is CallSignaling.CallEvent.CallBusy -> Toast.makeText(context, "User is Busy", Toast.LENGTH_SHORT).show()
+                is CallSignaling.CallEvent.CallEnded -> Toast.makeText(context, "Call Ended", Toast.LENGTH_SHORT).show()
+                else -> {}
+            }
         }
     }
 
@@ -61,6 +72,8 @@ fun CallOverlay(
         if (callerIp.isNotEmpty()) nameResolver(callerIp) else "Unknown"
     }
 
+    // [FIX] We now handle Active Call inside the AnimatedVisibility
+    // but wrapped in a Dialog to guarantee it renders ON TOP of the NavHost.
     AnimatedVisibility(
         visible = callState != CallStatus.Idle,
         enter = slideInVertically { it } + fadeIn(),
@@ -69,7 +82,7 @@ fun CallOverlay(
         when (callState) {
             CallStatus.Ringing -> IncomingCallDialog(displayName, { CallSignaling.acceptCall() }, { CallSignaling.declineCall() })
             CallStatus.Dialing -> DialingDialog(displayName, { CallSignaling.endCall() })
-            CallStatus.Active -> ActiveCallScreen(
+            CallStatus.Active -> ActiveCallDialog( // [CHANGED] Now a Dialog
                 callerName = displayName,
                 isSpeakerOn = isSpeakerOn,
                 onSpeakerToggle = onSpeakerToggle,
@@ -80,7 +93,8 @@ fun CallOverlay(
     }
 }
 
-// [FIX] Plays Ringtone or Dialtone based on state
+// ... SoundEffectManager, DialingDialog, IncomingCallDialog remain same ...
+
 @Composable
 fun SoundEffectManager(callState: CallStatus) {
     val context = LocalContext.current
@@ -152,46 +166,52 @@ fun IncomingCallDialog(callerName: String, onAccept: () -> Unit, onDecline: () -
     }
 }
 
+// [FIX] Renamed to ActiveCallDialog and wrapped in Dialog composable
 @Composable
-fun ActiveCallScreen(
+fun ActiveCallDialog(
     callerName: String,
     isSpeakerOn: Boolean,
     onSpeakerToggle: () -> Unit,
     onEndCall: () -> Unit
 ) {
-    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-            Box(Modifier.size(120.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer), contentAlignment = Alignment.Center) {
-                Icon(Icons.Default.Call, null, modifier = Modifier.size(64.dp), tint = MaterialTheme.colorScheme.primary)
-            }
-            Spacer(Modifier.height(24.dp))
-            Text(callerName, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
-            CallTimer()
-            Spacer(Modifier.height(64.dp))
-
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-
-                // [FIX] Observe Real Engine State
-                val isMuted by CallEngine.muteStatus.collectAsState()
-
-                IconButton(onClick = {
-                    CallEngine.toggleMute() // Toggle Singleton
-                }, modifier = Modifier.size(56.dp).background(if(isMuted) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.surfaceVariant, CircleShape)) {
-                    Icon(if (isMuted) Icons.Default.MicOff else Icons.Default.Mic, null)
+    // Dialog ensures this renders on top of everything else (NavHost, etc.)
+    Dialog(
+        onDismissRequest = { /* Prevent back press from minimizing call accidentally */ },
+        properties = DialogProperties(usePlatformDefaultWidth = false, dismissOnBackPress = false)
+    ) {
+        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+            Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                Box(Modifier.size(120.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer), contentAlignment = Alignment.Center) {
+                    Icon(Icons.Default.Call, null, modifier = Modifier.size(64.dp), tint = MaterialTheme.colorScheme.primary)
                 }
+                Spacer(Modifier.height(24.dp))
+                Text(callerName, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
+                CallTimer()
+                Spacer(Modifier.height(64.dp))
 
-                Button(onClick = onEndCall, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE53935)), shape = CircleShape, modifier = Modifier.size(80.dp), contentPadding = PaddingValues(0.dp)) {
-                    Icon(Icons.Default.CallEnd, null, modifier = Modifier.size(32.dp))
-                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                    val isMuted by CallEngine.muteStatus.collectAsState()
 
-                // Speaker logic was already correct (wired to Service)
-                IconButton(onClick = onSpeakerToggle, modifier = Modifier.size(56.dp).background(if(isSpeakerOn) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant, CircleShape)) {
-                    Icon(if (isSpeakerOn) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff, null)
+                    IconButton(onClick = {
+                        CallEngine.toggleMute()
+                    }, modifier = Modifier.size(56.dp).background(if(isMuted) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.surfaceVariant, CircleShape)) {
+                        Icon(if (isMuted) Icons.Default.MicOff else Icons.Default.Mic, null)
+                    }
+
+                    Button(onClick = onEndCall, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE53935)), shape = CircleShape, modifier = Modifier.size(80.dp), contentPadding = PaddingValues(0.dp)) {
+                        Icon(Icons.Default.CallEnd, null, modifier = Modifier.size(32.dp))
+                    }
+
+                    IconButton(onClick = onSpeakerToggle, modifier = Modifier.size(56.dp).background(if(isSpeakerOn) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant, CircleShape)) {
+                        Icon(if (isSpeakerOn) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff, null)
+                    }
                 }
             }
         }
     }
 }
+
+// ... CallButton and CallTimer remain same ...
 
 @Composable
 fun CallButton(icon: androidx.compose.ui.graphics.vector.ImageVector, color: Color, text: String, onClick: () -> Unit) {

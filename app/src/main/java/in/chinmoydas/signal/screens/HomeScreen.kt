@@ -32,18 +32,16 @@ fun HomeScreen(
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
 
-    // [NEW] State for Overlays
+    // State for Overlays
     var showDiagnostics by remember { mutableStateOf(false) }
     var showAssistant by remember { mutableStateOf(false) }
 
-    // [NEW] Auto-Run Diagnostics only once per session
-    var hasRunDiagnostics by rememberSaveable { mutableStateOf(false) }
+    // [FIX] Removed 'hasRunDiagnostics' state variable here.
 
     // Live count of nearby devices for the Badge
     val nearbyCount = viewModel.nearbyUsers.size
 
     Scaffold(
-        // [FIX] Removed navigationBarsPadding() to prevent double-padding/gaps.
         // contentWindowInsets handles the edge-to-edge layout correctly.
         containerColor = MaterialTheme.colorScheme.surfaceVariant,
         topBar = {
@@ -70,7 +68,7 @@ fun HomeScreen(
                 }
             )
         },
-        // [FIX] Pinned AI Button to Bottom-Left to avoid overlapping Call/SOS buttons
+        // Pinned AI Button to Bottom-Left to avoid overlapping Call/SOS buttons
         floatingActionButtonPosition = FabPosition.Start,
         floatingActionButton = {
             if (selectedTab == 0) {
@@ -128,16 +126,9 @@ fun HomeScreen(
 
         val contentModifier = Modifier.padding(innerPadding)
 
-        // [NEW] Automatic Readiness Check (Runs once when Service is ready)
-        if (!hasRunDiagnostics && service != null) {
-            SystemReadinessDialog(
-                viewModel = viewModel,
-                service = service,
-                onDismiss = { hasRunDiagnostics = true }
-            )
-        }
+        // [FIX] Removed the Automatic Readiness Check block here.
 
-        // [NEW] Manual Readiness Check (Triggered by Button)
+        // Manual Readiness Check (Triggered by Button in TalkTab)
         if (showDiagnostics) {
             SystemReadinessDialog(
                 viewModel = viewModel,
@@ -146,7 +137,7 @@ fun HomeScreen(
             )
         }
 
-        // [NEW] AI Assistant Sheet
+        // AI Assistant Sheet
         if (showAssistant) {
             ModalBottomSheet(
                 onDismissRequest = { showAssistant = false },
@@ -166,6 +157,7 @@ fun HomeScreen(
                 viewModel = viewModel,
                 service = service,
                 onPermissionsGranted = onPermissionsGranted,
+                // Passing the lambda to show diagnostics manually
                 onCheckSystem = { showDiagnostics = true }
             )
             1 -> HistoryTab(

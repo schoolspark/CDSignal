@@ -41,6 +41,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import `in`.chinmoydas.signal.VoiceService
@@ -83,17 +84,28 @@ fun TalkTab(
     val serviceState by service?.voiceServiceState?.collectAsState(initial = VoiceServiceState()) ?: remember { mutableStateOf(VoiceServiceState()) }
     val listState = rememberLazyListState()
 
-    val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-        if (it.getOrDefault(Manifest.permission.RECORD_AUDIO, false)) onPermissionsGranted()
+    // [MODIFIED] Permission Callback: Only calls logic, does NOT trigger system check
+    val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+        if (results.getOrDefault(Manifest.permission.RECORD_AUDIO, false)) {
+            onPermissionsGranted()
+        }
     }
 
-    // [FIX ISSUE 7] Auto-show System Diagnostics on first cold start
+    // [MODIFIED] Startup Logic: Requests Permissions if needed, but removed Auto-Diagnostics
     LaunchedEffect(Unit) {
-        if (!viewModel.hasShownStartupCheck) {
-            delay(800) // Slight delay so UI settles
-            onCheckSystem()
-            viewModel.hasShownStartupCheck = true
+        val perms = mutableListOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.VIBRATE, Manifest.permission.ACCESS_FINE_LOCATION)
+        if (Build.VERSION.SDK_INT >= 34) perms.add(Manifest.permission.FOREGROUND_SERVICE_MICROPHONE)
+        if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.POST_NOTIFICATIONS)
+        if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+
+        val hasAllPermissions = perms.all {
+            ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
         }
+
+        if (!hasAllPermissions) {
+            permLauncher.launch(perms.toTypedArray())
+        }
+        // Removed the 'else { onCheckSystem() }' block
     }
 
     LaunchedEffect(service) {
@@ -109,14 +121,6 @@ fun TalkTab(
 
     LaunchedEffect(service) { viewModel.observeServicePing(service) }
     LaunchedEffect(viewModel.targetUser) { if (viewModel.targetUser.isNotEmpty()) viewModel.triggerPing(service) }
-
-    LaunchedEffect(Unit) {
-        val perms = mutableListOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.VIBRATE, Manifest.permission.ACCESS_FINE_LOCATION)
-        if (Build.VERSION.SDK_INT >= 34) perms.add(Manifest.permission.FOREGROUND_SERVICE_MICROPHONE)
-        if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.POST_NOTIFICATIONS)
-        if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
-        permLauncher.launch(perms.toTypedArray())
-    }
 
     if (serviceState.isSosPending) {
         SosDialog(onCancel = { service?.cancelSos() }, onSend = { service?.confirmSos() })
@@ -206,6 +210,7 @@ fun TalkTab(
                         Icon(Icons.Default.Sync, "Sync", tint = MaterialTheme.colorScheme.primary)
                     }
 
+                    // This Manual Button remains as requested
                     IconButton(onClick = onCheckSystem) {
                         Icon(Icons.Default.VerifiedUser, "System Check", tint = MaterialTheme.colorScheme.primary)
                     }
@@ -251,10 +256,9 @@ fun TalkTab(
                         when (it.action) {
                             MotionEvent.ACTION_DOWN -> {
                                 isPressed = true
-                                // [FIXED HANDSFREE START LOGIC]
+                                // [HANDSFREE LOGIC REMAINS FIXED]
                                 if (service != null) {
                                     if (viewModel.isHandsFree) {
-                                        // Toggle Logic
                                         if (serviceState.isTransmitting) {
                                             viewModel.stopTransmission { service.stopTalk() }
                                         } else {
@@ -265,7 +269,6 @@ fun TalkTab(
                                             )
                                         }
                                     } else {
-                                        // Standard PTT Logic
                                         permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
                                         viewModel.startTransmission(
                                             onIpsFound = { ips, port -> service.startTalk(ips, port) },
@@ -276,8 +279,6 @@ fun TalkTab(
                             }
                             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                                 isPressed = false
-                                // [FIXED HANDSFREE STOP LOGIC]
-                                // Ignore lift if Handsfree is ON
                                 if (!viewModel.isHandsFree && service != null) {
                                     viewModel.stopTransmission { service.stopTalk() }
                                 }

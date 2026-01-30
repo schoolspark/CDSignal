@@ -54,8 +54,15 @@ object CallEngine {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 // 1. Setup Network (2s timeout to detect dead connection)
-                callSocket = DatagramSocket(CALL_PORT).apply {
+                val socket = DatagramSocket(CALL_PORT).apply {
                     soTimeout = 2000
+                }
+                callSocket = socket
+
+                // [FIX] Safety Check 1: Did user hang up while we were opening the socket?
+                if (!isCallActive) {
+                    socket.close()
+                    return@launch
                 }
 
                 // 2. Calculate Buffers
@@ -63,7 +70,7 @@ object CallEngine {
                 val minBufTrack = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AUDIO_FORMAT) * 2
 
                 // 3. Init Audio Hardware
-                audioTrack = AudioTrack(
+                val track = AudioTrack(
                     AudioManager.STREAM_VOICE_CALL,
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_OUT_MONO,
@@ -71,29 +78,37 @@ object CallEngine {
                     minBufTrack,
                     AudioTrack.MODE_STREAM
                 )
+                audioTrack = track
 
-                audioRecord = AudioRecord(
+                val record = AudioRecord(
                     MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,
                     AUDIO_FORMAT,
                     minBufRec
                 )
+                audioRecord = record
+
+                // [FIX] Safety Check 2: Did user hang up while we were creating audio tracks?
+                if (!isCallActive) {
+                    stopCall() // Triggers full cleanup
+                    return@launch
+                }
 
                 // [CRITICAL] Verify Hardware Init
-                if (audioRecord?.state != AudioRecord.STATE_INITIALIZED || audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
+                if (record.state != AudioRecord.STATE_INITIALIZED || track.state != AudioTrack.STATE_INITIALIZED) {
                     throw Exception("Audio hardware initialization failed")
                 }
 
                 // 4. Setup Effects (if available)
-                val sessionId = audioRecord!!.audioSessionId
+                val sessionId = record.audioSessionId
                 if (AcousticEchoCanceler.isAvailable()) aec = AcousticEchoCanceler.create(sessionId)?.apply { enabled = true }
                 if (NoiseSuppressor.isAvailable()) ns = NoiseSuppressor.create(sessionId)?.apply { enabled = true }
                 if (AutomaticGainControl.isAvailable()) agc = AutomaticGainControl.create(sessionId)?.apply { enabled = true }
 
                 // 5. Start Stream
-                audioTrack?.play()
-                audioRecord?.startRecording()
+                track.play()
+                record.startRecording()
 
                 startSendingLoop(minBufRec)
                 startReceivingLoop(minBufTrack)
