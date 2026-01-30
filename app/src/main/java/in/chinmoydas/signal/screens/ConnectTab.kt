@@ -27,10 +27,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import `in`.chinmoydas.signal.viewmodel.WalkieViewModel
 import `in`.chinmoydas.signal.utils.CallSignaling
+import `in`.chinmoydas.signal.utils.SafetySignaling
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -90,6 +92,105 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
         contentPadding = PaddingValues(bottom = 80.dp) // Add padding for bottom nav/FAB if needed
     ) {
 
+        // --- INSERT THIS AS THE FIRST ITEM INSIDE LazyColumn ---
+        item {
+            val safeWalkRemaining by SafetySignaling.safeWalkTimeRemaining.collectAsState()
+            var selectedDuration by remember { mutableIntStateOf(15) }
+
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = if (safeWalkRemaining != null) Color(0xFFFFF3E0) else MaterialTheme.colorScheme.surfaceVariant
+                ),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.padding(horizontal = 16.dp) // Align with other cards
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    // Header
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = if (safeWalkRemaining != null) Icons.Default.Timer else Icons.Default.DirectionsWalk,
+                            contentDescription = null,
+                            tint = if (safeWalkRemaining != null) Color(0xFFE65100) else MaterialTheme.colorScheme.onSurface
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = if (safeWalkRemaining != null) "GUARDIAN ACTIVE" else "Safe Walk (Dead Man's Switch)",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = if (safeWalkRemaining != null) Color(0xFFE65100) else MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+
+                    Spacer(Modifier.height(12.dp))
+
+                    if (safeWalkRemaining != null) {
+                        // --- ACTIVE STATE (COUNTDOWN) ---
+                        val totalSecs = safeWalkRemaining!! / 1000
+                        val minutes = totalSecs / 60
+                        val seconds = totalSecs % 60
+                        val timeString = String.format("%02d:%02d", minutes, seconds)
+
+                        Text(
+                            text = timeString,
+                            fontSize = 48.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFFBF360C),
+                            modifier = Modifier.align(Alignment.CenterHorizontally)
+                        )
+
+                        Text(
+                            text = "SOS in $timeString",
+                            style = MaterialTheme.typography.labelSmall,
+                            modifier = Modifier.align(Alignment.CenterHorizontally)
+                        )
+
+                        Spacer(Modifier.height(16.dp))
+
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                            Button(
+                                onClick = { SafetySignaling.checkIn() },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("I'M OK")
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            OutlinedButton(
+                                onClick = { SafetySignaling.stopSafeWalk() },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("STOP")
+                            }
+                        }
+
+                    } else {
+                        // --- IDLE STATE (SETUP) ---
+                        Text("Auto-SOS if you don't check in.", style = MaterialTheme.typography.bodySmall)
+                        Spacer(Modifier.height(12.dp))
+
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                            listOf(15, 30, 60).forEach { mins ->
+                                FilterChip(
+                                    selected = selectedDuration == mins,
+                                    onClick = { selectedDuration = mins },
+                                    label = { Text("$mins m") }
+                                )
+                            }
+                        }
+
+                        Spacer(Modifier.height(12.dp))
+                        Button(
+                            onClick = { SafetySignaling.startSafeWalk(selectedDuration) },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                        ) {
+                            Text("START MONITORING")
+                        }
+                    }
+                }
+            }
+        }
+        // --- END OF SAFE WALK CARD ---
         // --- SECTION 1: SEARCH ---
         item {
             Box(Modifier.padding(16.dp)) {

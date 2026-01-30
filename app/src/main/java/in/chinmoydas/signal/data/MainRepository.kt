@@ -83,14 +83,25 @@ class MainRepository(context: Context) {
         contactDao.getAllContacts().find { it.ip == ip }
     }
 
-    suspend fun saveContact(name: String, ip: String, code: String, fcmToken: String = "") = withContext(Dispatchers.IO) {
+    suspend fun saveContact(name: String, ip: String, code: String, isPriority: Boolean = false, fcmToken: String = "") = withContext(Dispatchers.IO) {
+        // Keep existing logic: check if user was previously blocked
         val isBlocked = contactDao.isBlocked(name)
-        contactDao.insert(ContactEntity(name, ip, code, isBlocked = isBlocked, fcmToken = fcmToken))
+
+        contactDao.insert(ContactEntity(
+            name = name,
+            ip = ip,
+            savedCode = code,
+            isBlocked = isBlocked,
+            isPriority = isPriority, // [FIX] Now successfully passes the priority flag
+            fcmToken = fcmToken
+        ))
+
         triggerConfigRefresh()
     }
 
-    suspend fun updateContactIp(name: String, ip: String) = withContext(Dispatchers.IO) {
-        contactDao.updateIp(name, ip)
+    // Change return type to Int
+    suspend fun updateContactIp(name: String, ip: String): Int {
+        return contactDao.updateIp(name, ip)
     }
 
     suspend fun deleteContact(name: String) = withContext(Dispatchers.IO) {

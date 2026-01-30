@@ -79,7 +79,7 @@ interface ContactDao {
 
     // Silent IP Update helper
     @Query("UPDATE contacts SET ip = :newIp WHERE name = :name")
-    suspend fun updateIp(name: String, newIp: String)
+    suspend fun updateIp(name: String, newIp: String): Int // Returns row count
 
     @Query("UPDATE contacts SET fcmToken = :token WHERE name = :name")
     suspend fun updateContactToken(name: String, token: String)
@@ -104,7 +104,7 @@ interface PagerDao {
 
 // --- DATABASE ---
 
-@Database(entities = [CallLog::class, ContactEntity::class, PagerEntry::class], version = 6)
+@Database(entities = [CallLog::class, ContactEntity::class, PagerEntry::class], version = 7)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun callLogDao(): CallLogDao
     abstract fun contactDao(): ContactDao

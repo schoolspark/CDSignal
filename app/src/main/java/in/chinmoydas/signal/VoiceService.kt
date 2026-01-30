@@ -16,7 +16,6 @@ import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
-import android.media.RingtoneManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -45,7 +44,6 @@ import `in`.chinmoydas.signal.utils.CryptoEngine
 import `in`.chinmoydas.signal.utils.G711
 import `in`.chinmoydas.signal.utils.LocalLinkManager
 import `in`.chinmoydas.signal.utils.NetworkEngine
-import `in`.chinmoydas.signal.RetrofitClient
 import `in`.chinmoydas.signal.utils.WavUtils
 import `in`.chinmoydas.signal.utils.CallSignaling
 import `in`.chinmoydas.signal.utils.SafetySignaling
@@ -114,12 +112,14 @@ class VoiceService : Service() {
     @Volatile private var dataSaverEnabled = false
     @Volatile private var activeKeySpec: javax.crypto.spec.SecretKeySpec? = null
     @Volatile private var activeKeySource: String? = null
-    private val IGNORE_SENDER_DELAY = 5000L
+    private val IGNORE_SENDER_DELAY = 500L
 
     @Volatile private var isReceiving = false
     @Volatile private var isSending = false
     private var lastReceiveTime = 0L
     private var resetJob: Job? = null
+    // [FIX] Job to manage "End Stream" signaling
+    private var cleanupJob: Job? = null
 
     @Volatile var lastIncomingIp: String? = null
     @Volatile private var myUsername: String = "User"
@@ -160,6 +160,8 @@ class VoiceService : Service() {
     private val activeIpCache = ConcurrentHashMap<String, String>()
     private val blockedCache = ConcurrentHashMap.newKeySet<String>()
     private val principalCache = ConcurrentHashMap.newKeySet<String>()
+    // [FIX] Track pending acknowledgments for reliable delivery
+    private val pendingAckJobs = ConcurrentHashMap<String, Job>()
 
     @Volatile private var ignoredSender: String? = null
 
@@ -218,43 +220,59 @@ class VoiceService : Service() {
 
         override fun onAvailable(network: Network) {
             super.onAvailable(network)
-            val newIp = getLocalIpAddress()
 
-            if (newIp.isNotEmpty() && newIp != myLocalIp) {
-                Log.i(tag, "Network Handover: $myLocalIp -> $newIp")
-                myLocalIp = newIp
+            // Run on IO thread to prevent Main Thread stutter
+            scope.launch(Dispatchers.IO) {
+                val newIp = getLocalIpAddress()
 
-                scope.launch {
+                // [FIX 4] Seamless Handover Logic
+                if (newIp.isNotEmpty() && newIp != myLocalIp) {
+                    Log.i(tag, "Network Handover: $myLocalIp -> $newIp")
+                    myLocalIp = newIp
+
+                    // 1. Fast Restart (Reduced latency from 500ms to 50ms)
                     try { networkEngine.stop() } catch (e: Exception) {}
-                    delay(500)
+                    delay(50)
 
-                    // Restart Network Engine
-                    networkEngine.start { packet ->
+                    val networkStarted = networkEngine.start { packet ->
                         handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
                     }
 
-                    val principals = repository.getPrincipalContacts()
-                    principalCache.clear()
-                    principalCache.addAll(principals.map { it.name })
+                    if (networkStarted) {
+                        _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
 
-                    _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
+                        // 2. Proactive "I Moved" Signal
+                        // Tell our active target our new IP immediately
+                        val currentTarget = repository.getTargetUser()
+                        val targetIp = activeIpCache[currentTarget]
+                        if (!targetIp.isNullOrBlank()) {
+                            // Sending a Ping forces the receiver to update their IP cache for us
+                            sendPing(targetIp)
+                        }
 
-                    if (::connectionManager.isInitialized) {
-                        connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
+                        // 3. Restore Background Services
+                        broadcastHello() // Tell the subnet we are here
+                        localLinkManager?.startAdvertising(myUsername, UDP_PORT)
+                        connectionManager.triggerImmediateHeartbeat()
                     }
-
-                    broadcastHello()
-                    localLinkManager?.startAdvertising(myUsername, UDP_PORT)
+                } else if (myLocalIp.isEmpty()) {
+                    myLocalIp = newIp
                 }
-            } else if (myLocalIp.isEmpty()) {
-                myLocalIp = newIp
             }
         }
 
         override fun onLost(network: Network) {
             super.onLost(network)
             Log.w(tag, "Network Lost")
-            _voiceServiceState.update { it.copy(networkStatus = "Waiting for Network...") }
+            // [OPTIMIZATION] Don't show "Disconnected" instantly.
+            // Wait 2 seconds to see if this is just a handover to Data.
+            scope.launch {
+                delay(2000)
+                // If we still have no IP after 2s, THEN declare offline.
+                if (getLocalIpAddress().isEmpty()) {
+                    _voiceServiceState.update { it.copy(networkStatus = "Waiting for Network...") }
+                }
+            }
         }
     }
 
@@ -351,6 +369,30 @@ class VoiceService : Service() {
             onSilence = { scope.launch(Dispatchers.Main) { toggleTalk(fromVox = true) } }
         )
 
+        // Connect the "Safe Walk" Timer to the SOS Network Blaster
+        `in`.chinmoydas.signal.utils.SafetySignaling.onSafeWalkTimeout = {
+            // 1. Send the network alert
+            sendPanicAlert()
+            // 2. Audible feedback
+            speakText("Emergency Alert! Safe Walk Timeout.")
+            // 3. Show notification
+            showIncomingCallNotification("SOS TRIGGERED: Safe Walk Timeout", isAlarm = true)
+        }
+
+        // ADD THIS LISTENER TO HOLD WAKELOCK DURING MONITORING:
+        scope.launch {
+            `in`.chinmoydas.signal.utils.SafetySignaling.safeWalkTimeRemaining.collect { time ->
+                if (time != null && time > 0) {
+                    if (!wakeLock.isHeld) wakeLock.acquire(65 * 60 * 1000L) // Hold for 65 mins max
+                } else {
+                    // Release lock if we aren't talking AND aren't monitoring safety
+                    if (wakeLock.isHeld && !isSending && !isReceiving) {
+                        wakeLock.release()
+                    }
+                }
+            }
+        }
+
         // Register variable receiver instead of anonymous
         registerReceiver(audioNoisyReceiver, IntentFilter(android.media.AudioManager.ACTION_AUDIO_BECOMING_NOISY))
 
@@ -436,7 +478,12 @@ class VoiceService : Service() {
 
     private fun startVoxMonitoring() {
         stopVoxMonitoring()
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
+        // [FIX] Mic Manager: Prevent VOX if Call is Active
+            if (CallEngine.isCallActive) {
+                Log.d(tag, "VOX suspended: Call Active")
+                return
+            }
 
         voxJob = scope.launch(Dispatchers.IO) {
             val bufferSize = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
@@ -846,9 +893,24 @@ class VoiceService : Service() {
         val lastSeq = sequenceMap.getOrPut(senderName) { -1 }
 
         if (seqNum > lastSeq || seqNum < lastSeq - 1000 || seqNum == 0) {
+            // [FIX] Auto-Save Unknown Callers so we can reply to them
             if (!senderName.startsWith("group:") && activeIpCache[senderName] != senderIp) {
                 activeIpCache[senderName] = senderIp
-                scope.launch { repository.updateContactIp(senderName, senderIp) }
+                scope.launch {
+                    // Try to update existing contact
+                    val rowsAffected = repository.updateContactIp(senderName, senderIp)
+
+                    // If contact doesn't exist (rows == 0), create a temporary one
+                    if (rowsAffected == 0) {
+                        Log.d(tag, "Auto-Saving new contact: $senderName")
+                        repository.saveContact(
+                            name = senderName,
+                            ip = senderIp,
+                            code = "", // No secure code yet
+                            isPriority = false
+                        )
+                    }
+                }
             }
             if (seqNum == 0 || seqNum < lastSeq - 1000) {
                 scope.launch { repository.insertLog(senderName, true) }
@@ -884,19 +946,36 @@ class VoiceService : Service() {
                         if (textData.startsWith("TXT:")) {
                             val cleanMessage = textData.substring(4)
 
-                            // Intercept Call Signals
-                            if (packetInterceptor?.invoke(cleanMessage, senderIp) == true) {
-                                return
+                            // [FIX] 1. Handle Acknowledgment (Stop Retrying)
+                            // If we receive an ACK, find the retry job and cancel it.
+                            if (cleanMessage.startsWith("ACK:")) {
+                                val originalCmd = cleanMessage.removePrefix("ACK:") // e.g., "CMD:SOS"
+                                val jobKey = senderIp + originalCmd
+
+                                pendingAckJobs[jobKey]?.cancel()
+                                pendingAckJobs.remove(jobKey)
+
+                                Log.d(tag, "Delivery Confirmed: $originalCmd to $senderIp")
+                                return // Stop processing, it's just an ACK
                             }
 
-                            // Handle SOS separately for instant wake-up
+                            // [FIX] 2. Handle SOS with Auto-ACK
                             if (cleanMessage == "CMD:SOS") {
+                                // A. Immediately reply "I heard you" so the sender stops spamming
+                                sendTextMessage(senderIp, "ACK:CMD:SOS")
+
+                                // B. Trigger the Alarm UI
                                 showIncomingCallNotification("SOS ALERT: $senderName", isAlarm = true)
                                 SafetySignaling.triggerSOS(senderName)
                                 return
                             }
 
-                            // Catch Guardian Commands
+                            // Intercept Call Signals (Voice/Video Call Signaling)
+                            if (packetInterceptor?.invoke(cleanMessage, senderIp) == true) {
+                                return
+                            }
+
+                            // Catch Guardian Commands (Remote Control)
                             if (cleanMessage.startsWith("CMD:REMOTE_")) {
                                 val isRemoteAllowed = prefs.getBoolean("allow_remote_control", false)
                                 if (!isRemoteAllowed) {
@@ -952,7 +1031,7 @@ class VoiceService : Service() {
                                 return
                             }
 
-                            // Only speak valid messages, ignore commands
+                            // Only speak valid messages, ignore other internal commands
                             if (!cleanMessage.startsWith("CMD:") && !cleanMessage.startsWith("LOC:")) {
                                 val notificationPrefix = if(isPrincipal) "⚠️ PRIORITY MSG" else "Message"
                                 speakText(cleanMessage)
@@ -1017,24 +1096,55 @@ class VoiceService : Service() {
         }
     }
 
+    // [FIX] Reliable Command Sender (Retries until ACK received)
+    fun sendReliableCmd(targetIp: String, cmd: String) {
+        // Don't duplicate efforts if already trying to send to this IP
+        if (pendingAckJobs.containsKey(targetIp + cmd)) return
+
+        val job = scope.launch(Dispatchers.IO) {
+            var attempts = 0
+            // Retry for up to 60 seconds (30 attempts)
+            while (isActive && attempts < 30) {
+                sendTextMessage(targetIp, cmd)
+                attempts++
+
+                // UI Feedback (optional logging)
+                if (attempts % 5 == 0) Log.d(tag, "Retrying $cmd to $targetIp ($attempts/30)")
+
+                delay(2000) // Wait 2 seconds for ACK
+            }
+            pendingAckJobs.remove(targetIp + cmd)
+        }
+        pendingAckJobs[targetIp + cmd] = job
+    }
+
     fun sendPanicAlert() {
         scope.launch(Dispatchers.IO) {
             val allContacts = repository.getAllContacts()
             var sentCount = 0
+
+            // 1. Send reliably to known contacts
             allContacts.forEach { contact ->
                 if (!contact.ip.isNullOrBlank() && contact.ip != "SERVER_LINK") {
-                    sendTextMessage(contact.ip, "CMD:SOS")
+                    sendReliableCmd(contact.ip, "CMD:SOS")
                     sentCount++
-                    delay(10)
                 }
             }
+
+            // 2. Send reliably to current target (if not in contact list)
             val currentTarget = activeIpCache[repository.getTargetUser()]
             if (!currentTarget.isNullOrBlank() && allContacts.none { it.ip == currentTarget }) {
-                sendTextMessage(currentTarget, "CMD:SOS")
+                sendReliableCmd(currentTarget, "CMD:SOS")
                 sentCount++
             }
+
+            // 3. Fallback: If nobody is known, BLAST the subnet (Broadcast)
+            // Broadcasts cannot be ACKed reliably, so we just spam it 10 times.
             if (sentCount == 0) {
-                sendTextMessage("255.255.255.255", "CMD:SOS")
+                repeat(10) {
+                    sendTextMessage("255.255.255.255", "CMD:SOS")
+                    delay(1000)
+                }
             }
         }
     }
@@ -1098,6 +1208,15 @@ class VoiceService : Service() {
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     fun startTalk(ips: List<String>, port: Int) {
+        // [FIX] Cancel any pending "End Stream" signals from previous button press
+        // This prevents the "Phantom Termination" bug.
+        cleanupJob?.cancel()
+        cleanupJob = null
+        if (CallEngine.isCallActive) {
+            Log.w(tag, "Mic denied: Call Engine is active")
+            speakText("Line is busy")
+            return
+        }
         if (isSending) return
 
         if (ips.isEmpty()) {
@@ -1166,14 +1285,21 @@ class VoiceService : Service() {
         // Disable Echo Cancellation Mode
         audioRouter.setCallMode(false)
 
-        scope.launch {
+        // [FIX] Assign to cleanupJob so startTalk can cancel it if you press the button again quickly
+        cleanupJob = scope.launch {
             val endNameBytes = END_STREAM_SIGNAL.toByteArray()
             val buf = ByteArray(1 + endNameBytes.size + 4)
             buf[0] = endNameBytes.size.toByte()
             System.arraycopy(endNameBytes, 0, buf, 1, endNameBytes.size)
-            repeat(3) { networkEngine.send(buf, activeTargets, lastPort); delay(20) }
-            releaseResourcesIfNeeded()
 
+            // Send End Signal
+            repeat(3) {
+                if (isActive) { // Only send if we haven't been cancelled
+                    networkEngine.send(buf, activeTargets, lastPort)
+                    delay(20)
+                }
+            }
+            releaseResourcesIfNeeded()
             startForegroundServiceNotification("Listening...")
         }
 

@@ -20,14 +20,11 @@ import `in`.chinmoydas.signal.data.CallLog
 import `in`.chinmoydas.signal.data.MainRepository
 import `in`.chinmoydas.signal.data.PagerEntry
 import `in`.chinmoydas.signal.utils.LocalLinkManager
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.isActive
 import java.io.File
 import android.graphics.Color as AndroidColor
 
@@ -414,7 +411,14 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                     }
 
                     if (response.ip != contact.ip) {
-                        repository.saveContact(contact.name, response.ip!!, contact.savedCode, response.fcm_token ?: "")
+                        // [FIX] Update contact with correct arguments, preserving priority status
+                        repository.saveContact(
+                            name = contact.name,
+                            ip = response.ip!!,
+                            code = contact.savedCode,
+                            isPriority = contact.isPriority,
+                            fcmToken = response.fcm_token ?: ""
+                        )
                     }
                 }
             } catch (e: Exception) {

@@ -79,8 +79,18 @@ object CallSignaling {
                 if (_callStatus.value == CallStatus.Dialing) {
                     callTimeoutJob?.cancel()
                     _callStatus.value = CallStatus.Active
-                    scope.launch { _callEvents.emit(CallEvent.CallConnected) }
-                    CallEngine.startCall(ip)
+
+                    // 1. Notify UI & VoiceService to release mic
+                    scope.launch {
+                        _callEvents.emit(CallEvent.CallConnected)
+
+                        // [FIX] Mic Manager: Handover Delay
+                        // Give VoiceService 500ms to release AudioRecord before we grab it
+                        delay(500)
+
+                        // 2. Start Engine safely
+                        CallEngine.startCall(ip)
+                    }
                 }
             }
             CMD_REJ -> {
@@ -145,8 +155,15 @@ object CallSignaling {
         isBusy = true
         _callStatus.value = CallStatus.Active
         sendSignal(CMD_ACC, ip)
-        scope.launch { _callEvents.emit(CallEvent.CallConnected) }
-        CallEngine.startCall(ip)
+
+        scope.launch {
+            _callEvents.emit(CallEvent.CallConnected)
+
+            // [FIX] Mic Manager: Handover Delay
+            delay(500)
+
+            CallEngine.startCall(ip)
+        }
     }
 
     fun declineCall() {
