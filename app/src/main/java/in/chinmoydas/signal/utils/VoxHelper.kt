@@ -39,9 +39,14 @@ class VoxHelper(
         var sum = 0.0
         // Parse 16-bit PCM data
         for (i in 0 until buffer.size step 2) {
-            if (i+1 >= buffer.size) break
+            if (i + 1 >= buffer.size) break
+
+            // Convert to 16-bit signed integer
             val sample = (buffer[i].toInt() and 0xFF) or (buffer[i+1].toInt() shl 8)
-            sum += sample * sample
+
+            // [CRITICAL FIX] Convert to Double BEFORE squaring to prevent Int Overflow
+            val sampleVal = sample.toDouble()
+            sum += sampleVal * sampleVal
         }
         return sqrt(sum / (buffer.size / 2))
     }

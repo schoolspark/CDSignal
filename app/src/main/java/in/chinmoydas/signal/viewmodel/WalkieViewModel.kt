@@ -63,6 +63,9 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     // [MISSION CRITICAL] PTT Job Management
     private var transmissionJob: Job? = null
 
+    // [FIX ISSUE 7] Track if startup check has run in this session
+    var hasShownStartupCheck by mutableStateOf(false)
+
     var qrBitmap by mutableStateOf<Bitmap?>(null)
     var channelQrBitmap by mutableStateOf<Bitmap?>(null)
     var sharingChannelName by mutableStateOf("")
@@ -367,7 +370,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         if (token.isBlank() || token == "OFFLINE_TOKEN") { _uiState.value = UiState.Error("Offline"); return }
 
         // [OPTIMIZATION] Speculative Execution
-        // Start transmitting immediately to last known IP while we verify with server
         var speculated = false
         if (contact != null && contact.ip.isNotEmpty() && contact.ip != "SERVER_LINK") {
             _uiState.value = UiState.Transmitting("On Air", false)
@@ -411,7 +413,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                         }
                     }
 
-                    // Silent update of local DB
                     if (response.ip != contact.ip) {
                         repository.saveContact(contact.name, response.ip!!, contact.savedCode, response.fcm_token ?: "")
                     }

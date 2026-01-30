@@ -1,6 +1,7 @@
 package `in`.chinmoydas.signal
 
 import android.Manifest
+import android.app.KeyguardManager // [FIX] Added import
 import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
@@ -69,6 +70,7 @@ class MainActivity : ComponentActivity() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action == "in.chinmoydas.signal.ACTION_EXIT") {
                 Log.d("MainActivity", "Received Exit Signal. Closing App.")
+                // [LIFECYCLE FIX] This is the ONLY place we kill the Activity
                 finishAffinity()
             }
         }
@@ -101,10 +103,13 @@ class MainActivity : ComponentActivity() {
         // This connects the "Call" button logic to the Android System
         `in`.chinmoydas.signal.utils.CallSignaling.initialize(applicationContext)
 
-        // [FIX] Allow waking up the screen for incoming calls
+        // [FIX] WhatsApp-Style Lock Screen Bypass
+        // This allows the Activity to rise above the Keyguard for Incoming Calls/SOS
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
+            val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+            keyguardManager.requestDismissKeyguard(this, null)
         } else {
             @Suppress("DEPRECATION")
             window.addFlags(
@@ -382,7 +387,10 @@ class MainActivity : ComponentActivity() {
             action = "STOP_SERVICE"
         }
         startService(stopIntent)
-        finishAffinity()
+
+        // [LIFECYCLE FIX] Do NOT call finishAffinity() here.
+        // Wait for VoiceService to do its cleanup and send the broadcast.
+        // finishAffinity() is now inside exitReceiver.
     }
 
     override fun onNewIntent(intent: Intent) {

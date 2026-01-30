@@ -1,5 +1,4 @@
 # --- Android Application Components ---
-# Prevents R8 from renaming classes that the Android OS needs to call by name.
 -keep public class * extends android.app.Activity
 -keep public class * extends android.app.Service
 -keep public class * extends android.content.BroadcastReceiver
@@ -8,11 +7,9 @@
 -keep public class * extends androidx.lifecycle.ViewModel
 
 # --- App Utilities ---
-# Keep our utility classes, like AudioEngine and NetworkEngine, from being obfuscated.
 -keep class in.chinmoydas.signal.utils.** { *; }
 
 # --- App Data/API Models ---
-# Keep all data classes used by Gson/Retrofit.
 -keep class in.chinmoydas.signal.LoginResponse { *; }
 -keep class in.chinmoydas.signal.PeerResponse { *; }
 -keep class in.chinmoydas.signal.ChannelResponse { *; }
@@ -35,13 +32,9 @@
 # --- Retrofit & OkHttp ---
 -keep,allowobfuscation @retrofit2.http.POST class *
 -keep,allowobfuscation @retrofit2.http.GET class *
--keep,allowobfuscation @retrofit2.http.PUT class *
--keep,allowobfuscation @retrofit2.http.DELETE class *
--keep,allowobfuscation @retrofit2.http.PATCH class *
 -keepclassmembers interface * { @retrofit2.http.* *; }
 -dontwarn retrofit2.**
 -keep class okhttp3.** { *; }
--keep interface okhttp3.** { *; }
 -dontwarn okhttp3.**
 -dontwarn okio.**
 
@@ -59,7 +52,6 @@
 -keepclassmembers class kotlinx.coroutines.internal.MainDispatcherFactory { *; }
 -keepclassmembers class kotlinx.coroutines.flow.** { *; }
 -keep class kotlinx.coroutines.CompletedExceptionally { *; }
--keepclassmembers class kotlinx.coroutines.** { *; }
 -dontwarn kotlinx.coroutines.**
 
 # --- ZXing & JourneyApps Scanner ---
@@ -67,3 +59,10 @@
 -keep class com.journeyapps.barcodescanner.** { *; }
 -dontwarn com.journeyapps.barcodescanner.**
 -dontwarn com.google.zxing.**
+
+# --- CRITICAL ATTRIBUTES (Must Have) ---
+# Ensures Gson can see @SerializedName and Retrofit can see Generic types
+-keepattributes Signature
+-keepattributes *Annotation*
+-keepattributes EnclosingMethod
+-keepattributes InnerClasses

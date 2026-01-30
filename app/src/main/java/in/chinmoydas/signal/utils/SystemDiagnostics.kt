@@ -3,13 +3,20 @@ package `in`.chinmoydas.signal.utils
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.hardware.Sensor
+import android.hardware.SensorManager
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.os.Build
+import android.os.PowerManager
 import androidx.core.content.ContextCompat
 import `in`.chinmoydas.signal.VoiceService
 import `in`.chinmoydas.signal.RetrofitClient
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.flow
+import java.net.DatagramSocket
 
 data class DiagnosticItem(
     val name: String,
@@ -23,90 +30,116 @@ object SystemDiagnostics {
 
     fun runChecks(context: Context, service: VoiceService?) = flow {
 
-        // 1. Audio Hardware (Critical)
-        emit(DiagnosticItem("Verifying Audio Hardware", DiagnosticStatus.Running))
-        delay(300)
+        // 1. PERMISSIONS AUDIT
+        emit(DiagnosticItem("Security & Permissions", DiagnosticStatus.Running))
+        delay(200)
         val hasMic = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val hasLoc = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
         if (!hasMic) {
-            emit(DiagnosticItem("Microphone Access Denied", DiagnosticStatus.Failure, "Grant permission in Settings"))
-            // We don't return@flow here to allow checking other systems (like server conn) even if mic is off
+            emit(DiagnosticItem("Microphone Access", DiagnosticStatus.Failure, "Voice Disabled"))
+        } else if (!hasLoc) {
+            emit(DiagnosticItem("Permissions", DiagnosticStatus.Warning, "SOS Location Disabled"))
         } else {
-            emit(DiagnosticItem("Audio System Secure", DiagnosticStatus.Success))
+            emit(DiagnosticItem("Permissions Secure", DiagnosticStatus.Success))
         }
 
-        // 2. Radio Bind (Critical)
-        emit(DiagnosticItem("Checking Radio Ports", DiagnosticStatus.Running))
-        delay(300)
+        // 2. BACKGROUND SURVIVAL (Critical for PTT)
+        emit(DiagnosticItem("Background Process", DiagnosticStatus.Running))
+        delay(200)
+        val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        val isIgnoringBattery = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            pm.isIgnoringBatteryOptimizations(context.packageName)
+        } else true
+
+        if (isIgnoringBattery) {
+            emit(DiagnosticItem("Battery Optimization", DiagnosticStatus.Success, "Unrestricted"))
+        } else {
+            emit(DiagnosticItem("Battery Optimization", DiagnosticStatus.Warning, "App may sleep. Tap to fix."))
+        }
+
+        // 3. AUDIO HARDWARE (AEC Check)
+        emit(DiagnosticItem("Audio Engine", DiagnosticStatus.Running))
+        delay(200)
+        val hasAec = AcousticEchoCanceler.isAvailable()
+        val hasNs = NoiseSuppressor.isAvailable()
+
+        if (hasAec && hasNs) {
+            emit(DiagnosticItem("Audio Hardware", DiagnosticStatus.Success, "AEC + NS Ready"))
+        } else {
+            emit(DiagnosticItem("Audio Hardware", DiagnosticStatus.Warning, "Software Mode (Echo Risk)"))
+        }
+
+        // 4. UDP PORT BINDING (PTT & Calls)
+        emit(DiagnosticItem("Radio Transport", DiagnosticStatus.Running))
+        delay(200)
+
+        // Check PTT Port 50005 (Managed by Service)
         val bindStatus = service?.voiceServiceState?.value?.networkStatus ?: "Disconnected"
 
+        // Check Call Port 50006 (Managed by CallEngine)
+        var port50006Free = false
+        try {
+            // If we can bind it, it's free. If it throws, it's in use (which is good if we are calling, bad if idle)
+            val s = DatagramSocket(50006)
+            s.close()
+            port50006Free = true
+        } catch (e: Exception) { port50006Free = false }
+
         if (bindStatus != "Error: UDP Bind Failed") {
-            emit(DiagnosticItem("Port 50005 Bound", DiagnosticStatus.Success))
+            emit(DiagnosticItem("UDP Transport", DiagnosticStatus.Success, "Port 50005 Bound"))
         } else {
-            emit(DiagnosticItem("Radio Bind Failed", DiagnosticStatus.Failure, "Restart App"))
+            emit(DiagnosticItem("Radio Transport", DiagnosticStatus.Failure, "Port 50005 Failed"))
         }
 
-        // 3. Network Transport
-        emit(DiagnosticItem("Checking Connectivity", DiagnosticStatus.Running))
-        delay(400)
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val hasNet = cm.activeNetwork?.let {
-            cm.getNetworkCapabilities(it)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-        } == true
-
-        if (hasNet) {
-            emit(DiagnosticItem("Global Network Active", DiagnosticStatus.Success))
+        // 5. HARDWARE SENSORS (Impact Shield)
+        emit(DiagnosticItem("Safety Sensors", DiagnosticStatus.Running))
+        delay(200)
+        val sm = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        val accel = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        if (accel != null) {
+            emit(DiagnosticItem("Impact Sensor", DiagnosticStatus.Success, "Accelerometer Active"))
         } else {
-            emit(DiagnosticItem("Offline Mode Active", DiagnosticStatus.Warning, "Local Range Only"))
+            emit(DiagnosticItem("Impact Sensor", DiagnosticStatus.Failure, "Hardware Missing"))
         }
 
-        // 4. CLOUD WAKE TOKEN (New & Critical for Internet Calls)
+        // 6. CLOUD WAKE (FCM)
         emit(DiagnosticItem("Cloud Wake Service", DiagnosticStatus.Running))
-        delay(500)
+        delay(300)
         val prefs = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
         val token = prefs.getString("my_fcm_token", "")
 
-        // Google Play Services Check
         val googleApi = com.google.android.gms.common.GoogleApiAvailability.getInstance()
         val resultCode = googleApi.isGooglePlayServicesAvailable(context)
 
         if (resultCode != com.google.android.gms.common.ConnectionResult.SUCCESS) {
-            emit(DiagnosticItem("Cloud Wake Service", DiagnosticStatus.Failure, "Google Play Services Missing"))
+            emit(DiagnosticItem("Cloud Wake", DiagnosticStatus.Failure, "Play Services Missing"))
         } else if (token.isNullOrBlank()) {
-            // This catches the "Fresh Install" bug we just fixed
-            emit(DiagnosticItem("Cloud Wake Service", DiagnosticStatus.Failure, "Token Missing. Relogin required."))
+            emit(DiagnosticItem("Cloud Wake", DiagnosticStatus.Failure, "Token Missing. Relogin."))
         } else {
-            val shortToken = token.take(6) + "..."
-            emit(DiagnosticItem("Cloud Wake Service", DiagnosticStatus.Success, "Active ($shortToken)"))
+            emit(DiagnosticItem("Cloud Wake", DiagnosticStatus.Success, "Active"))
         }
 
-        // 5. SERVER HEARTBEAT (New)
-        emit(DiagnosticItem("Server Link", DiagnosticStatus.Running))
-        delay(500)
+        // 7. SERVER HEARTBEAT
+        emit(DiagnosticItem("Signal Server", DiagnosticStatus.Running))
+        delay(300)
         val jwt = prefs.getString("jwt_token", "")
         if (jwt.isNullOrEmpty() || jwt == "OFFLINE_TOKEN") {
-            emit(DiagnosticItem("Server Link", DiagnosticStatus.Warning, "Offline Login Mode"))
+            emit(DiagnosticItem("Signal Server", DiagnosticStatus.Warning, "Offline Login"))
         } else {
             try {
-                // Lightweight ping to ensure API is reachable and JWT is valid
-                RetrofitClient.api.checkSignals("Bearer $jwt")
-                emit(DiagnosticItem("Server Link", DiagnosticStatus.Success, "Connected"))
+                val response = RetrofitClient.api.checkSignals("Bearer $jwt")
+                if (response.signals != null) {
+                    emit(DiagnosticItem("Signal Server", DiagnosticStatus.Success, "Synced (Low Latency)"))
+                } else {
+                    emit(DiagnosticItem("Signal Server", DiagnosticStatus.Warning, "Connected (No Data)"))
+                }
             } catch (e: Exception) {
-                emit(DiagnosticItem("Server Link", DiagnosticStatus.Failure, "Unreachable (Check Internet)"))
+                emit(DiagnosticItem("Signal Server", DiagnosticStatus.Failure, "Unreachable"))
             }
         }
 
-        // 6. Guardian Services (Config Check)
-        emit(DiagnosticItem("Scanning Guardian Services", DiagnosticStatus.Running))
-        delay(300)
-        val remoteAllowed = prefs.getBoolean("allow_remote_control", false)
-
-        if (remoteAllowed) {
-            emit(DiagnosticItem("Guardian Link Active", DiagnosticStatus.Success))
-        } else {
-            emit(DiagnosticItem("Guardian Link Standby", DiagnosticStatus.Warning, "Remote Control Disabled"))
-        }
-
-        delay(200)
+        delay(100)
         emit(DiagnosticItem("DIAGNOSTIC COMPLETE", DiagnosticStatus.Success))
     }
 }

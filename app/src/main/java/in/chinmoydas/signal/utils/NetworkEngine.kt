@@ -4,6 +4,7 @@ import android.util.Log
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
@@ -16,69 +17,63 @@ class NetworkEngine(
     private var socket: DatagramSocket? = null
     private val isRunning = AtomicBoolean(false)
 
-    // [FIX] Limit queue size to prevent memory leaks if network is slow
-    private val sendQueue = LinkedBlockingQueue<DatagramPacket>(100)
+    // [FIX 1] DNS Cache to prevent "Stutter"
+    private val ipCache = ConcurrentHashMap<String, InetAddress>()
 
-    // [CRITICAL] Fixed Thread Pool (4 threads).
-    // This handles high-speed audio packets without crashing the CPU.
-    private val sendExecutor = Executors.newFixedThreadPool(4)
+    // Queue for outgoing packets
+    private val sendQueue = LinkedBlockingQueue<DatagramPacket>(128)
+
+    // Single thread is enough if DNS is cached. No need for 4 threads.
+    private val sendExecutor = Executors.newSingleThreadExecutor()
 
     fun start(onPacketReceived: (DatagramPacket) -> Unit): Boolean {
         if (isRunning.getAndSet(true)) return true
 
-        // Retry logic for port binding (Robustness)
-        var attempt = 0
-        var bound = false
-        while (attempt < 3 && !bound) {
-            try {
-                socket = DatagramSocket(port).apply {
-                    reuseAddress = true
-                    receiveBufferSize = 256 * 1024
-                    soTimeout = 0
-                }
-                bound = true
-            } catch (e: Exception) {
-                attempt++
-                try { Thread.sleep(200) } catch (e: Exception) {}
+        try {
+            socket = DatagramSocket(port).apply {
+                reuseAddress = true
+                receiveBufferSize = 256 * 1024 // 256KB Buffer
+                broadcast = true // Enable Broadcast for discovery
+                soTimeout = 0
             }
-        }
-
-        if (!bound) {
+        } catch (e: Exception) {
             isRunning.set(false)
             return false
         }
 
-        // 1. Sender Thread (Consumes the queue)
+        // 1. Sender Loop
         Thread {
             while (isRunning.get()) {
                 try {
                     val packet = sendQueue.take()
                     socket?.send(packet)
-                } catch (e: Exception) { /* socket closed */ }
+                } catch (e: Exception) {
+                    // Socket closed or network error
+                }
             }
         }.start()
 
-        // 2. Receiver Thread (Listens for data)
+        // 2. Receiver Loop
         Thread {
-            val buffer = ByteArray(4096)
-            val packet = DatagramPacket(buffer, buffer.size)
-
+            // [FIX 2] Use a fresh buffer for every packet to prevent data corruption
             while (isRunning.get()) {
                 try {
-                    packet.setData(buffer)
+                    val buffer = ByteArray(4096) // Max MTU safe size
+                    val packet = DatagramPacket(buffer, buffer.size)
+
                     socket?.receive(packet)
 
+                    // Create a precise copy of the data
                     val dataCopy = packet.data.copyOf(packet.length)
 
-                    // Traffic Splitter: STUN vs Audio
                     if (StunClient.isStunResponse(dataCopy)) {
                         onStunPacket(dataCopy)
                     } else {
-                        val forwardingPacket = DatagramPacket(dataCopy, dataCopy.size, packet.address, packet.port)
-                        onPacketReceived(forwardingPacket)
+                        // Pass the packet up (Address/Port preserved in the packet object)
+                        onPacketReceived(packet)
                     }
                 } catch (e: Exception) {
-                    if (isRunning.get()) Log.w(tag, "Receive Error: ${e.message}")
+                    // Ignore receive errors
                 }
             }
         }.start()
@@ -90,22 +85,31 @@ class NetworkEngine(
         if (isRunning.get()) sendQueue.offer(packet)
     }
 
-    // [CRITICAL FIX] Efficient Sending
-    // Offloads IP resolution to the thread pool so the UI/Audio thread never waits.
     fun send(data: ByteArray, targets: List<String>, targetPort: Int) {
         if (!isRunning.get() || targets.isEmpty()) return
 
+        // [FIX 3] High-Performance Send (Non-Blocking)
         sendExecutor.execute {
             targets.forEach { ip ->
                 try {
-                    val address = InetAddress.getByName(ip)
-                    val packet = DatagramPacket(data, data.size, address, targetPort)
-                    // If queue is full, drop oldest packet to keep audio "real-time"
-                    if (!sendQueue.offer(packet)) {
-                        sendQueue.poll()
-                        sendQueue.offer(packet)
+                    // Check Cache first
+                    var address = ipCache[ip]
+                    if (address == null) {
+                        address = InetAddress.getByName(ip)
+                        ipCache[ip] = address // Cache it!
                     }
-                } catch (e: Exception) { }
+
+                    if (address != null) {
+                        val packet = DatagramPacket(data, data.size, address, targetPort)
+                        // Drop oldest if queue full (Real-time priority)
+                        if (!sendQueue.offer(packet)) {
+                            sendQueue.poll()
+                            sendQueue.offer(packet)
+                        }
+                    }
+                } catch (e: Exception) {
+                    // Bad IP, ignore
+                }
             }
         }
     }
@@ -114,6 +118,7 @@ class NetworkEngine(
         isRunning.set(false)
         try { socket?.close() } catch (e: Exception) {}
         sendQueue.clear()
+        ipCache.clear()
     }
 
     fun isBound(): Boolean = isRunning.get() && socket != null && !socket!!.isClosed

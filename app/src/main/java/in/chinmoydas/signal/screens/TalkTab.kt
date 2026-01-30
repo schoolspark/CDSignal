@@ -80,12 +80,20 @@ fun TalkTab(
     var isPressed by remember { mutableStateOf(false) }
     val fusedLocationClient = remember { LocationServices.getFusedLocationProviderClient(context) }
 
-    // [FIX] Correctly observe the Unstable Service State
     val serviceState by service?.voiceServiceState?.collectAsState(initial = VoiceServiceState()) ?: remember { mutableStateOf(VoiceServiceState()) }
     val listState = rememberLazyListState()
 
     val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         if (it.getOrDefault(Manifest.permission.RECORD_AUDIO, false)) onPermissionsGranted()
+    }
+
+    // [FIX ISSUE 7] Auto-show System Diagnostics on first cold start
+    LaunchedEffect(Unit) {
+        if (!viewModel.hasShownStartupCheck) {
+            delay(800) // Slight delay so UI settles
+            onCheckSystem()
+            viewModel.hasShownStartupCheck = true
+        }
     }
 
     LaunchedEffect(service) {
@@ -95,15 +103,13 @@ fun TalkTab(
         }
     }
 
-    // Auto-scroll to new messages
     LaunchedEffect(pagerEntries.size) {
-        if (pagerEntries.isNotEmpty()) listState.animateScrollToItem(0) // Scroll to top (newest)
+        if (pagerEntries.isNotEmpty()) listState.animateScrollToItem(0)
     }
 
     LaunchedEffect(service) { viewModel.observeServicePing(service) }
     LaunchedEffect(viewModel.targetUser) { if (viewModel.targetUser.isNotEmpty()) viewModel.triggerPing(service) }
 
-    // [FIX] Permissions for Unstable Core (Android 14+ Microphone Service)
     LaunchedEffect(Unit) {
         val perms = mutableListOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.VIBRATE, Manifest.permission.ACCESS_FINE_LOCATION)
         if (Build.VERSION.SDK_INT >= 34) perms.add(Manifest.permission.FOREGROUND_SERVICE_MICROPHONE)
@@ -112,7 +118,6 @@ fun TalkTab(
         permLauncher.launch(perms.toTypedArray())
     }
 
-    // [FIX] Wiring SOS to the new Unstable VoiceService logic
     if (serviceState.isSosPending) {
         SosDialog(onCancel = { service?.cancelSos() }, onSend = { service?.confirmSos() })
     }
@@ -151,7 +156,6 @@ fun TalkTab(
                     }
                     Text(if (isSecureMode) "Encrypted Channel" else "Public Channel", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
 
-                    // [FIX] Cloud Wake Logic from Unstable ViewModel
                     if (viewModel.targetUser.isNotEmpty() && !viewModel.isBroadcastMode) {
                         val targetContact = viewModel.savedContacts.find { it.name == viewModel.targetUser }
                         val hasToken = targetContact?.fcmToken?.isNotBlank() == true
@@ -198,7 +202,6 @@ fun TalkTab(
                         Icon(Icons.Default.SettingsRemote, "Guardian Remote", tint = MaterialTheme.colorScheme.error)
                     }
 
-                    // [FIX] Calls Unstable Service heartbeat to force update IPs
                     IconButton(onClick = { service?.triggerHeartbeat(); viewModel.triggerPing(service); Toast.makeText(context, "Synced", Toast.LENGTH_SHORT).show() }) {
                         Icon(Icons.Default.Sync, "Sync", tint = MaterialTheme.colorScheme.primary)
                     }
@@ -248,17 +251,33 @@ fun TalkTab(
                         when (it.action) {
                             MotionEvent.ACTION_DOWN -> {
                                 isPressed = true
-                                if (!viewModel.isHandsFree && service != null) {
-                                    permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
-                                    // [FIX] Matches Unstable WalkieViewModel signature (handling STUN/Dynamic Ports)
-                                    viewModel.startTransmission(
-                                        onIpsFound = { ips, port -> service.startTalk(ips, port) },
-                                        onUpdateIps = { newIps -> service.updateTalkTargets(newIps) }
-                                    )
+                                // [FIXED HANDSFREE START LOGIC]
+                                if (service != null) {
+                                    if (viewModel.isHandsFree) {
+                                        // Toggle Logic
+                                        if (serviceState.isTransmitting) {
+                                            viewModel.stopTransmission { service.stopTalk() }
+                                        } else {
+                                            permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+                                            viewModel.startTransmission(
+                                                onIpsFound = { ips, port -> service.startTalk(ips, port) },
+                                                onUpdateIps = { newIps -> service.updateTalkTargets(newIps) }
+                                            )
+                                        }
+                                    } else {
+                                        // Standard PTT Logic
+                                        permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+                                        viewModel.startTransmission(
+                                            onIpsFound = { ips, port -> service.startTalk(ips, port) },
+                                            onUpdateIps = { newIps -> service.updateTalkTargets(newIps) }
+                                        )
+                                    }
                                 }
                             }
                             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                                 isPressed = false
+                                // [FIXED HANDSFREE STOP LOGIC]
+                                // Ignore lift if Handsfree is ON
                                 if (!viewModel.isHandsFree && service != null) {
                                     viewModel.stopTransmission { service.stopTalk() }
                                 }
@@ -292,6 +311,7 @@ fun TalkTab(
                         selected = viewModel.isHandsFree,
                         onClick = {
                             viewModel.isHandsFree = !viewModel.isHandsFree
+                            // Safe stop if we toggle off while talking
                             if (serviceState.isTransmitting) viewModel.stopTransmission { service?.stopTalk() }
                             val status = if (viewModel.isHandsFree) "Handsfree: ON" else "Handsfree: OFF"
                             Toast.makeText(context, status, Toast.LENGTH_SHORT).show()
@@ -382,7 +402,6 @@ fun TalkTab(
         }
 
         // --- 7. FAB (CALL BUTTON) ---
-        // [FIX] Integrated with Unstable CallSignaling
         val targetUser = viewModel.targetUser
         val canCall = targetUser.isNotEmpty() && targetUser != "SERVER_LINK"
         FloatingActionButton(

@@ -119,6 +119,7 @@ fun DiagnosticsScreen(navController: NavController) {
         ttsEngine = tts
 
         onDispose {
+            // [FIX] Ensure we don't leave the audio system in a weird state
             val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             am.mode = AudioManager.MODE_NORMAL
             am.isSpeakerphoneOn = false
@@ -139,6 +140,7 @@ fun DiagnosticsScreen(navController: NavController) {
     }
 
     fun copyReport() {
+        // [FIX] Corrected String Template syntax
         val report = """
             CD SIGNAL DIAGNOSTIC REPORT
             ---------------------------
@@ -152,7 +154,7 @@ fun DiagnosticsScreen(navController: NavController) {
             Port 50005 (PTT): $portStatus
             Port 50006 (Call): $callPortStatus
             Sensors: $sensorStatus
-            fcmStatus = checkFcmToken(context)
+            Cloud Token: $fcmStatus
             Voice Vol: $volumeStatus
             TTS Engine: $ttsStatus
             Storage: $storageStatus
@@ -217,8 +219,8 @@ fun DiagnosticsScreen(navController: NavController) {
             DiagnosticRow("Local IP", localIp)
             DiagnosticRow("Server API", serverStatus)
             DiagnosticRow("Port 50005 (PTT)", portStatus)
-            DiagnosticRow("Port 50006 (Call)", callPortStatus) // [NEW]
-            DiagnosticRow("Sensors (Fall)", sensorStatus)       // [NEW]
+            DiagnosticRow("Port 50006 (Call)", callPortStatus)
+            DiagnosticRow("Sensors (Fall)", sensorStatus)
             DiagnosticRow("Voice Vol", volumeStatus)
             DiagnosticRow("TTS Engine", ttsStatus)
             DiagnosticRow("Storage", storageStatus)
@@ -447,7 +449,9 @@ fun checkPermissions(context: Context): String {
 
 fun checkBattery(context: Context): String {
     val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-    val isIgnored = pm.isIgnoringBatteryOptimizations(context.packageName)
+    val isIgnored = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        pm.isIgnoringBatteryOptimizations(context.packageName)
+    } else true
     return if (isIgnored) "OK (Unrestricted)" else "Warning (Restricted)"
 }
 
@@ -518,7 +522,6 @@ fun checkVolume(context: Context): String {
     return if (current == 0) "Muted (0%)" else "$pct% ($current/$max)"
 }
 
-// [UPDATED] Generic Port Checker
 fun checkPort(port: Int): String {
     return try {
         val socket = DatagramSocket(port)
@@ -531,7 +534,6 @@ fun checkPort(port: Int): String {
     }
 }
 
-// [NEW] Sensor Checker
 fun checkSensors(context: Context): String {
     val sm = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     val accel = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
@@ -543,6 +545,8 @@ suspend fun checkStunConnectivity(): String = withContext(Dispatchers.IO) {
         val socket = DatagramSocket()
         socket.soTimeout = 2500
 
+        // Use the new StunClient with arguments if needed,
+        // but default arguments work fine for diagnostics.
         val request = StunClient.createBindRequest()
             ?: return@withContext "Fail (Gen Request)"
 
@@ -599,7 +603,6 @@ fun startPlaying(file: File, playerState: MutableState<MediaPlayer?>, onComplete
     playerState.value = player
 }
 
-// [NEW] Checks shared prefs for the token
 fun checkFcmToken(context: Context): String {
     val prefs = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
     val token = prefs.getString("my_fcm_token", null)

@@ -16,12 +16,14 @@ import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.RingtoneManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.*
+import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import android.support.v4.media.session.MediaSessionCompat
 import android.view.KeyEvent
@@ -84,7 +86,7 @@ class VoiceService : Service() {
     private var lastRejectTime: Long = 0
     private var isTheaterMode = false
 
-    // [FIX] Interceptor is the primary way UI handles logic now
+    // Interceptor for UI logic (CallSignaling, etc.)
     var packetInterceptor: ((String, String) -> Boolean)? = null
 
     // Engines & Routers
@@ -128,7 +130,6 @@ class VoiceService : Service() {
     @Volatile private var myIdentityKey: String? = null
     @Volatile private var currentSpeakerName: String? = null
 
-    // [FIX] Added activeTargets to support multi-cast PTT
     @Volatile private var activeTargets: List<String> = emptyList()
     @Volatile private var lastPort: Int = UDP_PORT
 
@@ -185,7 +186,7 @@ class VoiceService : Service() {
     private var currentSequenceNumber = 0
     private var localLinkManager: LocalLinkManager? = null
 
-    // [CRITICAL] Broadcast Receiver for loose coupling with UI
+    // Broadcast Receiver for loose coupling with UI
     private val signalReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == "in.chinmoydas.signal.SEND_SIGNAL") {
@@ -229,7 +230,6 @@ class VoiceService : Service() {
 
                     _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
 
-                    // [FIX] Ensure ConnectionManager exists before using it
                     if (::connectionManager.isInitialized) {
                         connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
                     }
@@ -266,7 +266,7 @@ class VoiceService : Service() {
         audioEngine = AudioEngine(this)
         repository = MainRepository(applicationContext)
 
-        // 1. Init NetworkEngine with STUN Splitter Logic
+        // 1. Init NetworkEngine
         networkEngine = NetworkEngine(UDP_PORT) { stunData ->
             if (::connectionManager.isInitialized) {
                 connectionManager.handleStunResponse(stunData)
@@ -281,7 +281,6 @@ class VoiceService : Service() {
 
         initMediaSession()
 
-        // [FIX] Register Receiver with Tiramisu support
         val filter = IntentFilter("in.chinmoydas.signal.SEND_SIGNAL")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(signalReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -494,14 +493,35 @@ class VoiceService : Service() {
         return CryptoEngine.deriveKey(keyToUse)
     }
 
+    // [FIX] Graceful Shutdown to sync offline status
+    private fun performGracefulShutdown() {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val token = repository.getToken()
+                if (!token.isNullOrBlank()) {
+                    // Send status="offline" via Retrofit
+                    RetrofitClient.api.sendHeartbeat("Bearer $token", 0, "0.0.0.0", null, null, "offline")
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "Failed to send goodbye: ${e.message}")
+            }
+
+            // Wait briefly for network then die
+            delay(500)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            sendBroadcast(Intent("in.chinmoydas.signal.ACTION_EXIT"))
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         MediaButtonReceiver.handleIntent(mediaSession, intent)
         val action = intent?.action
 
         when (action) {
             "STOP_SERVICE" -> {
-                sendBroadcast(Intent("in.chinmoydas.signal.ACTION_EXIT").setPackage(packageName))
-                stopSelf()
+                // [FIX] Call graceful shutdown instead of abrupt stop
+                performGracefulShutdown()
                 return START_NOT_STICKY
             }
 
@@ -603,10 +623,8 @@ class VoiceService : Service() {
                 if (!multicastLock.isHeld) multicastLock.acquire()
                 audioEngine.startPlayback()
 
-                // [CRITICAL] 1. Start Network Listening
+                // 1. Start Network Listening
                 val networkStarted = networkEngine.start { packet ->
-                    // Note: STUN packets never reach here. They go to ConnectionManager.
-                    // Only Audio/Data packets arrive here.
                     handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
                 }
 
@@ -619,7 +637,7 @@ class VoiceService : Service() {
                 _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
                 updateNotification("Online & Ready", null)
 
-                // [CRITICAL] 2. Start Smart Heartbeat Loop
+                // 2. Start Smart Heartbeat Loop
                 connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
 
                 startSignalLoop()
@@ -739,7 +757,9 @@ class VoiceService : Service() {
     }
 
     private fun handleIncomingPacket(data: ByteArray, length: Int, senderIp: String) {
-        if (isSending || senderIp == myLocalIp || length <= 5) return
+        // [FIX] REMOVED the 'isSending' check here to allow incoming COMMANDS to be processed.
+        if (senderIp == myLocalIp || length <= 5) return
+
         val nameLen = data[0].toInt() and 0xFF
         if (nameLen + 5 > length) return
         val senderName = String(data, 1, nameLen)
@@ -828,18 +848,28 @@ class VoiceService : Service() {
                     }
                 }
 
+                // Check for TEXT / COMMANDS (Allows control even while transmitting)
                 if (payload.size < 500) {
                     try {
                         val textData = String(payload, Charsets.UTF_8)
                         if (textData.startsWith("TXT:")) {
                             val cleanMessage = textData.substring(4)
 
-                            // [CRITICAL FIX] Intercept Call Signals
+                            // [FIX] Intercept Call/SOS Signals
                             // This delegates logic to the UI/ViewModel layer via MainActivity
                             if (packetInterceptor?.invoke(cleanMessage, senderIp) == true) {
                                 return
                             }
 
+                            // [FIX] Handle SOS separately for instant wake-up
+                            if (cleanMessage == "CMD:SOS") {
+                                showIncomingCallNotification("SOS ALERT: $senderName", isAlarm = true)
+                                // [CRITICAL TYPO FIX] Case match with SafetySignaling.kt
+                                SafetySignaling.triggerSOS(senderName)
+                                return
+                            }
+
+                            // [FIX] Catch Guardian Commands
                             if (cleanMessage.startsWith("CMD:REMOTE_")) {
                                 val isRemoteAllowed = prefs.getBoolean("allow_remote_control", false)
                                 if (!isRemoteAllowed) {
@@ -895,13 +925,16 @@ class VoiceService : Service() {
                                 return
                             }
 
-                            val notificationPrefix = if(isPrincipal) "⚠️ PRIORITY MSG" else "Message"
-                            speakText(cleanMessage)
-                            scope.launch {
-                                val db = AppDatabase.getDatabase(applicationContext)
-                                db.pagerDao().insert(PagerEntry(sender = senderName, type = "TEXT", content = cleanMessage, isRead = false))
+                            // [FIX] Only speak valid messages, ignore commands
+                            if (!cleanMessage.startsWith("CMD:") && !cleanMessage.startsWith("LOC:")) {
+                                val notificationPrefix = if(isPrincipal) "⚠️ PRIORITY MSG" else "Message"
+                                speakText(cleanMessage)
+                                scope.launch {
+                                    val db = AppDatabase.getDatabase(applicationContext)
+                                    db.pagerDao().insert(PagerEntry(sender = senderName, type = "TEXT", content = cleanMessage, isRead = false))
+                                }
+                                updateNotification("$notificationPrefix from $senderName", cleanMessage)
                             }
-                            updateNotification("$notificationPrefix from $senderName", cleanMessage)
                             return
                         }
                     } catch (e: Exception) { }
@@ -914,6 +947,9 @@ class VoiceService : Service() {
                 if (CallEngine.isCallActive) {
                     return
                 }
+
+                // [FIX] Block AUDIO playback if transmitting, but allow everything else above
+                if (isSending) return
 
                 if (!isSilenced || isPrincipal) {
                     try { audioEngine.playPcmChunk(payload, seqNum) } catch (e: Exception) {}
@@ -1037,16 +1073,21 @@ class VoiceService : Service() {
     fun startTalk(ips: List<String>, port: Int) {
         if (isSending) return
 
-        // [FIX] Validating Targets
         if (ips.isEmpty()) {
             Log.e(tag, "No Target IPs!")
             return
         }
 
         stopVoxMonitoring()
+
+        // Force Foreground Service Type Microphone for Android 14+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForegroundServiceNotification("Transmitting...")
+        }
+
         acquireResources(forceAudio = true)
 
-        // [FIX] Enable Hardware Echo Cancellation (Fixes "Noise when together")
+        // Enable Hardware Echo Cancellation (Fixes "Noise when together")
         audioRouter.setCallMode(true)
 
         isSending = true
@@ -1067,7 +1108,6 @@ class VoiceService : Service() {
         val isSecureMode = prefs.getBoolean("secure_mode", false)
         val secretKey = if (isSecureMode) getEncryptionKey() else null
 
-        // [FIX] Confirmation Vibrate (Since we don't have the beep sound)
         vibrate()
 
         audioEngine.startRecording(shouldCompress) { rawBuffer ->
@@ -1096,7 +1136,7 @@ class VoiceService : Service() {
 
         audioEngine.stopRecording()
 
-        // [FIX] Disable Echo Cancellation Mode
+        // Disable Echo Cancellation Mode
         audioRouter.setCallMode(false)
 
         scope.launch {
@@ -1106,6 +1146,8 @@ class VoiceService : Service() {
             System.arraycopy(endNameBytes, 0, buf, 1, endNameBytes.size)
             repeat(3) { networkEngine.send(buf, activeTargets, lastPort); delay(20) }
             releaseResourcesIfNeeded()
+
+            startForegroundServiceNotification("Listening...")
         }
 
         if (_voiceServiceState.value.isVoxEnabled) startVoxMonitoring()
@@ -1237,6 +1279,7 @@ class VoiceService : Service() {
         val intent = Intent(this, MainActivity::class.java).apply { if (channelName != null) putExtra("auto_connect_channel", channelName) }
         val pendingIntent = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
 
+        // [FIX] Correct PendingIntent for Stopping Service (Needs getService, not getActivity)
         val exitIntent = Intent(this, VoiceService::class.java).apply { action = "STOP_SERVICE" }
         val exitPendingIntent = PendingIntent.getService(this, 999, exitIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val exitAction = NotificationCompat.Action.Builder(android.R.drawable.ic_menu_close_clear_cancel, "Exit", exitPendingIntent).build()
@@ -1267,38 +1310,59 @@ class VoiceService : Service() {
             .build()
     }
 
-    private fun showIncomingCallNotification(callerName: String) {
+    // [FIX] WhatsApp-Style Incoming Call Notification
+    // Uses High Importance, Full Screen Intent, and Bypass DND
+    private fun showIncomingCallNotification(callerName: String, msgBody: String = "Incoming Signal", isAlarm: Boolean = false) {
+        val channelId = "cd_signal_call_alert_v2" // [FIX] New ID to force system settings reset
+
+        val manager = getSystemService(NotificationManager::class.java)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(channelId, "Incoming Alerts", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "Wakes device for Calls and SOS"
+                setSound(Settings.System.DEFAULT_RINGTONE_URI, null)
+                enableVibration(true)
+                lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
+                setBypassDnd(true) // Attempt to override Do Not Disturb
+            }
+            manager.createNotificationChannel(channel)
+        }
+
         val fullScreenIntent = Intent(this, MainActivity::class.java).apply {
             action = "INCOMING_CALL"
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            // [FIX] Flags to wake from background/lock screen
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                    Intent.FLAG_ACTIVITY_NO_USER_ACTION
             putExtra("auto_connect_channel", callerName)
         }
 
         val fullScreenPendingIntent = PendingIntent.getActivity(
             this,
-            111,
+            119,
             fullScreenIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val notificationBuilder = NotificationCompat.Builder(this, "VoiceChannel")
+        val notification = NotificationCompat.Builder(this, channelId)
             .setSmallIcon(R.mipmap.ic_launcher_foreground)
-            .setContentTitle("Incoming Call")
-            .setContentText(callerName)
+            .setContentTitle(if(isAlarm) "SOS ALERT" else "INCOMING SIGNAL")
+            .setContentText("$msgBody from $callerName")
             .setPriority(NotificationCompat.PRIORITY_MAX)
-            .setCategory(NotificationCompat.CATEGORY_CALL)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setCategory(if(isAlarm) NotificationCompat.CATEGORY_ALARM else NotificationCompat.CATEGORY_CALL)
+            .setFullScreenIntent(fullScreenPendingIntent, true) // [CRITICAL] Wakes screen
             .setAutoCancel(true)
-            .setFullScreenIntent(fullScreenPendingIntent, true)
             .setOngoing(true)
+            .setVibrate(longArrayOf(0, 500, 500, 500))
             .addAction(
                 android.R.drawable.ic_menu_call,
-                "Open",
+                "OPEN",
                 fullScreenPendingIntent
             )
+            .build()
 
-        val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager.notify(2, notificationBuilder.build())
+        manager.notify(2, notification)
     }
 
     override fun onDestroy() {
@@ -1306,7 +1370,6 @@ class VoiceService : Service() {
         audioRouter.shutdown()
         CallEngine.stopCall()
 
-        // [NEW] Trigger offline via manager (fire and forget)
         if (::connectionManager.isInitialized) {
             connectionManager.stop()
         }

@@ -20,7 +20,7 @@ class AudioRouter(private val context: Context) {
     private var isHeadsetPlugged: Boolean = false
     private var isFocusHeld: Boolean = false
 
-    // [NEW] Call Mode State (Distinguishes PTT vs VoIP)
+    // [CRITICAL] This flag controls Echo Cancellation (AEC)
     private var isVoipCallActive: Boolean = false
 
     // Audio Focus (Android O+)
@@ -33,77 +33,77 @@ class AudioRouter(private val context: Context) {
     fun initialize() {
         val filter = IntentFilter(AudioManager.ACTION_HEADSET_PLUG)
         context.registerReceiver(headsetReceiver, filter)
-        // Initial check
+
+        // Initial hardware check
         isHeadsetPlugged = audioManager.isWiredHeadsetOn || audioManager.isBluetoothA2dpOn
         updateRoute()
     }
 
-    // 2. Headset Detection
+    // 2. Headset Detection (Simplified)
     private val headsetReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action == AudioManager.ACTION_HEADSET_PLUG) {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            if (intent?.action == AudioManager.ACTION_HEADSET_PLUG) {
                 val state = intent.getIntExtra("state", -1)
+                val wasPlugged = isHeadsetPlugged
                 isHeadsetPlugged = (state == 1)
 
-                // Hardware override: If headset plugged, speaker is OFF visually
-                if (isHeadsetPlugged) {
-                    setSpeakerphoneOn(false)
-                } else {
-                    // Restore user preference
-                    setSpeakerphoneOn(isSpeakerPreferred)
+                if (wasPlugged != isHeadsetPlugged) {
+                    Log.i(tag, "Headset Changed: $isHeadsetPlugged")
+                    // [FIX] Don't change settings here. Let updateRoute handle it.
+                    updateRoute()
                 }
-
-                // Notify UI of the forced change
-                onRouteChanged?.invoke(!isHeadsetPlugged && isSpeakerPreferred)
             }
         }
     }
 
-    // 3. Routing Logic (The Brain)
+    // 3. The "Brain" (Central Routing Logic)
     private fun updateRoute() {
+        // [RULE 1] Headset always wins. If plugged, force speaker OFF.
         if (isHeadsetPlugged) {
-            setSpeakerphoneOn(false)
-            // Use Communication mode for clean voice audio if calling
-            setMode(if (isVoipCallActive) AudioManager.MODE_IN_COMMUNICATION else AudioManager.MODE_NORMAL)
-            return
+            setSpeakerphone(false)
+            onRouteChanged?.invoke(false)
+        } else {
+            // [RULE 2] If no headset, respect user preference (Speaker vs Earpiece)
+            setSpeakerphone(isSpeakerPreferred)
+            onRouteChanged?.invoke(isSpeakerPreferred)
         }
 
-        // [UPGRADE] VoIP Call Mode (Full-Duplex) vs PTT
+        // [RULE 3] Echo Cancellation (AEC)
+        // If transmitting (PTT) or Calling, we MUST use MODE_IN_COMMUNICATION.
+        // This turns on the noise-canceling hardware.
         if (isVoipCallActive) {
-            // Full Duplex: Must use MODE_IN_COMMUNICATION for Echo Cancellation (AEC)
-            setMode(AudioManager.MODE_IN_COMMUNICATION)
-            setSpeakerphoneOn(isSpeakerPreferred)
+            if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) {
+                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            }
         } else {
-            // PTT Mode: Default to Speaker, but use NORMAL mode to save battery/avoid status bar green dot
-            setMode(AudioManager.MODE_NORMAL)
-            setSpeakerphoneOn(isSpeakerPreferred)
+            // If idle, go back to Normal to save battery and hide status bar icons
+            if (audioManager.mode != AudioManager.MODE_NORMAL) {
+                audioManager.mode = AudioManager.MODE_NORMAL
+            }
         }
     }
 
-    // 4. External Control Methods
+    // 4. Public Control Methods
+
+    // Called by VoiceService when PTT starts/stops
     fun setCallMode(active: Boolean) {
         isVoipCallActive = active
         updateRoute()
     }
 
-    fun setSpeakerPreferred(on: Boolean) {
-        isSpeakerPreferred = on
+    // Called by UI "Speaker" Toggle
+    fun setSpeakerPreferred(preferSpeaker: Boolean) {
+        isSpeakerPreferred = preferSpeaker
         updateRoute()
     }
 
-    private fun setMode(mode: Int) {
-        if (audioManager.mode != mode) {
-            audioManager.mode = mode
-        }
-    }
-
-    private fun setSpeakerphoneOn(on: Boolean) {
+    private fun setSpeakerphone(on: Boolean) {
         if (audioManager.isSpeakerphoneOn != on) {
             audioManager.isSpeakerphoneOn = on
         }
     }
 
-    // 5. Focus Management (Hardened)
+    // 5. Audio Focus (Stops Music Apps)
     fun requestFocus(): Boolean {
         if (isFocusHeld) return true
 
@@ -117,8 +117,8 @@ class AudioRouter(private val context: Context) {
                 )
                 .setOnAudioFocusChangeListener { focusChange ->
                     if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
-                        isFocusHeld = false
-                        // Note: Service should monitor this flag to stop PTT if focus is lost hard
+                        // If we lose focus permanently, stop logic
+                        abandonFocus()
                     }
                 }
                 .build()
@@ -139,8 +139,7 @@ class AudioRouter(private val context: Context) {
     }
 
     fun abandonFocus() {
-        // [FIX] Don't abandon focus if we are in an active VoIP call!
-        // The call engine needs the focus to keep the mic alive.
+        // [FIX] Don't abandon focus if we are actively transmitting/calling!
         if (isVoipCallActive) return
 
         if (!isFocusHeld) return
@@ -154,7 +153,7 @@ class AudioRouter(private val context: Context) {
         }
 
         isFocusHeld = false
-        // Reset mode to Normal when idle to be a good citizen
+        // Reset to normal state
         audioManager.mode = AudioManager.MODE_NORMAL
         audioManager.isSpeakerphoneOn = false
     }
@@ -163,7 +162,7 @@ class AudioRouter(private val context: Context) {
     fun shutdown() {
         try { context.unregisterReceiver(headsetReceiver) } catch (e: Exception) { }
         isVoipCallActive = false
-        isFocusHeld = true // Pretend held so abandon works
+        isFocusHeld = true // Force abandon to execute
         abandonFocus()
     }
 }
