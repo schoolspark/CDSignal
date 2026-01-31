@@ -1202,8 +1202,11 @@ class VoiceService : Service() {
         startService(intent)
     }
 
-    fun updateTalkTargets(newIps: List<String>) {
+    // [FIX] Update both IPs AND the Port mid-transmission
+    fun updateTalkTargets(newIps: List<String>, newPort: Int) {
         activeTargets = newIps
+        lastPort = newPort // <--- This is the critical missing line
+        Log.d(tag, "Updated Targets: $newIps on Port $newPort")
     }
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)

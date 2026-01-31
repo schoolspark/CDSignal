@@ -340,7 +340,8 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         }
     }
 
-    fun startTransmission(onIpsFound: (List<String>, Int) -> Unit, onUpdateIps: (List<String>) -> Unit) {
+    // [FIX] Updated signature: onUpdateIps now accepts 'Int' for the Port
+    fun startTransmission(onIpsFound: (List<String>, Int) -> Unit, onUpdateIps: (List<String>, Int) -> Unit) {
         if (_uiState.value is UiState.Transmitting || _uiState.value is UiState.Receiving) return
         _uiState.value = UiState.Transmitting("Connecting...", false)
 
@@ -355,6 +356,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
         if (targetUser.isEmpty()) { _uiState.value = UiState.Error("No Target Selected"); return }
 
+        // 1. Local Network Check
         val localUser = nearbyUsers.find { it.name.equals(targetUser, ignoreCase = true) }
         if (localUser != null) {
             _uiState.value = UiState.Transmitting("On Air (Local)", false)
@@ -366,7 +368,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         val token = repository.getToken() ?: ""
         if (token.isBlank() || token == "OFFLINE_TOKEN") { _uiState.value = UiState.Error("Offline"); return }
 
-        // [OPTIMIZATION] Speculative Execution
+        // 2. Speculative Start (Starts fast on default port 50005)
         var speculated = false
         if (contact != null && contact.ip.isNotEmpty() && contact.ip != "SERVER_LINK") {
             _uiState.value = UiState.Transmitting("On Air", false)
@@ -374,7 +376,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
             speculated = true
         }
 
-        // [FIX] Parallel Server Refresh on IO Thread
+        // 3. Server Refresh (Fixes NAT Port issues)
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 if (targetUser.startsWith("group:", true)) {
@@ -385,7 +387,9 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                     withContext(Dispatchers.Main) {
                         if (!finalIps.isNullOrEmpty()) {
                             _uiState.value = UiState.Transmitting("On Air", false)
-                            onIpsFound(finalIps.toList(), 50005)
+                            // Groups typically use the default port, but this supports updates if needed
+                            if (speculated) onUpdateIps(finalIps.toList(), 50005)
+                            else onIpsFound(finalIps.toList(), 50005)
                         } else if (!speculated) {
                             _uiState.value = UiState.Error("Channel Empty")
                         }
@@ -395,6 +399,8 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                     if (_uiState.value !is UiState.Transmitting) return@launch
 
                     val ipList = listOfNotNull(response.ip, response.local_ip).distinct()
+
+                    // [CRITICAL FIX] Capture the actual Port from Server (e.g. 59443)
                     val targetPort = response.port ?: 50005
 
                     withContext(Dispatchers.Main) {
@@ -403,15 +409,16 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                                 _uiState.value = UiState.Transmitting("On Air", false)
                                 onIpsFound(ipList, targetPort)
                             } else {
-                                onUpdateIps(ipList)
+                                // [CRITICAL FIX] Update the running stream with the CORRECT Port
+                                onUpdateIps(ipList, targetPort)
                             }
                         } else if (!speculated) {
                             _uiState.value = UiState.Error("User Offline")
                         }
                     }
 
+                    // Save new IP/Port info for next time
                     if (response.ip != contact.ip) {
-                        // [FIX] Update contact with correct arguments, preserving priority status
                         repository.saveContact(
                             name = contact.name,
                             ip = response.ip!!,

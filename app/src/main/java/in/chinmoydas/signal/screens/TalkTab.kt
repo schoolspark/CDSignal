@@ -259,20 +259,32 @@ fun TalkTab(
                                 // [HANDSFREE LOGIC REMAINS FIXED]
                                 if (service != null) {
                                     if (viewModel.isHandsFree) {
+                                        // HANDS-FREE TOGGLE LOGIC
                                         if (serviceState.isTransmitting) {
                                             viewModel.stopTransmission { service.stopTalk() }
                                         } else {
                                             permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
                                             viewModel.startTransmission(
-                                                onIpsFound = { ips, port -> service.startTalk(ips, port) },
-                                                onUpdateIps = { newIps -> service.updateTalkTargets(newIps) }
+                                                onIpsFound = { ips, port ->
+                                                    service.startTalk(ips, port)
+                                                },
+                                                // [FIX] Now accepts and passes 'port'
+                                                onUpdateIps = { newIps, port ->
+                                                    service.updateTalkTargets(newIps, port)
+                                                }
                                             )
                                         }
                                     } else {
+                                        // PUSH-TO-TALK LOGIC (Touch Down)
                                         permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
                                         viewModel.startTransmission(
-                                            onIpsFound = { ips, port -> service.startTalk(ips, port) },
-                                            onUpdateIps = { newIps -> service.updateTalkTargets(newIps) }
+                                            onIpsFound = { ips, port ->
+                                                service.startTalk(ips, port)
+                                            },
+                                            // [FIX] Now accepts and passes 'port'
+                                            onUpdateIps = { newIps, port ->
+                                                service.updateTalkTargets(newIps, port)
+                                            }
                                         )
                                     }
                                 }
