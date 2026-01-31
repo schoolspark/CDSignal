@@ -10,7 +10,9 @@ import kotlinx.coroutines.flow.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.nio.ByteBuffer
 import java.util.Arrays
+import javax.crypto.spec.SecretKeySpec
 
 object CallEngine {
 
@@ -33,7 +35,12 @@ object CallEngine {
     @Volatile var isCallActive = false
         private set
 
-    private var targetIp: String = ""
+    // [FIX] Volatile Target Address for Roaming Support
+    @Volatile private var targetAddress: InetAddress? = null
+
+    // [FIX] Encryption Key
+    private var activeSecretKey: SecretKeySpec? = null
+
     private var recordJob: Job? = null
     private var playJob: Job? = null
 
@@ -42,11 +49,14 @@ object CallEngine {
     val muteStatus: StateFlow<Boolean> = _muteStatus.asStateFlow()
 
     @SuppressLint("MissingPermission")
-    fun startCall(ip: String) {
+    fun startCall(ip: String, secretKey: SecretKeySpec? = null) {
         if (isCallActive) return
-        Log.d(TAG, "Starting Call Engine to $ip")
+        Log.d(TAG, "Starting Secure Call Engine to $ip")
 
-        targetIp = ip
+        // [FIX] Update Address immediately
+        updateTargetIp(ip)
+        activeSecretKey = secretKey
+
         isCallActive = true
         _muteStatus.value = false
 
@@ -120,35 +130,63 @@ object CallEngine {
         }
     }
 
+    // [FIX] Dynamic Roaming Support
+    fun updateTargetIp(newIp: String) {
+        try {
+            targetAddress = InetAddress.getByName(newIp)
+            Log.d(TAG, "Call Target Updated: $newIp")
+        } catch (e: Exception) {
+            Log.e(TAG, "Invalid IP Update: $newIp")
+        }
+    }
+
     private fun startSendingLoop(bufSize: Int) {
         recordJob = CoroutineScope(Dispatchers.IO).launch {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
 
-            // Resolve once to save CPU
-            val address = try { InetAddress.getByName(targetIp) } catch (e: Exception) { null }
-            if (address == null) { stopCall(); return@launch }
-
             val buffer = ByteArray(bufSize)
+            var seqNumber = 0
 
             while (isActive && isCallActive) {
+                val address = targetAddress // Local copy for thread safety
+                if (address == null) {
+                    delay(100)
+                    continue
+                }
+
                 if (_muteStatus.value) {
-                    // Send silence keep-alive (smaller packet)
-                    Arrays.fill(buffer, 0)
-                    try {
-                        callSocket?.send(DatagramPacket(buffer, 10, address, CALL_PORT))
-                        Thread.sleep(100) // Lower frequency
-                    } catch (e: Exception) {}
+                    // Send small keep-alive packet (Encrypted if key exists)
+                    val dummy = ByteArray(10)
+                    sendPacket(dummy, seqNumber++, address)
+                    Thread.sleep(100)
                 } else {
                     val read = audioRecord?.read(buffer, 0, bufSize) ?: 0
                     if (read > 0) {
-                        try {
-                            callSocket?.send(DatagramPacket(buffer, read, address, CALL_PORT))
-                        } catch (e: Exception) {
-                            if (isCallActive) Log.w(TAG, "Send error: ${e.message}")
-                        }
+                        val payload = buffer.copyOfRange(0, read)
+                        sendPacket(payload, seqNumber++, address)
                     }
                 }
             }
+        }
+    }
+
+    private fun sendPacket(data: ByteArray, seq: Int, address: InetAddress) {
+        try {
+            val key = activeSecretKey
+            val packetData = if (key != null) {
+                CryptoEngine.encrypt(data, seq, key) ?: data
+            } else {
+                data
+            }
+
+            val finalBuf = ByteBuffer.allocate(4 + packetData.size)
+                .putInt(seq)
+                .put(packetData)
+                .array()
+
+            callSocket?.send(DatagramPacket(finalBuf, finalBuf.size, address, CALL_PORT))
+        } catch (e: Exception) {
+            if (isCallActive) Log.w(TAG, "Send error: ${e.message}")
         }
     }
 
@@ -156,16 +194,32 @@ object CallEngine {
         playJob = CoroutineScope(Dispatchers.IO).launch {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
 
-            val buffer = ByteArray(bufSize)
-            val packet = DatagramPacket(buffer, buffer.size)
+            val receiveBuffer = ByteArray(bufSize + 100)
+            val packet = DatagramPacket(receiveBuffer, receiveBuffer.size)
 
             while (isActive && isCallActive) {
                 try {
                     callSocket?.receive(packet)
-                    audioTrack?.write(packet.data, 0, packet.length)
-                } catch (e: Exception) {
-                    // Socket timeout or error - expected loop behavior
-                }
+                    if (packet.length < 4) continue
+
+                    val wrapped = ByteBuffer.wrap(packet.data, 0, packet.length)
+                    val seq = wrapped.int
+
+                    val payloadLen = packet.length - 4
+                    val payload = ByteArray(payloadLen)
+                    wrapped.get(payload)
+
+                    val key = activeSecretKey
+                    val audioData = if (key != null) {
+                        CryptoEngine.decrypt(payload, seq, key)
+                    } else {
+                        payload
+                    }
+
+                    if (audioData != null) {
+                        audioTrack?.write(audioData, 0, audioData.size)
+                    }
+                } catch (e: Exception) { }
             }
         }
     }
@@ -178,26 +232,23 @@ object CallEngine {
         if (!isCallActive) return
         Log.d(TAG, "Stopping Call Engine")
 
-        // 1. Set flag first to stop loops
         isCallActive = false
         _muteStatus.value = false
+        targetAddress = null
+        activeSecretKey = null
 
-        // 2. Kill Coroutines
         recordJob?.cancel()
         playJob?.cancel()
 
-        // 3. Safe Socket Close
         try { callSocket?.close() } catch (e: Exception) {}
         callSocket = null
 
-        // 4. Safe Audio Release
         try { audioRecord?.stop(); audioRecord?.release() } catch (e: Exception) {}
         audioRecord = null
 
         try { audioTrack?.stop(); audioTrack?.release() } catch (e: Exception) {}
         audioTrack = null
 
-        // 5. Effects Cleanup
         try {
             aec?.release(); aec = null
             ns?.release(); ns = null

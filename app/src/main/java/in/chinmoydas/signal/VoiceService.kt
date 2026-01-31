@@ -121,6 +121,10 @@ class VoiceService : Service() {
     // [FIX] Job to manage "End Stream" signaling
     private var cleanupJob: Job? = null
 
+    // [FIX] Watchdog Variables
+    private var callWatchdogJob: Job? = null
+    @Volatile private var lastCallPacketTime: Long = 0L
+
     @Volatile var lastIncomingIp: String? = null
     @Volatile private var myUsername: String = "User"
     @Volatile private var myLocalIp: String = ""
@@ -324,24 +328,45 @@ class VoiceService : Service() {
         observeRepositoryFlows()
 
         // [FIX] Direct Link: Service observes Call Events independent of UI
-        // This ensures Echo Cancellation and Mode switching works even if app is backgrounded
+        // This ensures the screen wakes up and audio mode switches correctly
         scope.launch {
             CallSignaling.callEvents.collect { event ->
                 when (event) {
+                    is CallSignaling.CallEvent.IncomingCall -> {
+                        // [CRITICAL FIX] Wake Screen for Voice Call
+                        // We must trigger a Full Screen Notification from the Service
+                        // because the Activity cannot start itself from the background.
+                        val name = activeIpCache.entries.find { it.value == event.ip }?.key
+                            ?: repository.findContactByIp(event.ip)?.name
+                            ?: "Unknown Caller"
+
+                        // This function uses .setFullScreenIntent() which wakes the lockscreen
+                        showIncomingCallNotification(name, "Incoming Voice Call", isAlarm = false)
+                    }
+
                     is CallSignaling.CallEvent.CallConnected -> {
+                        // Remove the "Incoming Call" notification (ID 2)
+                        getSystemService(NotificationManager::class.java).cancel(2)
+
                         // Stop PTT if active to allow Full Duplex Call
                         if (isSending) stopTalk()
                         // Force VOX off during call
                         if (_voiceServiceState.value.isVoxEnabled) toggleVox(false)
                         // Enable AEC and Voice Mode
                         setCallMode(true)
+                        startCallWatchdog()
                     }
+
                     is CallSignaling.CallEvent.CallEnded,
                     is CallSignaling.CallEvent.CallRejected -> {
+                        // Remove the notification if call is rejected/ended before answering
+                        getSystemService(NotificationManager::class.java).cancel(2)
+
                         // Return to PTT/Normal Mode
                         setCallMode(false)
+                        callWatchdogJob?.cancel()
                     }
-                    else -> {} // Ignore Ringing/Dialing (handled by UI)
+                    else -> {} // Ignore Outgoing/Dialing (handled by UI)
                 }
             }
         }
@@ -946,6 +971,12 @@ class VoiceService : Service() {
                         if (textData.startsWith("TXT:")) {
                             val cleanMessage = textData.substring(4)
 
+                            if (cleanMessage == "CMD:CALL:PING") {
+                                lastCallPacketTime = System.currentTimeMillis()
+                                return // Consume ping, don't show notification
+                            }
+
+
                             // [FIX] 1. Handle Acknowledgment (Stop Retrying)
                             // If we receive an ACK, find the retry job and cancel it.
                             if (cleanMessage.startsWith("ACK:")) {
@@ -1050,11 +1081,13 @@ class VoiceService : Service() {
                     try { payload = G711.decode(payload, 640) } catch (e: Exception) { }
                 }
 
+                // [FIX] If in a Full Duplex Call, reset watchdog and consume audio here
                 if (CallEngine.isCallActive) {
+                    lastCallPacketTime = System.currentTimeMillis()
                     return
                 }
 
-                // Block AUDIO playback if transmitting
+                // Block AUDIO playback if transmitting (Half-Duplex PTT logic)
                 if (isSending) return
 
                 if (!isSilenced || isPrincipal) {
@@ -1063,8 +1096,8 @@ class VoiceService : Service() {
                 if (isRecordingEnabled) {
                     synchronized(bufferLock) { try { incomingBuffer.write(payload) } catch (t: Throwable) {} }
                 }
-            }
-        }
+            } // End of payloadLen > 0 block
+        } // End of handleIncomingPacket
     }
 
     private fun saveIncomingMessage(sender: String, data: ByteArray) {
@@ -1167,6 +1200,49 @@ class VoiceService : Service() {
             }
             if (sentCount == 0) {
                 sendTextMessage("255.255.255.255", "LOC:$lat,$lon")
+            }
+        }
+    }
+
+    // [FIX] Safety Timer: Hangs up if connection is lost
+    fun startCallWatchdog() {
+        callWatchdogJob?.cancel()
+        lastCallPacketTime = System.currentTimeMillis()
+
+        callWatchdogJob = scope.launch {
+            Log.d(tag, "Call Watchdog Started")
+            while (isActive) {
+                val now = System.currentTimeMillis()
+
+                // 1. TIMEOUT CHECK (15 seconds of silence = Kill Call)
+                if (now - lastCallPacketTime > 15000) {
+                    Log.e(tag, "Watchdog: Peer dead. Force Hangup.")
+                    `in`.chinmoydas.signal.utils.CallSignaling.endCall()
+                    break
+                }
+
+                // 2. KEEP-ALIVE (Send Ping every 2 seconds)
+                // We use sendTextMessage to ensure it's encrypted correctly if needed
+                activeTargets.forEach { ip ->
+                    sendTextMessage(ip, "CMD:CALL:PING")
+                }
+                delay(2000)
+            }
+        }
+    }
+
+    // [FIX] Audio Focus Listener for GSM Call handling
+    private val audioFocusChangeListener = android.media.AudioManager.OnAudioFocusChangeListener { focusChange ->
+        when (focusChange) {
+            android.media.AudioManager.AUDIOFOCUS_LOSS -> {
+                Log.w(tag, "Audio Focus LOST (Call/Music). Stopping Radio.")
+                if (isSending) stopTalk()
+                if (CallEngine.isCallActive) CallSignaling.endCall() // Kill VoIP call
+            }
+            android.media.AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                Log.w(tag, "Audio Focus Transient Loss (Notification/Alarm).")
+                // Optional: Mute instead of kill, but for safety we usually kill
+                if (isSending) stopTalk()
             }
         }
     }
@@ -1491,6 +1567,7 @@ class VoiceService : Service() {
                     Intent.FLAG_ACTIVITY_SINGLE_TOP or
                     Intent.FLAG_ACTIVITY_NO_USER_ACTION
             putExtra("auto_connect_channel", callerName)
+            putExtra("is_call", true) // <--- [CRITICAL ADDITION] This triggers the Call Overlay!
         }
 
         val fullScreenPendingIntent = PendingIntent.getActivity(

@@ -307,6 +307,9 @@ class MainActivity : ComponentActivity() {
         val isCloudWake = intent?.getBooleanExtra("is_cloud_wake", false) == true
         val wokenBy = intent?.getStringExtra("woken_by")
 
+        // [FIX] Detect if this launch is for an Incoming Voice Call
+        val isCall = intent?.getBooleanExtra("is_call", false) == true
+
         if (::walkieViewModel.isInitialized) {
             if (isCloudWake && wokenBy != null) {
                 walkieViewModel.setTarget(wokenBy)
@@ -314,9 +317,18 @@ class MainActivity : ComponentActivity() {
             } else if (autoChannel != null) {
                 walkieViewModel.setTarget(autoChannel)
             }
+
+            // [FIX] If this is a Call, force the screen to stay on so it doesn't sleep while ringing
+            if (isCall) {
+                window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+
             intent?.removeExtra("auto_connect_channel")
             intent?.removeExtra("is_cloud_wake")
             intent?.removeExtra("woken_by")
+            // Don't remove "is_call" immediately if other components need it,
+            // but usually safe to remove here if only used for flags.
+            intent?.removeExtra("is_call")
         }
     }
 

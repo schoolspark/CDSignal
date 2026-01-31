@@ -632,4 +632,33 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
             }
         }
     }
+    // [FIX] Safe Call Starter (Prevents UI crash/vanish)
+    fun startCall(context: Context) {
+        if (targetUser.isEmpty()) return
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // 1. Validate IP before touching UI
+                val ip = getCurrentTargetIp()
+
+                if (ip.isNullOrEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, "Call Failed: User Offline or IP Missing", Toast.LENGTH_SHORT).show()
+                    }
+                    return@launch
+                }
+
+                // 2. Trigger Signaling Safely on Main Thread
+                withContext(Dispatchers.Main) {
+                    `in`.chinmoydas.signal.utils.CallSignaling.startOutgoingCall(ip)
+                }
+
+            } catch (e: Exception) {
+                Log.e("WalkieVM", "Call Start Failed", e)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
 }
