@@ -248,56 +248,62 @@ fun TalkTab(
                 }
             }
 
-            // --- 3. PTT BUTTON ---
+            // --- 3. PTT BUTTON (FIXED) ---
             item {
+                // Debounce state to prevent rapid-fire crashes
+                var lastTouchTime by remember { mutableLongStateOf(0L) }
+
                 Box(
                     contentAlignment = Alignment.Center,
-                    modifier = Modifier.size(240.dp).scale(if (isPressed) 0.95f else 1f).pointerInteropFilter {
-                        when (it.action) {
-                            MotionEvent.ACTION_DOWN -> {
-                                isPressed = true
-                                // [HANDSFREE LOGIC REMAINS FIXED]
-                                if (service != null) {
-                                    if (viewModel.isHandsFree) {
-                                        // HANDS-FREE TOGGLE LOGIC
-                                        if (serviceState.isTransmitting) {
-                                            viewModel.stopTransmission { service.stopTalk() }
+                    modifier = Modifier
+                        .size(240.dp)
+                        .scale(if (isPressed) 0.95f else 1f)
+                        .pointerInteropFilter { motionEvent ->
+                            when (motionEvent.action) {
+                                MotionEvent.ACTION_DOWN -> {
+                                    val now = System.currentTimeMillis()
+                                    // [FIX 1] Debounce: Ignore touches faster than 500ms
+                                    if (now - lastTouchTime < 500) return@pointerInteropFilter true
+                                    lastTouchTime = now
+
+                                    // [FIX 2] Permission Trap: Check permission BEFORE starting logic
+                                    // If we don't have it, launch dialog and STOP. Do not start transmitting.
+                                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                                        permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+                                        return@pointerInteropFilter true
+                                    }
+
+                                    isPressed = true
+                                    if (service != null) {
+                                        if (viewModel.isHandsFree) {
+                                            // HANDS-FREE TOGGLE LOGIC
+                                            if (serviceState.isTransmitting) {
+                                                viewModel.stopTransmission { service.stopTalk() }
+                                            } else {
+                                                viewModel.startTransmission(
+                                                    onIpsFound = { ips, port -> service.startTalk(ips, port) },
+                                                    onUpdateIps = { newIps, port -> service.updateTalkTargets(newIps, port) }
+                                                )
+                                            }
                                         } else {
-                                            permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+                                            // PUSH-TO-TALK LOGIC
                                             viewModel.startTransmission(
-                                                onIpsFound = { ips, port ->
-                                                    service.startTalk(ips, port)
-                                                },
-                                                // [FIX] Now accepts and passes 'port'
-                                                onUpdateIps = { newIps, port ->
-                                                    service.updateTalkTargets(newIps, port)
-                                                }
+                                                onIpsFound = { ips, port -> service.startTalk(ips, port) },
+                                                onUpdateIps = { newIps, port -> service.updateTalkTargets(newIps, port) }
                                             )
                                         }
-                                    } else {
-                                        // PUSH-TO-TALK LOGIC (Touch Down)
-                                        permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
-                                        viewModel.startTransmission(
-                                            onIpsFound = { ips, port ->
-                                                service.startTalk(ips, port)
-                                            },
-                                            // [FIX] Now accepts and passes 'port'
-                                            onUpdateIps = { newIps, port ->
-                                                service.updateTalkTargets(newIps, port)
-                                            }
-                                        )
+                                    }
+                                }
+                                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                    isPressed = false
+                                    // Only stop if we are NOT in HandsFree mode
+                                    if (!viewModel.isHandsFree && service != null) {
+                                        viewModel.stopTransmission { service.stopTalk() }
                                     }
                                 }
                             }
-                            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                                isPressed = false
-                                if (!viewModel.isHandsFree && service != null) {
-                                    viewModel.stopTransmission { service.stopTalk() }
-                                }
-                            }
+                            true
                         }
-                        true
-                    }
                 ) {
                     if (serviceState.isTransmitting) {
                         val infiniteTransition = rememberInfiniteTransition()

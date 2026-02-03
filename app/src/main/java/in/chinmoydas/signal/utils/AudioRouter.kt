@@ -1,5 +1,8 @@
 package `in`.chinmoydas.signal.utils
 
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothHeadset
+import android.bluetooth.BluetoothProfile
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -8,62 +11,81 @@ import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.Build
-import android.util.Log
 
 class AudioRouter(private val context: Context) {
 
-    private val tag = "AudioRouter"
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
     // State
     private var isSpeakerPreferred: Boolean = true
     private var isHeadsetPlugged: Boolean = false
+    private var isBluetoothConnected: Boolean = false // NEW
     private var isFocusHeld: Boolean = false
     private var isVoipCallActive: Boolean = false
 
-    // Audio Focus (Android O+)
     private var activeFocusRequest: AudioFocusRequest? = null
-
     var onRouteChanged: ((Boolean) -> Unit)? = null
 
     fun initialize() {
-        val filter = IntentFilter(AudioManager.ACTION_HEADSET_PLUG)
+        val filter = IntentFilter().apply {
+            addAction(AudioManager.ACTION_HEADSET_PLUG)
+            addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED) // NEW
+        }
         context.registerReceiver(headsetReceiver, filter)
-        isHeadsetPlugged = audioManager.isWiredHeadsetOn || audioManager.isBluetoothA2dpOn
+
+        // Initial Check
+        isHeadsetPlugged = audioManager.isWiredHeadsetOn
+        isBluetoothConnected = audioManager.isBluetoothA2dpOn || audioManager.isBluetoothScoOn
         updateRoute()
     }
 
     private val headsetReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
-            if (intent?.action == AudioManager.ACTION_HEADSET_PLUG) {
+            val action = intent?.action
+            if (action == AudioManager.ACTION_HEADSET_PLUG) {
                 val state = intent.getIntExtra("state", -1)
-                val wasPlugged = isHeadsetPlugged
                 isHeadsetPlugged = (state == 1)
-
-                if (wasPlugged != isHeadsetPlugged) {
-                    updateRoute()
-                }
+                updateRoute()
+            } else if (action == BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED) {
+                val state = intent.getIntExtra(BluetoothProfile.EXTRA_STATE, BluetoothProfile.STATE_DISCONNECTED)
+                isBluetoothConnected = (state == BluetoothProfile.STATE_CONNECTED)
+                updateRoute()
             }
         }
     }
 
     private fun updateRoute() {
-        if (isHeadsetPlugged) {
+        // Bluetooth takes priority, then Wired Headset, then Speaker
+        if (isBluetoothConnected || isHeadsetPlugged) {
             setSpeakerphone(false)
-            onRouteChanged?.invoke(false)
+            onRouteChanged?.invoke(false) // Inform UI: "Headset Mode"
+            if (isBluetoothConnected && isVoipCallActive) {
+                startBluetoothSco()
+            }
         } else {
             setSpeakerphone(isSpeakerPreferred)
             onRouteChanged?.invoke(isSpeakerPreferred)
+            stopBluetoothSco()
         }
 
         if (isVoipCallActive) {
-            if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) {
-                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            }
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
         } else {
-            if (audioManager.mode != AudioManager.MODE_NORMAL) {
-                audioManager.mode = AudioManager.MODE_NORMAL
-            }
+            audioManager.mode = AudioManager.MODE_NORMAL
+        }
+    }
+
+    private fun startBluetoothSco() {
+        if (!audioManager.isBluetoothScoOn) {
+            audioManager.startBluetoothSco()
+            audioManager.isBluetoothScoOn = true
+        }
+    }
+
+    private fun stopBluetoothSco() {
+        if (audioManager.isBluetoothScoOn) {
+            audioManager.stopBluetoothSco()
+            audioManager.isBluetoothScoOn = false
         }
     }
 
@@ -85,7 +107,6 @@ class AudioRouter(private val context: Context) {
 
     fun requestFocus(): Boolean {
         if (isFocusHeld) {
-            // [FIX 1] Even if held, ensure routing is correct (Double Tap safety)
             updateRoute()
             return true
         }
@@ -99,9 +120,7 @@ class AudioRouter(private val context: Context) {
                         .build()
                 )
                 .setOnAudioFocusChangeListener { focusChange ->
-                    if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
-                        abandonFocus()
-                    }
+                    if (focusChange == AudioManager.AUDIOFOCUS_LOSS) abandonFocus()
                 }
                 .build()
 
@@ -109,26 +128,16 @@ class AudioRouter(private val context: Context) {
             audioManager.requestAudioFocus(request)
         } else {
             @Suppress("DEPRECATION")
-            audioManager.requestAudioFocus(
-                null,
-                AudioManager.STREAM_VOICE_CALL,
-                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE
-            )
+            audioManager.requestAudioFocus(null, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
         }
 
         isFocusHeld = (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
-
-        // [FIX 2] CRITICAL: Re-apply routing (Speaker ON) immediately after gaining focus
-        if (isFocusHeld) {
-            updateRoute()
-        }
-
+        if (isFocusHeld) updateRoute()
         return isFocusHeld
     }
 
     fun abandonFocus() {
         if (isVoipCallActive) return
-
         if (!isFocusHeld) return
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -140,9 +149,7 @@ class AudioRouter(private val context: Context) {
         }
 
         isFocusHeld = false
-
-        // [FIX 3] Removed "audioManager.isSpeakerphoneOn = false"
-        // Just reset the mode. Leave speaker state for updateRoute to handle next time.
+        stopBluetoothSco()
         audioManager.mode = AudioManager.MODE_NORMAL
     }
 
