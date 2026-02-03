@@ -114,7 +114,7 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                         )
                         Spacer(Modifier.width(8.dp))
                         Text(
-                            text = if (safeWalkRemaining != null) "GUARDIAN ACTIVE" else "Safe Walk (Dead Man's Switch)",
+                            text = if (safeWalkRemaining != null) "GUARDIAN ACTIVE" else "Safe Walk",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = if (safeWalkRemaining != null) Color(0xFFE65100) else MaterialTheme.colorScheme.onSurface

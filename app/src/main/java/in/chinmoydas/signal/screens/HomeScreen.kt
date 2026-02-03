@@ -12,7 +12,6 @@ import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.navigation.NavController
@@ -35,8 +34,6 @@ fun HomeScreen(
     // State for Overlays
     var showDiagnostics by remember { mutableStateOf(false) }
     var showAssistant by remember { mutableStateOf(false) }
-
-    // [FIX] Removed 'hasRunDiagnostics' state variable here.
 
     // Live count of nearby devices for the Badge
     val nearbyCount = viewModel.nearbyUsers.size
@@ -68,7 +65,7 @@ fun HomeScreen(
                 }
             )
         },
-        // Pinned AI Button to Bottom-Left to avoid overlapping Call/SOS buttons
+        // Pinned AI Button to Bottom-Left
         floatingActionButtonPosition = FabPosition.Start,
         floatingActionButton = {
             if (selectedTab == 0) {
@@ -126,9 +123,7 @@ fun HomeScreen(
 
         val contentModifier = Modifier.padding(innerPadding)
 
-        // [FIX] Removed the Automatic Readiness Check block here.
-
-        // Manual Readiness Check (Triggered by Button in TalkTab)
+        // Manual Readiness Check (Triggered by Button in TalkTab OR by CD-1 Assistant)
         if (showDiagnostics) {
             SystemReadinessDialog(
                 viewModel = viewModel,
@@ -143,10 +138,15 @@ fun HomeScreen(
                 onDismissRequest = { showAssistant = false },
                 sheetState = rememberModalBottomSheetState()
             ) {
+                // [FIXED] Now correctly handling the 4th parameter
                 AssistantSheet(
                     viewModel = viewModel,
                     service = service,
-                    onDismiss = { showAssistant = false }
+                    onDismiss = { showAssistant = false },
+                    onOpenDiagnostics = {
+                        showAssistant = false // Close the sheet
+                        showDiagnostics = true // Open the System Check
+                    }
                 )
             }
         }

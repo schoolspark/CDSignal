@@ -15,76 +15,68 @@ class ConnectionManager(
     private var heartbeatJob: Job? = null
 
     // [MISSION CRITICAL] Redundant STUN Servers
-    // If Google is blocked (e.g. some firewalls), fall back to Mozilla
     private val STUN_SERVERS = listOf(
         Pair("stun.l.google.com", 19302),
         Pair("stun.services.mozilla.com", 3478)
     )
 
-    // Volatile ensures all threads see the latest port immediately
     @Volatile private var identifiedPublicPort: Int = 50005
+    @Volatile private var pendingHeartbeatTrigger = false
+    @Volatile var isEcoMode: Boolean = false // [NEW] Eco Mode Toggle
 
-    // State persistence for restarts
     private var activeChannel: String? = null
     private var activeKey: String? = null
 
-    // [REQUIRED] Called by VoiceService via Intent "CMD_HEARTBEAT"
-    fun triggerImmediateHeartbeat() {
-        Log.d(tag, "Forcing immediate heartbeat...")
-        // Restarting the loop triggers an immediate ping at the start of the block
-        startHeartbeatLoop(activeChannel, activeKey)
+    fun updateEcoMode(enabled: Boolean) {
+        isEcoMode = enabled
+        if (enabled) {
+            heartbeatJob?.cancel()
+            Log.d(tag, "Eco Mode ON: Heartbeat Stopped")
+        } else {
+            triggerImmediateHeartbeat()
+        }
     }
 
-    fun startHeartbeatLoop(currentChannel: String?, channelKey: String?) {
-        // Update state
+    fun triggerImmediateHeartbeat() {
+        startHeartbeatLoop(activeChannel, activeKey, immediate = true)
+    }
+
+    fun startHeartbeatLoop(currentChannel: String?, channelKey: String?, immediate: Boolean = true) {
         activeChannel = currentChannel
         activeKey = channelKey
-
         heartbeatJob?.cancel()
+
+        // If Eco Mode is ON, we do not run the loop. We only ping if 'immediate' is requested.
+        if (isEcoMode && !immediate) return
+
         heartbeatJob = scope.launch {
-            var stunIndex = 0
+            if (immediate) performHeartbeatSequence()
+
+            // In Eco Mode, we stop here. No background looping.
+            if (isEcoMode) return@launch
 
             while (isActive) {
-                // 1. Send STUN Request (Round Robin)
-                val server = STUN_SERVERS[stunIndex % STUN_SERVERS.size]
-                val stunReq = StunClient.createBindRequest(server.first, server.second)
-
-                if (stunReq != null) {
-                    networkEngine.sendRawPacket(stunReq)
-                }
-
-                // Wait 1.5s for STUN response to update 'identifiedPublicPort'
-                delay(1500)
-
-                // 2. Send Heartbeat to PHP with the CORRECT Port
-                try {
-                    val token = repository.getToken()
-                    if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
-                        val localIp = getLocalIpAddress()
-
-                        repository.sendHeartbeat(
-                            token = token,
-                            port = identifiedPublicPort,
-                            localIp = localIp,
-                            channel = activeChannel,
-                            key = activeKey
-                        )
-                        Log.d(tag, "Heartbeat sent. Port: $identifiedPublicPort via ${server.first}")
-                    }
-                } catch (e: Exception) {
-                    Log.e(tag, "Heartbeat failed: ${e.message}")
-                    // If failed, switch STUN server for next time
-                    stunIndex++
-                }
-
-                // 3. Robust Interval: 50 Seconds
-                // Keep-Alive usually expires at 60s, so 50s is safe and battery efficient.
-                delay(50_000)
+                delay(45_000) // 45s Interval
+                performHeartbeatSequence()
             }
         }
     }
 
-    // Called by NetworkEngine when a STUN packet arrives
+    private suspend fun performHeartbeatSequence() {
+        pendingHeartbeatTrigger = true
+        STUN_SERVERS.forEach { server ->
+            val stunReq = StunClient.createBindRequest(server.first, server.second)
+            if (stunReq != null) networkEngine.sendRawPacket(stunReq)
+            delay(50)
+        }
+        delay(500)
+        if (pendingHeartbeatTrigger) {
+            // If STUN failed, send with last known port
+            sendHeartbeatToServer()
+            pendingHeartbeatTrigger = false
+        }
+    }
+
     fun handleStunResponse(data: ByteArray) {
         val result = StunClient.parseResponse(data)
         if (result != null) {
@@ -92,7 +84,21 @@ class ConnectionManager(
                 Log.i(tag, "NAT MAPPING CHANGED: Old=$identifiedPublicPort -> New=${result.publicPort}")
                 identifiedPublicPort = result.publicPort
             }
+            if (pendingHeartbeatTrigger) {
+                pendingHeartbeatTrigger = false
+                scope.launch { sendHeartbeatToServer() }
+            }
         }
+    }
+
+    private suspend fun sendHeartbeatToServer() {
+        try {
+            val token = repository.getToken()
+            if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
+                val localIp = getLocalIpAddress()
+                repository.sendHeartbeat(token, identifiedPublicPort, localIp, activeChannel, activeKey)
+            }
+        } catch (e: Exception) { }
     }
 
     fun stop() {

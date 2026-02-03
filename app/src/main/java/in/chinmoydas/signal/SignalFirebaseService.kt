@@ -55,30 +55,40 @@ class SignalFirebaseService : FirebaseMessagingService() {
         val data = remoteMessage.data
         if (data["action"] == "WAKE_RADIO") {
             val sender = data["sender"] ?: "Unknown"
-            Log.d(tag, "Wake Signal Received from: $sender")
 
-            // 1. Acquire WakeLock (Crucial for CPU to stay awake during processing)
+            // [BREACH PROTOCOL] Extract Sender Network Info
+            val senderIp = data["sender_ip"]
+            val senderPort = data["sender_port"]?.toIntOrNull() ?: 50005
+
+            Log.d(tag, "Wake Signal from $sender ($senderIp:$senderPort)")
+
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            val wakeLock = powerManager.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "Signal:CloudWakeLock"
-            )
-            // Acquire with timeout to prevent battery drain if logic fails
+            val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Signal:CloudWakeLock")
             wakeLock.acquire(10 * 1000L)
 
-            // 2. "Smart" Start Strategy
-            if (isAppInForeground()) {
-                // Scenario A: User is looking at the app. Start Audio immediately.
-                startVoiceServiceDirectly(sender)
-            } else {
-                // Scenario B: App is background/killed.
-                // DO NOT start service directly (causes crash on Android 12+).
-                // Use Full Screen Intent (FSI) to wake the user legally.
-                postFallbackNotification(sender)
-            }
+            // Trigger "Punch Back"
+            startVoiceServiceForPunchBack(sender, senderIp, senderPort)
+        }
+    }
 
-            // WakeLock will release automatically after timeout or we can release manually if needed,
-            // but timeout is safer for fire-and-forget.
+    private fun startVoiceServiceForPunchBack(sender: String, ip: String?, port: Int) {
+        val intent = Intent(this, VoiceService::class.java).apply {
+            action = "ACTION_PUNCH_BACK" // [NEW] Special Intent
+            putExtra("target_ip", ip)
+            putExtra("target_port", port)
+            putExtra("sender_name", sender)
+            putExtra("is_cloud_wake", true)
+        }
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to start service: ${e.message}")
+            postFallbackNotification(sender)
         }
     }
 

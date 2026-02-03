@@ -3,6 +3,7 @@ package `in`.chinmoydas.signal.screens
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
@@ -25,6 +26,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
+import `in`.chinmoydas.signal.VoiceService
 import `in`.chinmoydas.signal.viewmodel.WalkieViewModel
 
 @Composable
@@ -213,6 +215,45 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
             }
         }
         Spacer(Modifier.height(16.dp))
+
+        // [ADD THIS CARD]
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha=0.5f)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.BatterySaver, null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Eco Mode (Trekking)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    }
+                    Text(
+                        "Stops background data. Saves battery. Wakes up only for incoming calls (2s delay).",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                var isEco by remember { mutableStateOf(prefs.getBoolean("eco_mode", false)) }
+                Switch(
+                    checked = isEco,
+                    onCheckedChange = {
+                        isEco = it
+                        prefs.edit().putBoolean("eco_mode", it).apply()
+                        // Helper to send Intent to Service
+                        val intent = Intent(context, VoiceService::class.java).apply {
+                            action = "TOGGLE_ECO"
+                            putExtra("state", it)
+                        }
+                        context.startService(intent)
+                    }
+                )
+            }
+        }
 
         // --- NEW: RECOVERY EMAIL CARD ---
         Card(

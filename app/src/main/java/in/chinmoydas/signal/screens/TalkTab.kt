@@ -138,6 +138,48 @@ fun TalkTab(
             // --- 1. HEADER & STATUS ---
             item {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
+
+                    // [NEW] ACTIVE TARGET CARD & CLEAR BUTTON
+                    if (viewModel.targetUser.isNotEmpty()) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                            shape = RoundedCornerShape(16.dp),
+                            modifier = Modifier.padding(horizontal = 32.dp).fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(12.dp).fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        "TARGET LOCKED",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha=0.6f),
+                                        letterSpacing = 1.sp
+                                    )
+                                    Text(
+                                        text = if (viewModel.targetUser.startsWith("group:")) viewModel.targetUser.substringAfter(":") else viewModel.targetUser,
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                // THE DISCONNECT BUTTON
+                                IconButton(onClick = { viewModel.clearTarget() }) {
+                                    Icon(
+                                        imageVector = Icons.Default.Close,
+                                        contentDescription = "Clear Target",
+                                        tint = MaterialTheme.colorScheme.onPrimaryContainer
+                                    )
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(16.dp))
+                    }
+
                     val (statusText, statusColor) = when (val state = uiState) {
                         is UiState.Ready -> "Ready" to MaterialTheme.colorScheme.primary
                         is UiState.Connected -> { val targetName = if (state.target.startsWith("group:")) state.target.substringAfter(":") else state.target; "Connected to $targetName" to MaterialTheme.colorScheme.primary }
@@ -159,33 +201,6 @@ fun TalkTab(
                         Text(statusText, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = statusColor, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                     Text(if (isSecureMode) "Encrypted Channel" else "Public Channel", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
-
-                    if (viewModel.targetUser.isNotEmpty() && !viewModel.isBroadcastMode) {
-                        val targetContact = viewModel.savedContacts.find { it.name == viewModel.targetUser }
-                        val hasToken = targetContact?.fcmToken?.isNotBlank() == true
-
-                        if (hasToken) {
-                            val isOffline = viewModel.connectionStatus == ConnectionStatus.OFFLINE
-                            Spacer(modifier = Modifier.height(12.dp))
-                            Button(
-                                onClick = {
-                                    if (targetContact != null) {
-                                        viewModel.sendCloudWakeUp(context, targetContact)
-                                    }
-                                },
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (isOffline) Color(0xFFFFA000) else Color.LightGray,
-                                    contentColor = if (isOffline) Color.Black else Color.DarkGray
-                                ),
-                                shape = RoundedCornerShape(8.dp),
-                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
-                            ) {
-                                Icon(Icons.Default.Bolt, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(8.dp))
-                                Text(if (isOffline) "WAKE DEVICE (CLOUD)" else "SEND CLOUD PING", fontWeight = FontWeight.Bold)
-                            }
-                        }
-                    }
                 }
             }
 

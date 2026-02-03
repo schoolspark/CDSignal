@@ -103,9 +103,16 @@ class VoiceService : Service() {
     private lateinit var mediaSession: MediaSessionCompat
     private var isHeadsetLinked = true
 
+    // [BREACH PROTOCOL] Signals & Constants
     private val END_STREAM_SIGNAL = "__END_TX__"
     private val PING_SIGNAL = "__PING__"
     private val PONG_SIGNAL = "__PONG__"
+    private val PUNCH_PACKET = "__PUNCH__"
+    private val WAKE_THRESHOLD_MS = 45_000L
+
+    // [BREACH PROTOCOL] Anti-Spam Tracker
+    private var lastWakeSentTime: Long = 0L
+    private val WAKE_DEBOUNCE_MS = 10_000L // Don't send wake more than once every 10s
 
     private val UDP_PORT = 50005
     @Volatile private var isOnWifi = false
@@ -120,7 +127,6 @@ class VoiceService : Service() {
     private var resetJob: Job? = null
     private var cleanupJob: Job? = null
 
-    // Watchdog Variables
     private var callWatchdogJob: Job? = null
     @Volatile private var lastCallPacketTime: Long = 0L
 
@@ -225,13 +231,16 @@ class VoiceService : Service() {
                 if (newIp.isNotEmpty() && newIp != myLocalIp) {
                     Log.i(tag, "Network Handover: $myLocalIp -> $newIp")
                     myLocalIp = newIp
+
                     try { networkEngine.stop() } catch (e: Exception) {}
-                    delay(50)
+
                     val networkStarted = networkEngine.start { packet ->
                         handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
                     }
+
                     if (networkStarted) {
                         _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
+                        sendTextMessage("255.255.255.255", "CMD:I_MOVED")
                         val currentTarget = repository.getTargetUser()
                         val targetIp = activeIpCache[currentTarget]
                         if (!targetIp.isNullOrBlank()) sendPing(targetIp)
@@ -283,7 +292,9 @@ class VoiceService : Service() {
         connectionManager = ConnectionManager(repository, networkEngine)
 
         val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
+        val ecoEnabled = prefs.getBoolean("eco_mode", false)
         dataSaverEnabled = prefs.getBoolean("data_saver", false)
+        connectionManager.updateEcoMode(ecoEnabled)
 
         initMediaSession()
 
@@ -550,6 +561,60 @@ class VoiceService : Service() {
         MediaButtonReceiver.handleIntent(mediaSession, intent)
         val action = intent?.action
 
+        // [BREACH PROTOCOL] Triggered by SignalFirebaseService
+        if (action == "ACTION_PUNCH_BACK") {
+            val ip = intent.getStringExtra("target_ip")
+            val port = intent.getIntExtra("target_port", 50005)
+            val sender = intent.getStringExtra("sender_name") ?: "Unknown"
+
+            if (!ip.isNullOrBlank()) {
+                scope.launch(Dispatchers.IO) {
+                    if (!networkEngine.isBound()) {
+                        // Cold Start: If service was asleep, we must bind first
+                        networkEngine.start { packet ->
+                            handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
+                        }
+                        delay(200)
+                    }
+                    Log.d(tag, "BREACH: Punching hole to $ip:$port")
+
+                    // [CRITICAL FIX] Construct a VALID packet with headers so receiver updates IP
+                    val punchPayload = PUNCH_PACKET.toByteArray()
+                    val nameBytes = myUsername.toByteArray()
+                    val packetSize = 1 + nameBytes.size + 4 + punchPayload.size
+                    val buffer = ByteBuffer.allocate(packetSize)
+                    buffer.put(nameBytes.size.toByte())
+                    buffer.put(nameBytes)
+                    buffer.putInt(0) // Seq 0 for punch
+                    buffer.put(punchPayload)
+                    val fullPacket = buffer.array()
+
+                    // Burst: 10 packets to P, P+1, P-1 to ensure firewall traversal
+                    networkEngine.sendBurst(fullPacket, listOf(ip), port, isMobileTarget = true, burstCount = 10)
+                }
+            }
+
+            // [FIX] SILENT WAKE (No Ringtone)
+            // We verify permissions and start the Foreground Notification (Silent)
+            startForegroundServiceNotification("Incoming Audio: $sender")
+
+            // Short Vibrate (100ms) to indicate connection established
+            val v = if (Build.VERSION.SDK_INT >= 31) (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator else vibrator
+            v.vibrate(VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE))
+
+            return START_STICKY
+        }
+
+        // [ECO MODE] Toggle Intent
+        if (action == "TOGGLE_ECO") {
+            val enabled = intent.getBooleanExtra("state", false)
+            connectionManager.updateEcoMode(enabled)
+            val msg = if(enabled) "Eco Mode: ON (Battery Saver)" else "Eco Mode: OFF (High Performance)"
+            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+            refreshNotification()
+            return START_STICKY
+        }
+
         when (action) {
             "STOP_SERVICE" -> { performGracefulShutdown(); return START_NOT_STICKY }
             "TOGGLE_MUTE" -> {
@@ -635,7 +700,7 @@ class VoiceService : Service() {
                 _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
                 updateNotification("Online & Ready", null)
                 connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
-                startSignalLoop() // [FIX] Restored Remote Hangup Listener
+                startSignalLoop()
 
             } catch (e: Exception) { Log.e(tag, "Startup Error: ${e.message}") }
         }
@@ -652,15 +717,22 @@ class VoiceService : Service() {
         signalingJob?.cancel()
         signalingJob = scope.launch {
             while (isActive) {
+                // [ECO MODE FIX]
+                // If Eco Mode is ON, we rely on FCM to wake us.
+                // We stop polling to allow the radio to sleep.
+                if (::connectionManager.isInitialized && connectionManager.isEcoMode) {
+                    delay(10_000) // Passive wait
+                    continue
+                }
+
                 val token = repository.getToken()
                 if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
                     try {
                         val response = RetrofitClient.api.checkSignals("Bearer $token")
                         val callers = response.callers
                         if (!callers.isNullOrEmpty()) {
-                            // [FIX] INTERRUPT LOGIC RESTORED
                             if (isSending) {
-                                // If we are sending AND receive a signal, it's an interruption
+                                // Interruption Logic
                                 val interrupter = callers.firstOrNull { caller ->
                                     val ip = activeIpCache[caller]
                                     (ip != null && activeTargets.contains(ip)) || (repository.getTargetUser() == caller)
@@ -730,19 +802,24 @@ class VoiceService : Service() {
         }
     }
 
+    // [BREACH PROTOCOL] Unified Text Sender with Burst & Smart Wake
     fun sendTextMessage(targetIp: String, message: String) {
         scope.launch(Dispatchers.IO) {
             try {
+                // 1. Prepare Payload
                 val rawPayload = "TXT:$message".toByteArray(Charsets.UTF_8)
                 val seqNum = (System.currentTimeMillis() % 1000000).toInt()
+
                 val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
                 val isSecureMode = prefs.getBoolean("secure_mode", false)
+
                 val finalPayload = if (isSecureMode) {
                     val contact = repository.findContactByIp(targetIp)
                     val secretString = contact?.savedCode ?: "0000"
                     val secretKeySpec = CryptoEngine.deriveKey(secretString)
                     CryptoEngine.encrypt(rawPayload, seqNum, secretKeySpec) ?: rawPayload
                 } else { rawPayload }
+
                 val nameBytes = myUsername.toByteArray(Charsets.UTF_8)
                 val packetSize = 1 + nameBytes.size + 4 + finalPayload.size
                 val buffer = ByteBuffer.allocate(packetSize)
@@ -751,13 +828,32 @@ class VoiceService : Service() {
                 buffer.putInt(seqNum)
                 buffer.put(finalPayload)
                 val packetData = buffer.array()
-                repeat(3) { networkEngine.send(packetData, listOf(targetIp), UDP_PORT); delay(50) }
+
+                // 2. Identify Network Type
+                val isLocal = targetIp.startsWith("192.168.") || targetIp.startsWith("10.")
+                val isMobile = !isLocal
+
+                // 3. Smart Wake Check
+                val lastSeen = _voiceServiceState.value.lastPingResponse
+                val isCold = (System.currentTimeMillis() - lastReceiveTime) > WAKE_THRESHOLD_MS
+
+                if (isMobile && isCold) {
+                    val contact = repository.getAllContacts().find { it.ip == targetIp }
+                    if (contact != null && contact.fcmToken.isNotEmpty()) {
+                        repository.sendWakeSignal("Bearer ${repository.getToken()}", myUsername, contact.fcmToken)
+                    }
+                }
+
+                // 4. BURST SEND (5 Copies for Reliability)
+                networkEngine.sendBurst(packetData, listOf(targetIp), UDP_PORT, isMobileTarget = isMobile, burstCount = 5)
+
             } catch (e: Exception) { e.printStackTrace() }
         }
     }
 
     private fun handleIncomingPacket(data: ByteArray, length: Int, senderIp: String) {
         if (senderIp == myLocalIp || length <= 5) return
+
         val nameLen = data[0].toInt() and 0xFF
         if (nameLen + 5 > length) return
         val senderName = String(data, 1, nameLen)
@@ -814,8 +910,10 @@ class VoiceService : Service() {
         val lastSeq = sequenceMap.getOrPut(senderName) { -1 }
 
         if (seqNum > lastSeq || seqNum < lastSeq - 1000 || seqNum == 0) {
+            // [CRITICAL FIX] Update IP Cache *Before* checking for Punch Packet
             if (!senderName.startsWith("group:") && activeIpCache[senderName] != senderIp) {
                 activeIpCache[senderName] = senderIp
+                Log.d(tag, "IP Updated via Packet for $senderName -> $senderIp")
                 scope.launch {
                     val rowsAffected = repository.updateContactIp(senderName, senderIp)
                     if (rowsAffected == 0) repository.saveContact(name = senderName, ip = senderIp, code = "", isPriority = false)
@@ -827,6 +925,16 @@ class VoiceService : Service() {
             }
             sequenceMap[senderName] = seqNum
             lastIncomingIp = senderIp
+
+            // [BREACH PROTOCOL] Check if this is just a hole-punch
+            if (payloadLen > 0) {
+                val checkPunch = String(data, payloadOffset, payloadLen)
+                if (checkPunch.trim() == PUNCH_PACKET) {
+                    Log.d(tag, "Received PUNCH from $senderName. NAT Hole Open.")
+                    return // Stop audio processing, but cache is now updated!
+                }
+            }
+
             handleIncomingSignal(senderName, isPrincipal)
 
             if (payloadLen > 0) {
@@ -991,26 +1099,39 @@ class VoiceService : Service() {
         pendingAckJobs[targetIp + cmd] = job
     }
 
+    // [BREACH PROTOCOL] Nuclear SOS with Burst Mode
     fun sendPanicAlert() {
         scope.launch(Dispatchers.IO) {
             val allContacts = repository.getAllContacts()
-            var sentCount = 0
+            val targets = ArrayList<String>()
+
             allContacts.forEach { contact ->
-                if (!contact.ip.isNullOrBlank() && contact.ip != "SERVER_LINK") {
-                    sendReliableCmd(contact.ip, "CMD:SOS")
-                    sentCount++
+                if (!contact.ip.isNullOrBlank() && contact.ip != "SERVER_LINK") targets.add(contact.ip)
+                if (contact.fcmToken.isNotEmpty()) {
+                    repository.sendWakeSignal("Bearer ${repository.getToken()}", myUsername, contact.fcmToken)
                 }
             }
             val currentTarget = activeIpCache[repository.getTargetUser()]
-            if (!currentTarget.isNullOrBlank() && allContacts.none { it.ip == currentTarget }) {
-                sendReliableCmd(currentTarget, "CMD:SOS")
-                sentCount++
-            }
-            if (sentCount == 0) {
-                repeat(10) {
-                    sendTextMessage("255.255.255.255", "CMD:SOS")
-                    delay(1000)
+            if (!currentTarget.isNullOrBlank() && !targets.contains(currentTarget)) targets.add(currentTarget)
+
+            if (targets.isEmpty()) targets.add("255.255.255.255")
+
+            val sosPayload = "TXT:CMD:SOS".toByteArray()
+            val nameBytes = myUsername.toByteArray()
+            val buf = ByteBuffer.allocate(1 + nameBytes.size + 4 + sosPayload.size)
+            buf.put(nameBytes.size.toByte())
+            buf.put(nameBytes)
+            buf.putInt(0)
+            buf.put(sosPayload)
+            val packet = buf.array()
+
+            // Aggressive Flood (8 copies repeated 5 times)
+            repeat(5) {
+                targets.forEach { ip ->
+                    val isMobile = !ip.startsWith("192.") && !ip.startsWith("10.")
+                    networkEngine.sendBurst(packet, listOf(ip), UDP_PORT, isMobileTarget = isMobile, burstCount = 8)
                 }
+                delay(1000)
             }
         }
     }
@@ -1097,7 +1218,11 @@ class VoiceService : Service() {
             return
         }
         if (isSending) return
-        if (ips.isEmpty()) { Log.e(tag, "No Target IPs!"); return }
+        if (ips.isEmpty()) {
+            Log.e(tag, "No Target IPs! PTT blocked.")
+            speakText("Select a contact first") // Feedback to user
+            return
+        }
 
         stopVoxMonitoring()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) startForegroundServiceNotification("Transmitting...")
@@ -1111,12 +1236,47 @@ class VoiceService : Service() {
         lastPort = port
         updateState()
 
+        // [BREACH PROTOCOL] OPTIMIZED SMART WAKE
+        val currentTime = System.currentTimeMillis()
         val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
         dataSaverEnabled = prefs.getBoolean("data_saver", false)
-        val isGroupCall = ips.size > 1
-        val shouldCompress = if (isGroupCall) true else !isOnWifi && dataSaverEnabled
+        val isEco = prefs.getBoolean("eco_mode", false)
+
+        // 1. Check if the "UDP Tunnel" is still open (Packet received recently)
+        // Standard NAT timeout is ~60s. We use 45s to be safe.
+        val isTunnelOpen = (currentTime - lastReceiveTime) < WAKE_THRESHOLD_MS
+
+        // 2. Check if we just sent a wake signal (Debounce)
+        val recentlyWoken = (currentTime - lastWakeSentTime) < WAKE_DEBOUNCE_MS
+
+        // DECISION MATRIX:
+        // If Eco Mode is ON -> Always assume sleep, unless we just woke them.
+        // If Eco Mode is OFF -> Only wake if the tunnel has collapsed (Cold).
+        val shouldWake = if (isEco) {
+            !recentlyWoken
+        } else {
+            !isTunnelOpen && !recentlyWoken
+        }
+
+        if (shouldWake) {
+            lastWakeSentTime = currentTime // Update timestamp immediately
+            scope.launch(Dispatchers.IO) {
+                val target = repository.getTargetUser()
+                val contact = repository.getAllContacts().find { it.name == target }
+                if (contact != null && contact.fcmToken.isNotEmpty()) {
+                    Log.d(tag, "Sending Wake Signal to $target (Tunnel Closed/Eco)")
+                    repository.sendWakeSignal("Bearer ${repository.getToken()}", myUsername, contact.fcmToken)
+                }
+            }
+        } else {
+            Log.d(tag, "Skipping Wake Signal (Tunnel Open or Recently Woken)")
+        }
+
+        val shouldCompress = if (ips.size > 1) true else !isOnWifi && dataSaverEnabled
         val isSecureMode = prefs.getBoolean("secure_mode", false)
         val secretKey = if (isSecureMode) getEncryptionKey() else null
+
+        val isLocal = ips.all { it.startsWith("192.") || it.startsWith("10.") }
 
         vibrate()
 
@@ -1134,8 +1294,9 @@ class VoiceService : Service() {
             ByteBuffer.wrap(sendBuf, 1 + nameBytes.size, 4).putInt(currentSequenceNumber++)
             System.arraycopy(payloadToSend, 0, sendBuf, headerLen, payloadToSend.size)
 
-            // [FIX] Use CLASS MEMBER lastPort to respect updates
-            networkEngine.send(sendBuf, activeTargets, lastPort)
+            // Burst logic remains same...
+            val burstCount = if (currentSequenceNumber < 50) 2 else 1
+            networkEngine.sendBurst(sendBuf, activeTargets, lastPort, isMobileTarget = !isLocal, burstCount = burstCount)
         }
     }
 

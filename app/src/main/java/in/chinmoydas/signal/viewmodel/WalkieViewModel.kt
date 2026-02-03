@@ -1,6 +1,7 @@
 package `in`.chinmoydas.signal.viewmodel
 
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.util.Log
 import android.widget.Toast
@@ -632,6 +633,22 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
             }
         }
     }
+
+    fun toggleEcoMode(context: Context, enabled: Boolean) {
+        val intent = Intent(context, VoiceService::class.java).apply {
+            action = "TOGGLE_ECO"
+            putExtra("state", enabled)
+        }
+        context.startService(intent)
+    }
+
+    fun clearTarget() {
+        viewModelScope.launch(Dispatchers.IO) {
+            // Use 'setTargetUser' as defined in your MainRepository
+            repository.setTargetUser("")
+        }
+    }
+
     // [FIX] Safe Call Starter (Prevents UI crash/vanish)
     fun startCall(context: Context) {
         if (targetUser.isEmpty()) return

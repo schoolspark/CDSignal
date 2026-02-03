@@ -159,15 +159,19 @@ object CallSignaling {
         _callStatus.value = CallStatus.Idle
     }
 
+    // [BREACH PROTOCOL] Aggressive Signaling
+    // Sends 10 copies to ensure the command punches through UDP loss.
     private fun sendSignal(cmd: String, ip: String) {
         scope.launch(Dispatchers.IO) {
-            repeat(3) {
+            // [FIX] Increased from 3 to 10 for reliability
+            repeat(10) {
                 appContext?.sendBroadcast(Intent("in.chinmoydas.signal.SEND_SIGNAL").apply {
                     putExtra("ip", ip)
                     putExtra("cmd", cmd)
                     setPackage(appContext?.packageName)
                 })
-                delay(50)
+                // [FIX] Decreased delay to 20ms for a tighter burst
+                delay(20)
             }
         }
     }
