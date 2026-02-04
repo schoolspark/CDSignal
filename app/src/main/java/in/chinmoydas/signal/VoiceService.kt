@@ -2,11 +2,7 @@ package `in`.chinmoydas.signal
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.app.AlarmManager
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.app.Service
+import android.app.*
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -84,7 +80,7 @@ class VoiceService : Service() {
     private var lastRejectTime: Long = 0
     private var isTheaterMode = false
 
-    // Interceptor for UI logic (CallSignaling, etc.)
+    // Interceptor for UI logic
     var packetInterceptor: ((String, String) -> Boolean)? = null
 
     // Engines & Routers
@@ -112,7 +108,7 @@ class VoiceService : Service() {
 
     // [BREACH PROTOCOL] Anti-Spam Tracker
     private var lastWakeSentTime: Long = 0L
-    private val WAKE_DEBOUNCE_MS = 10_000L // Don't send wake more than once every 10s
+    private val WAKE_DEBOUNCE_MS = 10_000L
 
     private val UDP_PORT = 50005
     @Volatile private var isOnWifi = false
@@ -202,7 +198,6 @@ class VoiceService : Service() {
                 val ip = intent.getStringExtra("ip")
                 val cmd = intent.getStringExtra("cmd")
                 if (ip != null && cmd != null) {
-                    Log.d(tag, "Broadcasting Signal: $cmd to $ip")
                     sendTextMessage(ip, cmd)
                 }
             }
@@ -233,6 +228,8 @@ class VoiceService : Service() {
                     myLocalIp = newIp
 
                     try { networkEngine.stop() } catch (e: Exception) {}
+                    // Small delay to allow socket cleanup
+                    delay(100)
 
                     val networkStarted = networkEngine.start { packet ->
                         handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
@@ -240,10 +237,13 @@ class VoiceService : Service() {
 
                     if (networkStarted) {
                         _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
+                        // Broadcast movement to peers
                         sendTextMessage("255.255.255.255", "CMD:I_MOVED")
+
                         val currentTarget = repository.getTargetUser()
                         val targetIp = activeIpCache[currentTarget]
                         if (!targetIp.isNullOrBlank()) sendPing(targetIp)
+
                         broadcastHello()
                         localLinkManager?.startAdvertising(myUsername, UDP_PORT)
                         connectionManager.triggerImmediateHeartbeat()
@@ -397,7 +397,6 @@ class VoiceService : Service() {
 
     fun speakText(text: String) {
         if (isSilenced || isTheaterMode) {
-            Log.d(tag, "TTS Suppressed")
             return
         }
         val params = Bundle()
@@ -570,15 +569,16 @@ class VoiceService : Service() {
             if (!ip.isNullOrBlank()) {
                 scope.launch(Dispatchers.IO) {
                     if (!networkEngine.isBound()) {
-                        // Cold Start: If service was asleep, we must bind first
-                        networkEngine.start { packet ->
+                        // Cold Start Protection
+                        val networkStarted = networkEngine.start { packet ->
                             handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
                         }
-                        delay(200)
+                        if (!networkStarted) return@launch
+                        delay(150) // Ensure bind completes
                     }
                     Log.d(tag, "BREACH: Punching hole to $ip:$port")
 
-                    // [CRITICAL FIX] Construct a VALID packet with headers so receiver updates IP
+                    // Construct PUNCH packet
                     val punchPayload = PUNCH_PACKET.toByteArray()
                     val nameBytes = myUsername.toByteArray()
                     val packetSize = 1 + nameBytes.size + 4 + punchPayload.size
@@ -594,14 +594,10 @@ class VoiceService : Service() {
                 }
             }
 
-            // [FIX] SILENT WAKE (No Ringtone)
-            // We verify permissions and start the Foreground Notification (Silent)
+            // [FIX] SILENT WAKE
             startForegroundServiceNotification("Incoming Audio: $sender")
-
-            // Short Vibrate (100ms) to indicate connection established
             val v = if (Build.VERSION.SDK_INT >= 31) (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator else vibrator
             v.vibrate(VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE))
-
             return START_STICKY
         }
 
@@ -673,7 +669,6 @@ class VoiceService : Service() {
 
         if (intent?.getBooleanExtra("is_cloud_wake", false) == true) {
             val wokenBy = intent.getStringExtra("woken_by")
-            Log.d(tag, "Service woken by Cloud. Identifying myself to $wokenBy")
             broadcastHello()
         }
 
@@ -718,12 +713,10 @@ class VoiceService : Service() {
         signalingJob = scope.launch {
             while (isActive) {
                 // [ECO MODE FIX]
-                // If Eco Mode is ON, we rely on FCM to wake us.
-                // We stop polling to allow the radio to sleep.
-                if (::connectionManager.isInitialized && connectionManager.isEcoMode) {
-                    delay(10_000) // Passive wait
-                    continue
-                }
+                // We do NOT stop the loop. We just poll slower.
+                val pollInterval = if (::connectionManager.isInitialized && connectionManager.isEcoMode) 10_000L else 2000L
+
+                delay(pollInterval)
 
                 val token = repository.getToken()
                 if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
@@ -748,7 +741,6 @@ class VoiceService : Service() {
                         }
                     } catch (e: Exception) { }
                 }
-                delay(2000)
             }
         }
     }
@@ -844,7 +836,7 @@ class VoiceService : Service() {
                     }
                 }
 
-                // 4. BURST SEND (5 Copies for Reliability)
+                // 4. BURST SEND
                 networkEngine.sendBurst(packetData, listOf(targetIp), UDP_PORT, isMobileTarget = isMobile, burstCount = 5)
 
             } catch (e: Exception) { e.printStackTrace() }
@@ -899,7 +891,6 @@ class VoiceService : Service() {
         if (currentSpeakerName != null && currentSpeakerName != senderName) {
             if (isPrincipal) {
                 currentSpeakerName = senderName
-                Log.w(tag, "Principal Override: $senderName taking over.")
             } else { return }
         } else { currentSpeakerName = senderName }
 
@@ -910,10 +901,9 @@ class VoiceService : Service() {
         val lastSeq = sequenceMap.getOrPut(senderName) { -1 }
 
         if (seqNum > lastSeq || seqNum < lastSeq - 1000 || seqNum == 0) {
-            // [CRITICAL FIX] Update IP Cache *Before* checking for Punch Packet
+            // Update IP if changed
             if (!senderName.startsWith("group:") && activeIpCache[senderName] != senderIp) {
                 activeIpCache[senderName] = senderIp
-                Log.d(tag, "IP Updated via Packet for $senderName -> $senderIp")
                 scope.launch {
                     val rowsAffected = repository.updateContactIp(senderName, senderIp)
                     if (rowsAffected == 0) repository.saveContact(name = senderName, ip = senderIp, code = "", isPriority = false)
@@ -926,12 +916,13 @@ class VoiceService : Service() {
             sequenceMap[senderName] = seqNum
             lastIncomingIp = senderIp
 
-            // [BREACH PROTOCOL] Check if this is just a hole-punch
-            if (payloadLen > 0) {
+            // [CRITICAL FIX] Efficient PUNCH Detection (No String Conversion)
+            // __PUNCH__ is 9 bytes. We only check if payload is small.
+            if (payloadLen == 9) {
                 val checkPunch = String(data, payloadOffset, payloadLen)
-                if (checkPunch.trim() == PUNCH_PACKET) {
+                if (checkPunch == PUNCH_PACKET) {
                     Log.d(tag, "Received PUNCH from $senderName. NAT Hole Open.")
-                    return // Stop audio processing, but cache is now updated!
+                    return
                 }
             }
 
@@ -957,6 +948,7 @@ class VoiceService : Service() {
                     }
                 }
 
+                // Text Logic: Only check if payload is small enough to be text
                 if (payload.size < 500) {
                     try {
                         val textData = String(payload, Charsets.UTF_8)
@@ -1219,8 +1211,7 @@ class VoiceService : Service() {
         }
         if (isSending) return
         if (ips.isEmpty()) {
-            Log.e(tag, "No Target IPs! PTT blocked.")
-            speakText("Select a contact first") // Feedback to user
+            speakText("Select a contact first")
             return
         }
 
@@ -1243,15 +1234,10 @@ class VoiceService : Service() {
         val isEco = prefs.getBoolean("eco_mode", false)
 
         // 1. Check if the "UDP Tunnel" is still open (Packet received recently)
-        // Standard NAT timeout is ~60s. We use 45s to be safe.
         val isTunnelOpen = (currentTime - lastReceiveTime) < WAKE_THRESHOLD_MS
-
         // 2. Check if we just sent a wake signal (Debounce)
         val recentlyWoken = (currentTime - lastWakeSentTime) < WAKE_DEBOUNCE_MS
 
-        // DECISION MATRIX:
-        // If Eco Mode is ON -> Always assume sleep, unless we just woke them.
-        // If Eco Mode is OFF -> Only wake if the tunnel has collapsed (Cold).
         val shouldWake = if (isEco) {
             !recentlyWoken
         } else {
@@ -1259,7 +1245,7 @@ class VoiceService : Service() {
         }
 
         if (shouldWake) {
-            lastWakeSentTime = currentTime // Update timestamp immediately
+            lastWakeSentTime = currentTime
             scope.launch(Dispatchers.IO) {
                 val target = repository.getTargetUser()
                 val contact = repository.getAllContacts().find { it.name == target }
@@ -1268,8 +1254,6 @@ class VoiceService : Service() {
                     repository.sendWakeSignal("Bearer ${repository.getToken()}", myUsername, contact.fcmToken)
                 }
             }
-        } else {
-            Log.d(tag, "Skipping Wake Signal (Tunnel Open or Recently Woken)")
         }
 
         val shouldCompress = if (ips.size > 1) true else !isOnWifi && dataSaverEnabled
@@ -1294,8 +1278,9 @@ class VoiceService : Service() {
             ByteBuffer.wrap(sendBuf, 1 + nameBytes.size, 4).putInt(currentSequenceNumber++)
             System.arraycopy(payloadToSend, 0, sendBuf, headerLen, payloadToSend.size)
 
-            // Burst logic remains same...
-            val burstCount = if (currentSequenceNumber < 50) 2 else 1
+            // [OPTIMIZATION] Only burst the very first few packets to establish connection
+            // Branch Script was bursting first 50 (too many!)
+            val burstCount = if (currentSequenceNumber < 5) 2 else 1
             networkEngine.sendBurst(sendBuf, activeTargets, lastPort, isMobileTarget = !isLocal, burstCount = burstCount)
         }
     }
