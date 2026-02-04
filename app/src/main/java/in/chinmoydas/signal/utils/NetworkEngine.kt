@@ -17,12 +17,11 @@ class NetworkEngine(
     private var socket: DatagramSocket? = null
     private val isRunning = AtomicBoolean(false)
 
-    // [BREACH PROTOCOL] DNS Cache to prevent "Stutter" during audio streaming
+    // DNS Cache to prevent "Stutter"
     private val ipCache = ConcurrentHashMap<String, InetAddress>()
 
-    // Queue for outgoing packets (Increased buffer for Burst Mode)
-    private val sendQueue = LinkedBlockingQueue<DatagramPacket>(512)
-
+    // Queue for outgoing packets
+    private val sendQueue = LinkedBlockingQueue<DatagramPacket>(128)
     private val sendExecutor = Executors.newSingleThreadExecutor()
 
     fun start(onPacketReceived: (DatagramPacket) -> Unit): Boolean {
@@ -31,110 +30,98 @@ class NetworkEngine(
         try {
             socket = DatagramSocket(port).apply {
                 reuseAddress = true
-                receiveBufferSize = 1024 * 1024 // 1MB Buffer (High Perf)
+                receiveBufferSize = 512 * 1024 // Increased Buffer
                 broadcast = true
                 soTimeout = 0
-                trafficClass = 0x10 // IPTOS_LOWDELAY
             }
+
+            Thread {
+                val buffer = ByteArray(4096)
+                while (isRunning.get()) {
+                    try {
+                        val packet = DatagramPacket(buffer, buffer.size)
+                        socket?.receive(packet)
+
+                        if (packet.length > 0) {
+                            val data = packet.data.copyOf(packet.length)
+                            if (StunClient.isStunResponse(data)) {
+                                onStunPacket(data)
+                            } else {
+                                onPacketReceived(packet)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        if (isRunning.get()) Log.e(tag, "Receive Error: ${e.message}")
+                    }
+                }
+            }.start()
+
+            // Sender Thread
+            Thread {
+                while (isRunning.get()) {
+                    try {
+                        val packet = sendQueue.take()
+                        socket?.send(packet)
+                    } catch (e: Exception) {
+                        // Queue error or socket closed
+                    }
+                }
+            }.start()
+
+            return true
         } catch (e: Exception) {
+            Log.e(tag, "Bind Failed: ${e.message}")
             isRunning.set(false)
             return false
         }
-
-        // 1. Sender Loop
-        Thread {
-            while (isRunning.get()) {
-                try {
-                    val packet = sendQueue.take()
-                    socket?.send(packet)
-                } catch (e: Exception) {
-                    // Socket closed or network error
-                }
-            }
-        }.start()
-
-        // 2. Receiver Loop
-        Thread {
-            while (isRunning.get()) {
-                try {
-                    val buffer = ByteArray(4096)
-                    val packet = DatagramPacket(buffer, buffer.size)
-
-                    socket?.receive(packet)
-
-                    val dataCopy = packet.data.copyOf(packet.length)
-
-                    if (StunClient.isStunResponse(dataCopy)) {
-                        onStunPacket(dataCopy)
-                    } else {
-                        onPacketReceived(packet)
-                    }
-                } catch (e: Exception) {
-                    // Ignore receive errors
-                }
-            }
-        }.start()
-
-        return true
     }
 
-    fun sendRawPacket(packet: DatagramPacket) {
-        if (isRunning.get()) sendQueue.offer(packet)
-    }
-
-    /**
-     * [BREACH PROTOCOL] - BURST MODE
-     * Sends the data to the target.
-     * @param isMobileTarget If TRUE, we enable "Port Spraying" (P, P+1, P-1)
-     * @param burstCount How many copies to send (Redundancy)
-     */
-    fun sendBurst(data: ByteArray, targets: List<String>, targetPort: Int, isMobileTarget: Boolean = false, burstCount: Int = 1) {
+    fun send(data: ByteArray, targets: List<String>, targetPort: Int) {
         if (!isRunning.get() || targets.isEmpty()) return
 
         sendExecutor.execute {
             targets.forEach { ip ->
                 try {
-                    // Check Cache first
                     var address = ipCache[ip]
                     if (address == null) {
                         address = InetAddress.getByName(ip)
-                        ipCache[ip] = address // Cache it!
+                        ipCache[ip] = address
                     }
 
                     if (address != null) {
-                        // 1. Standard Target
-                        queuePacket(data, address, targetPort, burstCount)
+                        val packet = DatagramPacket(data, data.size, address, targetPort)
+                        sendQueue.offer(packet)
+                    }
+                } catch (e: Exception) { }
+            }
+        }
+    }
 
-                        // 2. Port Spraying (Only for Mobile Targets to beat Symmetric NAT)
-                        if (isMobileTarget) {
-                            queuePacket(data, address, targetPort + 1, 1) // Try Next Port
-                            if (targetPort > 1024) {
-                                queuePacket(data, address, targetPort - 1, 1) // Try Prev Port
-                            }
+    // [NEW] CRITICAL FOR BREACH PROTOCOL
+    // Sends the same packet multiple times to ensure it punches through NAT
+    fun sendBurst(data: ByteArray, targets: List<String>, targetPort: Int, isMobileTarget: Boolean, burstCount: Int) {
+        if (!isRunning.get() || targets.isEmpty()) return
+
+        sendExecutor.execute {
+            targets.forEach { ip ->
+                try {
+                    var address = ipCache[ip]
+                    if (address == null) {
+                        address = InetAddress.getByName(ip)
+                        ipCache[ip] = address
+                    }
+
+                    if (address != null) {
+                        repeat(burstCount) {
+                            val packet = DatagramPacket(data, data.size, address, targetPort)
+                            sendQueue.offer(packet)
+                            // Small delay for mobile targets to prevent buffer overflow on their end
+                            if (isMobileTarget) Thread.sleep(5)
                         }
                     }
-                } catch (e: Exception) {
-                    // Bad IP, ignore
-                }
+                } catch (e: Exception) { }
             }
         }
-    }
-
-    // Helper to queue packets
-    private fun queuePacket(data: ByteArray, address: InetAddress, port: Int, count: Int) {
-        repeat(count) {
-            val packet = DatagramPacket(data, data.size, address, port)
-            // Drop oldest if queue full (Real-time priority)
-            if (!sendQueue.offer(packet)) {
-                sendQueue.poll()
-                sendQueue.offer(packet)
-            }
-        }
-    }
-
-    // Legacy support for existing calls (defaults to 1 copy, no spray)
-    fun send(data: ByteArray, targets: List<String>, targetPort: Int) {
-        sendBurst(data, targets, targetPort, isMobileTarget = false, burstCount = 1)
     }
 
     fun stop() {

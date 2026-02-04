@@ -228,7 +228,6 @@ class VoiceService : Service() {
                     myLocalIp = newIp
 
                     try { networkEngine.stop() } catch (e: Exception) {}
-                    // Small delay to allow socket cleanup
                     delay(100)
 
                     val networkStarted = networkEngine.start { packet ->
@@ -237,7 +236,6 @@ class VoiceService : Service() {
 
                     if (networkStarted) {
                         _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
-                        // Broadcast movement to peers
                         sendTextMessage("255.255.255.255", "CMD:I_MOVED")
 
                         val currentTarget = repository.getTargetUser()
@@ -246,6 +244,8 @@ class VoiceService : Service() {
 
                         broadcastHello()
                         localLinkManager?.startAdvertising(myUsername, UDP_PORT)
+
+                        // [FIX] Do NOT send default heartbeat here. Let ConnectionManager handle STUN.
                         connectionManager.triggerImmediateHeartbeat()
                     }
                 } else if (myLocalIp.isEmpty()) {
@@ -446,6 +446,9 @@ class VoiceService : Service() {
                 }
                 if (ip == "SERVER_LINK") ip = "signal.chinmoydas.in"
 
+                // [FIX] Allow explicit port usage if available in activeIpCache?
+                // For now, we rely on 50005 + Breach Protocol to punch the hole.
+
                 if (!ip.isNullOrBlank()) {
                     if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                         if (!fromVox) vibrate()
@@ -560,7 +563,6 @@ class VoiceService : Service() {
         MediaButtonReceiver.handleIntent(mediaSession, intent)
         val action = intent?.action
 
-        // [BREACH PROTOCOL] Triggered by SignalFirebaseService
         if (action == "ACTION_PUNCH_BACK") {
             val ip = intent.getStringExtra("target_ip")
             val port = intent.getIntExtra("target_port", 50005)
@@ -569,39 +571,33 @@ class VoiceService : Service() {
             if (!ip.isNullOrBlank()) {
                 scope.launch(Dispatchers.IO) {
                     if (!networkEngine.isBound()) {
-                        // Cold Start Protection
                         val networkStarted = networkEngine.start { packet ->
                             handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
                         }
                         if (!networkStarted) return@launch
-                        delay(150) // Ensure bind completes
+                        delay(150)
                     }
                     Log.d(tag, "BREACH: Punching hole to $ip:$port")
 
-                    // Construct PUNCH packet
                     val punchPayload = PUNCH_PACKET.toByteArray()
                     val nameBytes = myUsername.toByteArray()
                     val packetSize = 1 + nameBytes.size + 4 + punchPayload.size
                     val buffer = ByteBuffer.allocate(packetSize)
                     buffer.put(nameBytes.size.toByte())
                     buffer.put(nameBytes)
-                    buffer.putInt(0) // Seq 0 for punch
+                    buffer.putInt(0)
                     buffer.put(punchPayload)
                     val fullPacket = buffer.array()
 
-                    // Burst: 10 packets to P, P+1, P-1 to ensure firewall traversal
                     networkEngine.sendBurst(fullPacket, listOf(ip), port, isMobileTarget = true, burstCount = 10)
                 }
             }
 
-            // [FIX] SILENT WAKE
-            startForegroundServiceNotification("Incoming Audio: $sender")
-            val v = if (Build.VERSION.SDK_INT >= 31) (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator else vibrator
-            v.vibrate(VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE))
+            // Silent Notification
+            startForegroundServiceNotification("Checking Connection...")
             return START_STICKY
         }
 
-        // [ECO MODE] Toggle Intent
         if (action == "TOGGLE_ECO") {
             val enabled = intent.getBooleanExtra("state", false)
             connectionManager.updateEcoMode(enabled)
@@ -844,12 +840,16 @@ class VoiceService : Service() {
     }
 
     private fun handleIncomingPacket(data: ByteArray, length: Int, senderIp: String) {
-        if (senderIp == myLocalIp || length <= 5) return
+        // 1. SELF FILTER (IP Based)
+        if (senderIp == myLocalIp) return
+        if (length <= 5) return
 
+        // 2. PARSE HEADER
         val nameLen = data[0].toInt() and 0xFF
         if (nameLen + 5 > length) return
         val senderName = String(data, 1, nameLen)
 
+        // 3. PROTOCOL COMMANDS (Hello, Ping, Pong)
         if (senderName.startsWith("HELLO:")) {
             val parts = senderName.split(":")
             if (parts.size >= 3) {
@@ -868,6 +868,7 @@ class VoiceService : Service() {
         if (senderName == PING_SIGNAL) { sendPong(senderIp); return }
         if (senderName == PONG_SIGNAL) { _voiceServiceState.update { it.copy(lastPingResponse = System.currentTimeMillis()) }; return }
 
+        // 4. END STREAM LOGIC
         if (senderName == END_STREAM_SIGNAL) {
             if (isReceiving) {
                 isReceiving = false
@@ -885,7 +886,12 @@ class VoiceService : Service() {
             return
         }
 
-        if (senderName.trim().equals(myUsername.trim(), ignoreCase = true) || blockedCache.contains(senderName) || senderIp == ignoredSender) return
+        // 5. SELF FILTER (Name Based) & BLOCKING
+        // [CRITICAL FIX] Nuclear Self Filter - Trim and IgnoreCase
+        if (senderName.trim().equals(myUsername.trim(), ignoreCase = true)) return
+        if (blockedCache.contains(senderName)) return
+        if (senderIp == ignoredSender) return
+
         val isPrincipal = principalCache.contains(senderName)
 
         if (currentSpeakerName != null && currentSpeakerName != senderName) {
@@ -894,6 +900,7 @@ class VoiceService : Service() {
             } else { return }
         } else { currentSpeakerName = senderName }
 
+        // 6. SEQUENCE CHECK
         val seqOffset = 1 + nameLen
         val seqNum = ByteBuffer.wrap(data, seqOffset, 4).int
         val payloadOffset = seqOffset + 4
@@ -901,7 +908,7 @@ class VoiceService : Service() {
         val lastSeq = sequenceMap.getOrPut(senderName) { -1 }
 
         if (seqNum > lastSeq || seqNum < lastSeq - 1000 || seqNum == 0) {
-            // Update IP if changed
+            // Update IP mapping
             if (!senderName.startsWith("group:") && activeIpCache[senderName] != senderIp) {
                 activeIpCache[senderName] = senderIp
                 scope.launch {
@@ -909,141 +916,167 @@ class VoiceService : Service() {
                     if (rowsAffected == 0) repository.saveContact(name = senderName, ip = senderIp, code = "", isPriority = false)
                 }
             }
-            if (seqNum == 0 || seqNum < lastSeq - 1000) {
-                scope.launch { repository.insertLog(senderName, true) }
-                sequenceMap[senderName] = -1
-            }
+
             sequenceMap[senderName] = seqNum
             lastIncomingIp = senderIp
 
-            // [CRITICAL FIX] Efficient PUNCH Detection (No String Conversion)
-            // __PUNCH__ is 9 bytes. We only check if payload is small.
+            // Check PUNCH packet
             if (payloadLen == 9) {
                 val checkPunch = String(data, payloadOffset, payloadLen)
-                if (checkPunch == PUNCH_PACKET) {
-                    Log.d(tag, "Received PUNCH from $senderName. NAT Hole Open.")
-                    return
+                if (checkPunch == PUNCH_PACKET) return
+            }
+
+            // 7. DECRYPTION (Do this BEFORE deciding if it's Audio or Text)
+            var payload = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
+            val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
+            val isSecureMode = prefs.getBoolean("secure_mode", false)
+
+            if (isSecureMode) {
+                val isGroup = senderName.startsWith("group:")
+                val secretKey = getDecryptionKey(isGroup)
+                if (secretKey != null) {
+                    var decrypted = CryptoEngine.decrypt(payload, seqNum, secretKey)
+                    // Retry for G711 frame size mismatch
+                    if (decrypted == null && payload.size > 656 && payload.size < 720) {
+                        try {
+                            val trimmedPayload = payload.copyOfRange(0, 656)
+                            decrypted = CryptoEngine.decrypt(trimmedPayload, seqNum, secretKey)
+                        } catch (e: Exception) { }
+                    }
+                    if (decrypted != null) payload = decrypted
                 }
             }
 
-            handleIncomingSignal(senderName, isPrincipal)
+            // 8. ROUTING LOGIC (The Fix)
+            // Check if it's TEXT/CMD first. If yes, handle it and RETURN.
+            // Do NOT call handleIncomingSignal() yet.
 
-            if (payloadLen > 0) {
-                var payload = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
-                val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
-                val isSecureMode = prefs.getBoolean("secure_mode", false)
+            val isTextOrCmd = if (payload.size > 4) {
+                val header = String(payload, 0, 4, Charsets.UTF_8)
+                header == "TXT:" || header == "CMD:" || header == "LOC:"
+            } else false
 
-                if (isSecureMode) {
-                    val isGroup = senderName.startsWith("group:")
-                    val secretKey = getDecryptionKey(isGroup)
-                    if (secretKey != null) {
-                        var decrypted = CryptoEngine.decrypt(payload, seqNum, secretKey)
-                        if (decrypted == null && payload.size > 656 && payload.size < 720) {
-                            try {
-                                val trimmedPayload = payload.copyOfRange(0, 656)
-                                decrypted = CryptoEngine.decrypt(trimmedPayload, seqNum, secretKey)
-                            } catch (e: Exception) { }
-                        }
-                        if (decrypted != null) payload = decrypted
-                    }
-                }
+            if (isTextOrCmd) {
+                // --- IT IS A MESSAGE ---
+                try {
+                    val textData = String(payload, Charsets.UTF_8)
+                    if (textData.startsWith("TXT:")) {
+                        val cleanMessage = textData.substring(4)
 
-                // Text Logic: Only check if payload is small enough to be text
-                if (payload.size < 500) {
-                    try {
-                        val textData = String(payload, Charsets.UTF_8)
-                        if (textData.startsWith("TXT:")) {
-                            val cleanMessage = textData.substring(4)
-                            if (cleanMessage == "CMD:CALL:PING") { lastCallPacketTime = System.currentTimeMillis(); return }
-                            if (cleanMessage.startsWith("ACK:")) {
-                                val originalCmd = cleanMessage.removePrefix("ACK:")
-                                val jobKey = senderIp + originalCmd
-                                pendingAckJobs[jobKey]?.cancel()
-                                pendingAckJobs.remove(jobKey)
-                                return
-                            }
-                            if (cleanMessage == "CMD:SOS") {
-                                sendTextMessage(senderIp, "ACK:CMD:SOS")
-                                showIncomingCallNotification("SOS ALERT: $senderName", isAlarm = true)
-                                SafetySignaling.triggerSOS(senderName)
-                                return
-                            }
-                            if (packetInterceptor?.invoke(cleanMessage, senderIp) == true) return
-                            if (cleanMessage.startsWith("CMD:REMOTE_")) {
-                                val isRemoteAllowed = prefs.getBoolean("allow_remote_control", false)
-                                if (!isRemoteAllowed) {
-                                    val now = System.currentTimeMillis()
-                                    if (now - lastRejectTime > 5000) {
-                                        lastRejectTime = now
-                                        sendTextMessage(senderIp, "Remote Control is DISABLED on this device.")
-                                        updateNotification("🚫 Blocked CMD", "Guardian Mode OFF. Ignored $senderName")
-                                    }
-                                    return
-                                }
-                                if (isPrincipal) {
-                                    if (cleanMessage == "CMD:REMOTE_MIC_ON") {
-                                        updateNotification("🎙️ REMOTE ACTIVE", "Mic accessed by $senderName")
-                                        if (!_voiceServiceState.value.isVoxEnabled) toggleVox(true)
-                                    } else if (cleanMessage == "CMD:REMOTE_STEALTH") {
-                                        updateNotification("🤫 STEALTH MODE", "Activated by $senderName")
-                                        toggleSpeaker(false)
-                                        isSilenced = true
-                                        isTheaterMode = true
-                                        _voiceServiceState.update { it.copy(isSilenced = true, isTheaterMode = true) }
-                                    } else if (cleanMessage == "CMD:REMOTE_LOCATION") {
-                                        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                                            val locMgr = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
-                                            val loc = locMgr.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER)
-                                                ?: locMgr.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
-                                            if (loc != null) {
-                                                sendTextMessage(senderIp, "LOC:${loc.latitude},${loc.longitude}")
-                                                updateNotification("📍 LOCATION SHARED", "Sent to $senderName")
-                                            } else { sendTextMessage(senderIp, "ERROR: No GPS Signal found") }
-                                        }
-                                    } else if (cleanMessage == "CMD:REMOTE_RESTORE") {
-                                        isSilenced = false
-                                        isTheaterMode = false
-                                        _voiceServiceState.update { it.copy(isSilenced = false, isTheaterMode = false) }
-                                        toggleSpeaker(true)
-                                        if (_voiceServiceState.value.isVoxEnabled) toggleVox(false)
-                                        speakText("Device restored to normal mode")
-                                        updateNotification("✅ RESTORED", "Reset by $senderName")
-                                        sendTextMessage(senderIp, "CONFIRM: Device Restored to Normal")
-                                    }
-                                } else {
-                                    scope.launch { SafetySignaling.triggerSecurityAlert(senderName) }
-                                    updateNotification("⚠️ SECURITY WARN", "Blocked CMD from $senderName")
-                                }
-                                return
-                            }
-                            if (!cleanMessage.startsWith("CMD:") && !cleanMessage.startsWith("LOC:")) {
-                                val notificationPrefix = if(isPrincipal) "⚠️ PRIORITY MSG" else "Message"
-                                speakText(cleanMessage)
-                                scope.launch {
-                                    val db = AppDatabase.getDatabase(applicationContext)
-                                    db.pagerDao().insert(PagerEntry(sender = senderName, type = "TEXT", content = cleanMessage, isRead = false))
-                                }
-                                updateNotification("$notificationPrefix from $senderName", cleanMessage)
-                            }
+                        // Internal Signals
+                        if (cleanMessage == "CMD:CALL:PING") { lastCallPacketTime = System.currentTimeMillis(); return }
+                        if (cleanMessage.startsWith("ACK:")) {
+                            val originalCmd = cleanMessage.removePrefix("ACK:")
+                            val jobKey = senderIp + originalCmd
+                            pendingAckJobs[jobKey]?.cancel()
+                            pendingAckJobs.remove(jobKey)
                             return
                         }
-                    } catch (e: Exception) { }
-                }
 
-                if (payload.size >= 640 && payload.size < 720) {
-                    try { payload = G711.decode(payload, 640) } catch (e: Exception) { }
-                }
+                        // SOS
+                        if (cleanMessage == "CMD:SOS") {
+                            sendTextMessage(senderIp, "ACK:CMD:SOS")
+                            showIncomingCallNotification(senderName, "SOS ALERT", isAlarm = true) // Specific SOS Alert
+                            SafetySignaling.triggerSOS(senderName)
+                            return
+                        }
 
-                if (CallEngine.isCallActive) { lastCallPacketTime = System.currentTimeMillis(); return }
-                if (isSending) return
+                        // UI Interceptor (Chat Dialogs)
+                        if (packetInterceptor?.invoke(cleanMessage, senderIp) == true) return
 
-                if (!isSilenced || isPrincipal) {
-                    try { audioEngine.playPcmChunk(payload, seqNum) } catch (e: Exception) {}
+                        // Remote Control Logic
+                        if (cleanMessage.startsWith("CMD:REMOTE_")) {
+                            handleRemoteCommand(cleanMessage, senderIp, senderName, isPrincipal, prefs)
+                            return
+                        }
+
+                        // Normal Text Message
+                        if (!cleanMessage.startsWith("CMD:") && !cleanMessage.startsWith("LOC:")) {
+                            speakText(cleanMessage) // TTS
+                            scope.launch {
+                                val db = AppDatabase.getDatabase(applicationContext)
+                                db.pagerDao().insert(PagerEntry(sender = senderName, type = "TEXT", content = cleanMessage, isRead = false))
+                            }
+                            updateNotification("Message from $senderName", cleanMessage)
+                        }
+                    }
+                } catch (e: Exception) { }
+                return // <--- CRITICAL: Stop here. Do not process as Audio.
+            }
+
+            // --- IT IS AUDIO ---
+
+            // 9. HANDLE SIGNAL (Notifications & Vibration)
+            // Only trigger this now that we know it's audio
+            handleIncomingSignal(senderName, isPrincipal)
+
+            // G711 Decode
+            if (payload.size >= 640 && payload.size < 720) {
+                try { payload = G711.decode(payload, 640) } catch (e: Exception) { }
+            }
+
+            if (CallEngine.isCallActive) { lastCallPacketTime = System.currentTimeMillis(); return }
+            if (isSending) return
+
+            if (!isSilenced || isPrincipal) {
+                try { audioEngine.playPcmChunk(payload, seqNum) } catch (e: Exception) {}
+            }
+            if (isRecordingEnabled) {
+                synchronized(bufferLock) { try { incomingBuffer.write(payload) } catch (t: Throwable) {} }
+            }
+        }
+    }
+
+    // Helper for Remote Commands (Cleaned up from main logic)
+    private fun handleRemoteCommand(cmd: String, ip: String, name: String, isPrincipal: Boolean, prefs: android.content.SharedPreferences) {
+        val isRemoteAllowed = prefs.getBoolean("allow_remote_control", false)
+        if (!isRemoteAllowed) {
+            val now = System.currentTimeMillis()
+            if (now - lastRejectTime > 5000) {
+                lastRejectTime = now
+                sendTextMessage(ip, "Remote Control is DISABLED on this device.")
+                updateNotification("🚫 Blocked CMD", "Ignored $name")
+            }
+            return
+        }
+        if (isPrincipal) {
+            when (cmd) {
+                "CMD:REMOTE_MIC_ON" -> {
+                    updateNotification("🎙️ REMOTE ACTIVE", "Mic accessed by $name")
+                    if (!_voiceServiceState.value.isVoxEnabled) toggleVox(true)
                 }
-                if (isRecordingEnabled) {
-                    synchronized(bufferLock) { try { incomingBuffer.write(payload) } catch (t: Throwable) {} }
+                "CMD:REMOTE_STEALTH" -> {
+                    updateNotification("🤫 STEALTH MODE", "Activated by $name")
+                    toggleSpeaker(false)
+                    isSilenced = true
+                    isTheaterMode = true
+                    _voiceServiceState.update { it.copy(isSilenced = true, isTheaterMode = true) }
+                }
+                "CMD:REMOTE_LOCATION" -> {
+                    if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                        val locMgr = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+                        val loc = locMgr.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER)
+                            ?: locMgr.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
+                        if (loc != null) {
+                            sendTextMessage(ip, "LOC:${loc.latitude},${loc.longitude}")
+                            updateNotification("📍 LOCATION SHARED", "Sent to $name")
+                        } else { sendTextMessage(ip, "ERROR: No GPS Signal found") }
+                    }
+                }
+                "CMD:REMOTE_RESTORE" -> {
+                    isSilenced = false
+                    isTheaterMode = false
+                    _voiceServiceState.update { it.copy(isSilenced = false, isTheaterMode = false) }
+                    toggleSpeaker(true)
+                    if (_voiceServiceState.value.isVoxEnabled) toggleVox(false)
+                    speakText("Device restored to normal mode")
+                    updateNotification("✅ RESTORED", "Reset by $name")
+                    sendTextMessage(ip, "CONFIRM: Device Restored to Normal")
                 }
             }
+        } else {
+            scope.launch { SafetySignaling.triggerSecurityAlert(name) }
+            updateNotification("⚠️ SECURITY WARN", "Blocked CMD from $name")
         }
     }
 

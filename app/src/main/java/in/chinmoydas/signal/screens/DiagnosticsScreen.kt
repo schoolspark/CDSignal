@@ -52,6 +52,7 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.HttpURLConnection
 import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.SocketTimeoutException
 import java.net.URL
@@ -140,7 +141,6 @@ fun DiagnosticsScreen(navController: NavController) {
     }
 
     fun copyReport() {
-        // [FIX] Corrected String Template syntax
         val report = """
             CD SIGNAL DIAGNOSTIC REPORT
             ---------------------------
@@ -540,17 +540,18 @@ fun checkSensors(context: Context): String {
     return if (accel != null) "OK (Found)" else "Fail (Missing)"
 }
 
+// [FIXED] Updated to use the new StunClient.buildRequest() and manually creating the packet
 suspend fun checkStunConnectivity(): String = withContext(Dispatchers.IO) {
     try {
         val socket = DatagramSocket()
         socket.soTimeout = 2500
 
-        // Use the new StunClient with arguments if needed,
-        // but default arguments work fine for diagnostics.
-        val request = StunClient.createBindRequest()
-            ?: return@withContext "Fail (Gen Request)"
+        // Use new API
+        val reqBytes = StunClient.buildRequest()
+        val address = InetAddress.getByName("stun.l.google.com")
+        val packet = DatagramPacket(reqBytes, reqBytes.size, address, 19302)
 
-        socket.send(request)
+        socket.send(packet)
 
         val buf = ByteArray(1024)
         val p = DatagramPacket(buf, buf.size)

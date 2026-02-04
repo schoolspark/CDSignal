@@ -3,8 +3,6 @@ package `in`.chinmoydas.signal.utils
 import android.util.Log
 import `in`.chinmoydas.signal.data.MainRepository
 import kotlinx.coroutines.*
-import java.net.Inet4Address
-import java.net.NetworkInterface
 
 class ConnectionManager(
     private val repository: MainRepository,
@@ -13,113 +11,120 @@ class ConnectionManager(
     private val tag = "ConnectionManager"
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var heartbeatJob: Job? = null
+    private var stunJob: Job? = null
 
-    // [MISSION CRITICAL] Redundant STUN Servers
-    private val STUN_SERVERS = listOf(
-        Pair("stun.l.google.com", 19302),
-        Pair("stun.services.mozilla.com", 3478)
-    )
+    @Volatile var isEcoMode = false
+    @Volatile private var lastPublicIp: String = ""
+    @Volatile private var lastPublicPort: Int = 0
 
-    @Volatile private var identifiedPublicPort: Int = 50005
-    @Volatile private var pendingHeartbeatTrigger = false
-    @Volatile var isEcoMode: Boolean = false // [NEW] Eco Mode Toggle
-
+    // [FIX] Store state to allow restarting
     private var activeChannel: String? = null
     private var activeKey: String? = null
 
+    private val localPort = 50005
+
+    // STUN Servers (Lightweight)
+    private val stunServers = listOf(
+        "stun.l.google.com" to 19302,
+        "stun1.l.google.com" to 19302,
+        "stun2.l.google.com" to 19302
+    )
+
     fun updateEcoMode(enabled: Boolean) {
         isEcoMode = enabled
-        if (enabled) {
-            heartbeatJob?.cancel()
-            Log.d(tag, "Eco Mode ON: Heartbeat Stopped")
-        } else {
-            triggerImmediateHeartbeat()
+        // [FIX] Now calls the internal restart function
+        restartHeartbeat()
+    }
+
+    // [FIX] Added missing function
+    private fun restartHeartbeat() {
+        stop()
+        if (activeChannel != null || activeKey != null) {
+            startHeartbeatLoop(activeChannel, activeKey)
         }
     }
 
-    fun triggerImmediateHeartbeat() {
-        startHeartbeatLoop(activeChannel, activeKey, immediate = true)
-    }
-
-    fun startHeartbeatLoop(currentChannel: String?, channelKey: String?, immediate: Boolean = true) {
-        activeChannel = currentChannel
-        activeKey = channelKey
+    fun startHeartbeatLoop(channel: String?, key: String?) {
         heartbeatJob?.cancel()
+        stunJob?.cancel()
 
-        // If Eco Mode is ON, we do not run the loop. We only ping if 'immediate' is requested.
-        if (isEcoMode && !immediate) return
+        // Save for restart logic
+        activeChannel = channel
+        activeKey = key
 
-        heartbeatJob = scope.launch {
-            if (immediate) performHeartbeatSequence()
-
-            // In Eco Mode, we stop here. No background looping.
-            if (isEcoMode) return@launch
-
+        // 1. STUN Loop (Keep NAT Open)
+        stunJob = scope.launch {
             while (isActive) {
-                delay(45_000) // 45s Interval
-                performHeartbeatSequence()
+                try {
+                    val server = stunServers.random()
+                    // [Requirement] StunClient.buildRequest() must exist
+                    val request = StunClient.buildRequest()
+                    networkEngine.send(request, listOf(server.first), server.second)
+                } catch (e: Exception) { Log.e(tag, "STUN send failed", e) }
+                delay(if (isEcoMode) 25000 else 15000)
             }
         }
-    }
 
-    private suspend fun performHeartbeatSequence() {
-        pendingHeartbeatTrigger = true
-        STUN_SERVERS.forEach { server ->
-            val stunReq = StunClient.createBindRequest(server.first, server.second)
-            if (stunReq != null) networkEngine.sendRawPacket(stunReq)
-            delay(50)
-        }
-        delay(500)
-        if (pendingHeartbeatTrigger) {
-            // If STUN failed, send with last known port
-            sendHeartbeatToServer()
-            pendingHeartbeatTrigger = false
+        // 2. Heartbeat Loop (Tell Server where I am)
+        heartbeatJob = scope.launch {
+            while (isActive) {
+                if (lastPublicPort == 0) delay(1000)
+
+                sendHeartbeat(channel, key)
+                delay(if (isEcoMode) 10000 else 2000)
+            }
         }
     }
 
     fun handleStunResponse(data: ByteArray) {
-        val result = StunClient.parseResponse(data)
-        if (result != null) {
-            if (identifiedPublicPort != result.publicPort) {
-                Log.i(tag, "NAT MAPPING CHANGED: Old=$identifiedPublicPort -> New=${result.publicPort}")
-                identifiedPublicPort = result.publicPort
-            }
-            if (pendingHeartbeatTrigger) {
-                pendingHeartbeatTrigger = false
-                scope.launch { sendHeartbeatToServer() }
-            }
-        }
-    }
-
-    private suspend fun sendHeartbeatToServer() {
         try {
-            val token = repository.getToken()
-            if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
-                val localIp = getLocalIpAddress()
-                repository.sendHeartbeat(token, identifiedPublicPort, localIp, activeChannel, activeKey)
+            // [FIX] Safe Call ?.let to handle nullable result
+            val result = StunClient.parseResponse(data)
+            if (result != null) {
+                val (ip, port) = result
+                if (ip.isNotEmpty() && port > 0) {
+                    lastPublicIp = ip
+                    lastPublicPort = port
+                }
             }
         } catch (e: Exception) { }
     }
 
-    fun stop() {
-        heartbeatJob?.cancel()
-        scope.cancel()
+    private suspend fun sendHeartbeat(channel: String?, key: String?) {
+        val token = repository.getToken() ?: return
+        if (token == "OFFLINE_TOKEN") return
+
+        val portToSend = if (lastPublicPort > 0) lastPublicPort else localPort
+        val ipToSend = if (lastPublicIp.isNotEmpty()) lastPublicIp else "0.0.0.0"
+
+        try {
+            repository.sendHeartbeat(token, portToSend, getLocalIp(), channel, key)
+        } catch (e: Exception) { Log.e(tag, "Heartbeat Failed", e) }
     }
 
-    private fun getLocalIpAddress(): String {
+    fun triggerImmediateHeartbeat() {
+        scope.launch { sendHeartbeat(null, null) }
+    }
+
+    fun stop() {
+        heartbeatJob?.cancel()
+        stunJob?.cancel()
+    }
+
+    private fun getLocalIp(): String {
         try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
+            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
             while (interfaces.hasMoreElements()) {
-                val intf = interfaces.nextElement()
-                val addrs = intf.inetAddresses
-                while (addrs.hasMoreElements()) {
-                    val addr = addrs.nextElement()
-                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                val iface = interfaces.nextElement()
+                val addresses = iface.inetAddresses
+                while (addresses.hasMoreElements()) {
+                    val addr = addresses.nextElement()
+                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
                         return addr.hostAddress ?: ""
                     }
                 }
             }
-        } catch (ex: Exception) { }
-        return ""
+        } catch (e: Exception) { }
+        return "127.0.0.1"
     }
 }

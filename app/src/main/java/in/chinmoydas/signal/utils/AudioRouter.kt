@@ -11,15 +11,17 @@ import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.Build
+import android.util.Log
 
 class AudioRouter(private val context: Context) {
 
+    private val tag = "AudioRouter"
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
     // State
     private var isSpeakerPreferred: Boolean = true
     private var isHeadsetPlugged: Boolean = false
-    private var isBluetoothConnected: Boolean = false // NEW
+    private var isBluetoothConnected: Boolean = false
     private var isFocusHeld: Boolean = false
     private var isVoipCallActive: Boolean = false
 
@@ -29,7 +31,9 @@ class AudioRouter(private val context: Context) {
     fun initialize() {
         val filter = IntentFilter().apply {
             addAction(AudioManager.ACTION_HEADSET_PLUG)
-            addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED) // NEW
+            addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED)
+            // [NEW] Listen for the exact moment the Bluetooth Mic opens
+            addAction(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED)
         }
         context.registerReceiver(headsetReceiver, filter)
 
@@ -42,14 +46,34 @@ class AudioRouter(private val context: Context) {
     private val headsetReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
             val action = intent?.action
-            if (action == AudioManager.ACTION_HEADSET_PLUG) {
-                val state = intent.getIntExtra("state", -1)
-                isHeadsetPlugged = (state == 1)
-                updateRoute()
-            } else if (action == BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED) {
-                val state = intent.getIntExtra(BluetoothProfile.EXTRA_STATE, BluetoothProfile.STATE_DISCONNECTED)
-                isBluetoothConnected = (state == BluetoothProfile.STATE_CONNECTED)
-                updateRoute()
+
+            when (action) {
+                AudioManager.ACTION_HEADSET_PLUG -> {
+                    val state = intent.getIntExtra("state", -1)
+                    isHeadsetPlugged = (state == 1)
+                    updateRoute()
+                }
+                BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED -> {
+                    val state = intent.getIntExtra(BluetoothProfile.EXTRA_STATE, BluetoothProfile.STATE_DISCONNECTED)
+                    isBluetoothConnected = (state == BluetoothProfile.STATE_CONNECTED)
+                    updateRoute()
+                }
+                // [NEW] Safety Check for Bluetooth SCO
+                AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED -> {
+                    val state = intent.getIntExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, -1)
+                    if (state == AudioManager.SCO_AUDIO_STATE_CONNECTED) {
+                        Log.d(tag, "Bluetooth SCO Connected. Forcing Voice Mode.")
+                        if (isVoipCallActive) {
+                            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                        }
+                    } else if (state == AudioManager.SCO_AUDIO_STATE_DISCONNECTED) {
+                        Log.d(tag, "Bluetooth SCO Disconnected.")
+                        if (isBluetoothConnected && isVoipCallActive) {
+                            // Try to restart it if we are still in a call
+                            startBluetoothSco()
+                        }
+                    }
+                }
             }
         }
     }
@@ -59,6 +83,7 @@ class AudioRouter(private val context: Context) {
         if (isBluetoothConnected || isHeadsetPlugged) {
             setSpeakerphone(false)
             onRouteChanged?.invoke(false) // Inform UI: "Headset Mode"
+
             if (isBluetoothConnected && isVoipCallActive) {
                 startBluetoothSco()
             }
@@ -68,6 +93,7 @@ class AudioRouter(private val context: Context) {
             stopBluetoothSco()
         }
 
+        // Apply Mode
         if (isVoipCallActive) {
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
         } else {
@@ -77,8 +103,12 @@ class AudioRouter(private val context: Context) {
 
     private fun startBluetoothSco() {
         if (!audioManager.isBluetoothScoOn) {
-            audioManager.startBluetoothSco()
-            audioManager.isBluetoothScoOn = true
+            try {
+                audioManager.startBluetoothSco()
+                audioManager.isBluetoothScoOn = true
+            } catch (e: Exception) {
+                Log.e(tag, "Failed to start Bluetooth SCO: ${e.message}")
+            }
         }
     }
 
