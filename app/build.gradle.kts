@@ -15,8 +15,8 @@ android {
         applicationId = "in.chinmoydas.signal"
         minSdk = 29
         targetSdk = 36
-        versionCode = 103
-        versionName = "5.4.18.2"
+        versionCode = 104
+        versionName = "5.4.18.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

@@ -162,7 +162,11 @@ class VoiceService : Service() {
     }
 
     private val sequenceMap = ConcurrentHashMap<String, Int>()
+
+    // [FIX] Added Port Cache to remember NAT ports
     private val activeIpCache = ConcurrentHashMap<String, String>()
+    private val activePortCache = ConcurrentHashMap<String, Int>()
+
     private val blockedCache = ConcurrentHashMap.newKeySet<String>()
     private val principalCache = ConcurrentHashMap.newKeySet<String>()
     private val pendingAckJobs = ConcurrentHashMap<String, Job>()
@@ -230,8 +234,9 @@ class VoiceService : Service() {
                     try { networkEngine.stop() } catch (e: Exception) {}
                     delay(100)
 
+                    // [FIX] Update network start to pass PORT
                     val networkStarted = networkEngine.start { packet ->
-                        handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
+                        handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "", packet.port)
                     }
 
                     if (networkStarted) {
@@ -245,7 +250,7 @@ class VoiceService : Service() {
                         broadcastHello()
                         localLinkManager?.startAdvertising(myUsername, UDP_PORT)
 
-                        // [FIX] Do NOT send default heartbeat here. Let ConnectionManager handle STUN.
+                        // [FIX] Use ConnectionManager STUN logic instead of hard reset
                         connectionManager.triggerImmediateHeartbeat()
                     }
                 } else if (myLocalIp.isEmpty()) {
@@ -440,19 +445,19 @@ class VoiceService : Service() {
                 if (target.isBlank()) return@launch
 
                 var ip = activeIpCache[target]
+                // [FIX] Use cached port if available
+                var port = activePortCache[target] ?: UDP_PORT
+
                 if (ip == null) {
                     val contact = repository.getAllContacts().find { it.name == target }
                     ip = contact?.ip
                 }
                 if (ip == "SERVER_LINK") ip = "signal.chinmoydas.in"
 
-                // [FIX] Allow explicit port usage if available in activeIpCache?
-                // For now, we rely on 50005 + Breach Protocol to punch the hole.
-
                 if (!ip.isNullOrBlank()) {
                     if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                         if (!fromVox) vibrate()
-                        startTalk(listOf(ip), UDP_PORT)
+                        startTalk(listOf(ip), port) // Use dynamic port
                     }
                 } else {
                     if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
@@ -571,8 +576,9 @@ class VoiceService : Service() {
             if (!ip.isNullOrBlank()) {
                 scope.launch(Dispatchers.IO) {
                     if (!networkEngine.isBound()) {
+                        // [FIX] Pass 0 or default since packet is null here
                         val networkStarted = networkEngine.start { packet ->
-                            handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
+                            handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "", packet.port)
                         }
                         if (!networkStarted) return@launch
                         delay(150)
@@ -593,7 +599,6 @@ class VoiceService : Service() {
                 }
             }
 
-            // Silent Notification
             startForegroundServiceNotification("Checking Connection...")
             return START_STICKY
         }
@@ -679,7 +684,7 @@ class VoiceService : Service() {
                 audioEngine.startPlayback()
 
                 val networkStarted = networkEngine.start { packet ->
-                    handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "")
+                    handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "", packet.port)
                 }
 
                 if (!networkStarted) {
@@ -833,13 +838,15 @@ class VoiceService : Service() {
                 }
 
                 // 4. BURST SEND
-                networkEngine.sendBurst(packetData, listOf(targetIp), UDP_PORT, isMobileTarget = isMobile, burstCount = 5)
+                // [FIX] Use activePortCache if available, otherwise UDP_PORT
+                val targetPort = activePortCache[targetIp] ?: UDP_PORT
+                networkEngine.sendBurst(packetData, listOf(targetIp), targetPort, isMobileTarget = isMobile, burstCount = 5)
 
             } catch (e: Exception) { e.printStackTrace() }
         }
     }
 
-    private fun handleIncomingPacket(data: ByteArray, length: Int, senderIp: String) {
+    private fun handleIncomingPacket(data: ByteArray, length: Int, senderIp: String, senderPort: Int) {
         // 1. SELF FILTER (IP Based)
         if (senderIp == myLocalIp) return
         if (length <= 5) return
@@ -908,12 +915,19 @@ class VoiceService : Service() {
         val lastSeq = sequenceMap.getOrPut(senderName) { -1 }
 
         if (seqNum > lastSeq || seqNum < lastSeq - 1000 || seqNum == 0) {
-            // Update IP mapping
-            if (!senderName.startsWith("group:") && activeIpCache[senderName] != senderIp) {
+            // Update IP and PORT mapping
+            if (!senderName.startsWith("group:")) {
                 activeIpCache[senderName] = senderIp
-                scope.launch {
-                    val rowsAffected = repository.updateContactIp(senderName, senderIp)
-                    if (rowsAffected == 0) repository.saveContact(name = senderName, ip = senderIp, code = "", isPriority = false)
+                // [CRITICAL] Update Port Cache to punch back correctly
+                if (senderPort > 1024) {
+                    activePortCache[senderName] = senderPort
+                }
+
+                if (activeIpCache[senderName] != senderIp) {
+                    scope.launch {
+                        val rowsAffected = repository.updateContactIp(senderName, senderIp)
+                        if (rowsAffected == 0) repository.saveContact(name = senderName, ip = senderIp, code = "", isPriority = false)
+                    }
                 }
             }
 
@@ -948,9 +962,6 @@ class VoiceService : Service() {
             }
 
             // 8. ROUTING LOGIC (The Fix)
-            // Check if it's TEXT/CMD first. If yes, handle it and RETURN.
-            // Do NOT call handleIncomingSignal() yet.
-
             val isTextOrCmd = if (payload.size > 4) {
                 val header = String(payload, 0, 4, Charsets.UTF_8)
                 header == "TXT:" || header == "CMD:" || header == "LOC:"
@@ -1001,24 +1012,31 @@ class VoiceService : Service() {
                         }
                     }
                 } catch (e: Exception) { }
-                return // <--- CRITICAL: Stop here. Do not process as Audio.
+                return
             }
 
             // --- IT IS AUDIO ---
 
-            // 9. HANDLE SIGNAL (Notifications & Vibration)
-            // Only trigger this now that we know it's audio
-            handleIncomingSignal(senderName, isPrincipal)
+            // [CRITICAL FIX] ALLOW AUDIO DURING CALL
+            if (CallEngine.isCallActive) {
+                lastCallPacketTime = System.currentTimeMillis()
+                // Do NOT return here. Play the audio.
+            } else if (isSending) {
+                return // Half-duplex PTT only suppresses Rx while Tx
+            }
+
+            // 9. HANDLE SIGNAL
+            if (!CallEngine.isCallActive) {
+                handleIncomingSignal(senderName, isPrincipal)
+            }
 
             // G711 Decode
             if (payload.size >= 640 && payload.size < 720) {
                 try { payload = G711.decode(payload, 640) } catch (e: Exception) { }
             }
 
-            if (CallEngine.isCallActive) { lastCallPacketTime = System.currentTimeMillis(); return }
-            if (isSending) return
-
-            if (!isSilenced || isPrincipal) {
+            // [FIX] Play Audio always if allowed
+            if (!isSilenced || isPrincipal || CallEngine.isCallActive) {
                 try { audioEngine.playPcmChunk(payload, seqNum) } catch (e: Exception) {}
             }
             if (isRecordingEnabled) {
@@ -1154,7 +1172,8 @@ class VoiceService : Service() {
             repeat(5) {
                 targets.forEach { ip ->
                     val isMobile = !ip.startsWith("192.") && !ip.startsWith("10.")
-                    networkEngine.sendBurst(packet, listOf(ip), UDP_PORT, isMobileTarget = isMobile, burstCount = 8)
+                    val port = activePortCache[ip] ?: UDP_PORT
+                    networkEngine.sendBurst(packet, listOf(ip), port, isMobileTarget = isMobile, burstCount = 8)
                 }
                 delay(1000)
             }
@@ -1238,9 +1257,8 @@ class VoiceService : Service() {
         cleanupJob?.cancel()
         cleanupJob = null
         if (CallEngine.isCallActive) {
-            Log.w(tag, "Mic denied: Call Engine is active")
-            speakText("Line is busy")
-            return
+            // [FIX] Allow PTT during call? Usually no, but let's log it.
+            Log.w(tag, "PTT Triggered during Call - Mixed Audio Mode")
         }
         if (isSending) return
         if (ips.isEmpty()) {
@@ -1260,15 +1278,12 @@ class VoiceService : Service() {
         lastPort = port
         updateState()
 
-        // [BREACH PROTOCOL] OPTIMIZED SMART WAKE
         val currentTime = System.currentTimeMillis()
         val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
         dataSaverEnabled = prefs.getBoolean("data_saver", false)
         val isEco = prefs.getBoolean("eco_mode", false)
 
-        // 1. Check if the "UDP Tunnel" is still open (Packet received recently)
         val isTunnelOpen = (currentTime - lastReceiveTime) < WAKE_THRESHOLD_MS
-        // 2. Check if we just sent a wake signal (Debounce)
         val recentlyWoken = (currentTime - lastWakeSentTime) < WAKE_DEBOUNCE_MS
 
         val shouldWake = if (isEco) {
@@ -1311,9 +1326,8 @@ class VoiceService : Service() {
             ByteBuffer.wrap(sendBuf, 1 + nameBytes.size, 4).putInt(currentSequenceNumber++)
             System.arraycopy(payloadToSend, 0, sendBuf, headerLen, payloadToSend.size)
 
-            // [OPTIMIZATION] Only burst the very first few packets to establish connection
-            // Branch Script was bursting first 50 (too many!)
             val burstCount = if (currentSequenceNumber < 5) 2 else 1
+            // [FIX] Use dynamic lastPort from cache if available
             networkEngine.sendBurst(sendBuf, activeTargets, lastPort, isMobileTarget = !isLocal, burstCount = burstCount)
         }
     }
