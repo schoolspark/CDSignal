@@ -6,12 +6,13 @@ import android.media.audiofx.*
 import android.os.Process
 import android.util.Log
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentSkipListMap
 import javax.crypto.spec.SecretKeySpec
+import kotlin.math.abs
 
 object CallEngine {
 
@@ -19,7 +20,11 @@ object CallEngine {
     private const val SAMPLE_RATE = 16000
     private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
 
-    // [BREACH PROTOCOL] Ports to spray to ensure connection
+    // [TUNING] Carrier Grade Settings
+    private const val JITTER_BUFFER_MS = 60 // 60ms "Waiting Room" to fix ordering
+    private const val PACKET_INTERVAL_MS = 20 // Send audio every 20ms
+
+    // [BREACH PROTOCOL]
     private const val CALL_PORT = 50006
     private val TARGET_PORTS = listOf(50006, 50005, 50007)
 
@@ -35,44 +40,50 @@ object CallEngine {
         private set
 
     @Volatile private var targetAddress: InetAddress? = null
+    @Volatile private var activeTargetPort: Int = CALL_PORT
     private var activeSecretKey: SecretKeySpec? = null
 
     private var recordJob: Job? = null
     private var playJob: Job? = null
+    private var netJob: Job? = null
     private var punchJob: Job? = null
 
-    private val _muteStatus = MutableStateFlow(false)
-    val muteStatus: StateFlow<Boolean> = _muteStatus.asStateFlow()
+    private val _muteStatus = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+    // [JITTER BUFFER] Sorts packets by Sequence Number automatically
+    private val jitterBuffer = ConcurrentSkipListMap<Int, ByteArray>()
+
+    // [FEC] Redundancy Cache
+    @Volatile private var previousFrame: ByteArray? = null
 
     @SuppressLint("MissingPermission")
     fun startCall(ip: String, secretKey: SecretKeySpec? = null) {
         if (isCallActive) return
-        Log.d(TAG, "BREACH: Starting VoIP Engine to $ip")
+        Log.d(TAG, "STARTING CARRIER GRADE VOIP -> $ip")
 
+        // Reset State
+        activeTargetPort = CALL_PORT
         updateTargetIp(ip)
         activeSecretKey = secretKey
-
         isCallActive = true
         _muteStatus.value = false
+        jitterBuffer.clear()
+        previousFrame = null
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                // 1. Setup Network (Robust Bind)
-                val socket = try {
-                    DatagramSocket(CALL_PORT).apply {
-                        reuseAddress = true
-                        soTimeout = 2000 // 2s read timeout
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Port 50006 busy, trying random port")
-                    DatagramSocket().apply { soTimeout = 2000 }
+                // 1. Networking (Aggressive Timeout)
+                callSocket = DatagramSocket(CALL_PORT).apply {
+                    reuseAddress = true
+                    soTimeout = 1000 // 1s disconnect timeout
+                    receiveBufferSize = 64 * 1024 // Large OS buffer
                 }
-                callSocket = socket
 
-                // [BREACH PROTOCOL] IMMEDIATE HOLE PUNCH
                 punchHole(ip)
 
-                // 2. Init Audio Hardware
+                // 2. Audio Hardware (Low Latency Mode)
+                // Calculate precise buffer size for 20ms chunks
+                val frameSize = (SAMPLE_RATE * PACKET_INTERVAL_MS / 1000) * 2 // 16-bit = 2 bytes
                 val minBufRec = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AUDIO_FORMAT) * 2
                 val minBufTrack = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AUDIO_FORMAT) * 2
 
@@ -81,7 +92,7 @@ object CallEngine {
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_OUT_MONO,
                     AUDIO_FORMAT,
-                    minBufTrack,
+                    maxOf(minBufTrack, frameSize * 4), // Ensure track has breathing room
                     AudioTrack.MODE_STREAM
                 )
                 audioTrack = track
@@ -91,33 +102,192 @@ object CallEngine {
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,
                     AUDIO_FORMAT,
-                    minBufRec
+                    maxOf(minBufRec, frameSize * 2)
                 )
                 audioRecord = record
 
-                if (!isCallActive) { stopCall(); return@launch }
-
                 if (record.state != AudioRecord.STATE_INITIALIZED || track.state != AudioTrack.STATE_INITIALIZED) {
-                    throw Exception("Audio hardware init failed")
+                    throw Exception("Hardware Init Failed")
                 }
 
-                // 3. Effects
-                val sessionId = record.audioSessionId
-                if (AcousticEchoCanceler.isAvailable()) aec = AcousticEchoCanceler.create(sessionId)?.apply { enabled = true }
-                if (NoiseSuppressor.isAvailable()) ns = NoiseSuppressor.create(sessionId)?.apply { enabled = true }
-                if (AutomaticGainControl.isAvailable()) agc = AutomaticGainControl.create(sessionId)?.apply { enabled = true }
+                // 3. Audio Effects (Critical for Speakerphone)
+                val sId = record.audioSessionId
+                if (AcousticEchoCanceler.isAvailable()) aec = AcousticEchoCanceler.create(sId)?.apply { enabled = true }
+                if (NoiseSuppressor.isAvailable()) ns = NoiseSuppressor.create(sId)?.apply { enabled = true }
+                if (AutomaticGainControl.isAvailable()) agc = AutomaticGainControl.create(sId)?.apply { enabled = true }
 
-                // 4. Start Loops
-                track.play()
                 record.startRecording()
+                track.play()
 
-                startSendingLoop(minBufRec)
-                startReceivingLoop(minBufTrack)
-                startKeepAliveLoop() // Keep NAT open during silence
+                // 4. Start Triple-Thread Architecture
+                startMicrophoneLoop(frameSize)   // Thread A: Capture & Send
+                startNetworkLoop()               // Thread B: Receive & Sort
+                startSpeakerLoop(frameSize)      // Thread C: De-Jitter & Play
 
             } catch (e: Exception) {
-                Log.e(TAG, "Engine Crash: ${e.message}")
+                Log.e(TAG, "Startup Crash: ${e.message}")
                 stopCall()
+            }
+        }
+    }
+
+    // --- THREAD A: MICROPHONE & SENDER (With Redundancy) ---
+    private fun startMicrophoneLoop(frameSize: Int) {
+        recordJob = CoroutineScope(Dispatchers.IO).launch {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+            val rawBuffer = ShortArray(frameSize / 2)
+            var seqNumber = 0
+
+            while (isActive && isCallActive) {
+                // [FIX] Capture volatile address locally as InetAddress?
+                // This prevents the 'Any' type mismatch error
+                val currentAddress: InetAddress? = targetAddress
+
+                if (currentAddress == null) {
+                    delay(50)
+                    continue
+                }
+
+                if (_muteStatus.value) {
+                    delay(20)
+                } else {
+                    val read = audioRecord?.read(rawBuffer, 0, rawBuffer.size) ?: 0
+                    if (read > 0) {
+                        // 1. Compress Current Frame
+                        val currentEncoded = G711.encode(rawBuffer, read)
+
+                        // 2. Get Previous Frame (for Redundancy)
+                        val prevEncoded = previousFrame ?: ByteArray(0)
+                        previousFrame = currentEncoded // Save current for next loop
+
+                        // 3. Send Both (Packet = [Header][Current][Previous])
+                        sendPacket(currentEncoded, prevEncoded, seqNumber++, currentAddress)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun sendPacket(current: ByteArray, previous: ByteArray, seq: Int, address: InetAddress) {
+        try {
+            // Payload = [Len_Cur(2)][Current_Data][Previous_Data]
+            val payload = ByteBuffer.allocate(2 + current.size + previous.size)
+                .putShort(current.size.toShort())
+                .put(current)
+                .put(previous)
+                .array()
+
+            // Encrypt
+            val key = activeSecretKey
+            val encrypted = if (key != null) CryptoEngine.encrypt(payload, seq, key) ?: payload else payload
+
+            // Header = [Seq(4)][Encrypted_Payload]
+            val packetData = ByteBuffer.allocate(4 + encrypted.size)
+                .putInt(seq)
+                .put(encrypted)
+                .array()
+
+            callSocket?.send(DatagramPacket(packetData, packetData.size, address, activeTargetPort))
+        } catch (e: Exception) {}
+    }
+
+    // --- THREAD B: NETWORK RECEIVER (Packet Sorting) ---
+    private fun startNetworkLoop() {
+        netJob = CoroutineScope(Dispatchers.IO).launch {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+            val buffer = ByteArray(4096)
+            val p = DatagramPacket(buffer, buffer.size)
+
+            while (isActive && isCallActive) {
+                try {
+                    callSocket?.receive(p)
+                    if (p.length < 4) continue
+
+                    // [LATCHING] Fixes Mobile Data NAT issues
+                    if (p.port != activeTargetPort) activeTargetPort = p.port
+
+                    val wrapped = ByteBuffer.wrap(p.data, 0, p.length)
+                    val seq = wrapped.int // Header
+
+                    val payloadLen = p.length - 4
+                    val encrypted = ByteArray(payloadLen)
+                    wrapped.get(encrypted)
+
+                    val key = activeSecretKey
+                    val decrypted = if (key != null) CryptoEngine.decrypt(encrypted, seq, key) else encrypted
+
+                    if (decrypted != null) {
+                        // DECODE HYBRID PACKET
+                        val bb = ByteBuffer.wrap(decrypted)
+                        val curLen = bb.short.toInt()
+
+                        val currentFrame = ByteArray(curLen)
+                        bb.get(currentFrame)
+
+                        val prevLen = decrypted.size - 2 - curLen
+                        val prevFrame = ByteArray(maxOf(0, prevLen))
+                        if (prevLen > 0) bb.get(prevFrame)
+
+                        // [CRITICAL] Insert into Jitter Buffer
+                        // 1. Add Current Frame
+                        if (!jitterBuffer.containsKey(seq)) {
+                            jitterBuffer[seq] = currentFrame
+                        }
+
+                        // 2. Recover LOST Previous Frame (FEC)
+                        // If we missed packet (seq-1), we restore it now from this packet's backup!
+                        if (seq > 0 && !jitterBuffer.containsKey(seq - 1) && prevFrame.isNotEmpty()) {
+                            Log.w(TAG, "FEC: Recovered lost packet ${seq - 1} using redundancy")
+                            jitterBuffer[seq - 1] = prevFrame
+                        }
+                    }
+                } catch (e: Exception) {
+                    // Socket Timeout is normal, just loop
+                }
+            }
+        }
+    }
+
+    // --- THREAD C: SPEAKER LOOP (De-Jitter & Play) ---
+    private fun startSpeakerLoop(frameSize: Int) {
+        playJob = CoroutineScope(Dispatchers.IO).launch {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+
+            var nextSeqToPlay = -1
+            var buffering = true
+
+            while (isActive && isCallActive) {
+                // Initial Buffering (Wait for 3 packets)
+                if (buffering) {
+                    if (jitterBuffer.size >= 3) {
+                        buffering = false
+                        nextSeqToPlay = jitterBuffer.firstKey()
+                    } else {
+                        delay(10)
+                        continue
+                    }
+                }
+
+                // Check if we have the next packet
+                val data = jitterBuffer.remove(nextSeqToPlay)
+
+                if (data != null) {
+                    // Packet Found! Decode G711 -> PCM
+                    val pcm = G711.decode(data, data.size)
+                    audioTrack?.write(pcm, 0, pcm.size)
+                    nextSeqToPlay++
+                } else {
+                    // Packet Missing (Even after FEC recovery)
+                    // Check if we fell too far behind (Latency catch-up)
+                    if (jitterBuffer.isNotEmpty() && jitterBuffer.firstKey() > nextSeqToPlay + 10) {
+                        // We are 10 packets behind -> Jump ahead
+                        nextSeqToPlay = jitterBuffer.firstKey()
+                    } else {
+                        // Genuine network gap -> Wait briefly (Concealment) or Silence
+                        // Ideally write comfort noise here, but silence is okay for now
+                        delay(5)
+                    }
+                }
             }
         }
     }
@@ -127,18 +297,15 @@ object CallEngine {
             try {
                 val address = InetAddress.getByName(targetIp)
                 val dummy = "HOLE_PUNCH".toByteArray()
-                Log.d(TAG, "BREACH: Spraying packets to $targetIp")
-
-                repeat(10) {
+                repeat(15) {
                     TARGET_PORTS.forEach { port ->
                         try {
-                            val p = DatagramPacket(dummy, dummy.size, address, port)
-                            callSocket?.send(p)
+                            callSocket?.send(DatagramPacket(dummy, dummy.size, address, port))
                         } catch (e: Exception) {}
                     }
-                    delay(50)
+                    delay(40)
                 }
-            } catch (e: Exception) { Log.e(TAG, "Punch failed: ${e.message}") }
+            } catch (e: Exception) {}
         }
     }
 
@@ -146,118 +313,23 @@ object CallEngine {
         try {
             targetAddress = InetAddress.getByName(newIp)
             if (isCallActive) punchHole(newIp)
-        } catch (e: Exception) { Log.e(TAG, "Invalid IP: $newIp") }
-    }
-
-    // [FIXED] Type Mismatch solved here
-    private fun startSendingLoop(bufSize: Int) {
-        recordJob = CoroutineScope(Dispatchers.IO).launch {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-            val buffer = ByteArray(bufSize)
-            var seqNumber = 0
-
-            while (isActive && isCallActive) {
-                // Explicit check prevents 'Any' type inference error
-                val address = targetAddress
-                if (address == null) {
-                    delay(100)
-                    continue
-                }
-
-                if (_muteStatus.value) {
-                    delay(100)
-                } else {
-                    val read = audioRecord?.read(buffer, 0, bufSize) ?: 0
-                    if (read > 0) {
-                        val payload = buffer.copyOfRange(0, read)
-                        sendPacket(payload, seqNumber++, address)
-                    }
-                }
-            }
-        }
-    }
-
-    private fun startKeepAliveLoop() {
-        CoroutineScope(Dispatchers.IO).launch {
-            val keepAlive = ByteArray(1)
-            var seq = -1
-            while (isActive && isCallActive) {
-                val address = targetAddress
-                if (address != null) {
-                    sendPacket(keepAlive, seq--, address)
-                }
-                delay(500)
-            }
-        }
-    }
-
-    private fun sendPacket(data: ByteArray, seq: Int, address: InetAddress) {
-        try {
-            val key = activeSecretKey
-            val packetData = if (key != null) CryptoEngine.encrypt(data, seq, key) ?: data else data
-
-            val finalBuf = ByteBuffer.allocate(4 + packetData.size)
-                .putInt(seq)
-                .put(packetData)
-                .array()
-
-            callSocket?.send(DatagramPacket(finalBuf, finalBuf.size, address, CALL_PORT))
-        } catch (e: Exception) { }
-    }
-
-    private fun startReceivingLoop(bufSize: Int) {
-        playJob = CoroutineScope(Dispatchers.IO).launch {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-            val receiveBuffer = ByteArray(bufSize + 200)
-            val packet = DatagramPacket(receiveBuffer, receiveBuffer.size)
-
-            while (isActive && isCallActive) {
-                try {
-                    callSocket?.receive(packet)
-                    if (packet.length < 4) continue
-
-                    val wrapped = ByteBuffer.wrap(packet.data, 0, packet.length)
-                    val seq = wrapped.int
-
-                    if (seq < 0 || packet.length <= 4) continue
-
-                    val payloadLen = packet.length - 4
-                    val payload = ByteArray(payloadLen)
-                    wrapped.get(payload)
-
-                    val key = activeSecretKey
-                    val audioData = if (key != null) CryptoEngine.decrypt(payload, seq, key) else payload
-
-                    if (audioData != null) {
-                        audioTrack?.write(audioData, 0, audioData.size)
-                    }
-                } catch (e: Exception) { }
-            }
-        }
+        } catch (e: Exception) {}
     }
 
     fun toggleMute() { _muteStatus.value = !_muteStatus.value }
 
     fun stopCall() {
-        if (!isCallActive) return
-        Log.d(TAG, "Stopping Call Engine")
-
         isCallActive = false
         _muteStatus.value = false
         targetAddress = null
         activeSecretKey = null
+        previousFrame = null
+        jitterBuffer.clear()
 
-        recordJob?.cancel()
-        playJob?.cancel()
-        punchJob?.cancel()
+        recordJob?.cancel(); playJob?.cancel(); netJob?.cancel(); punchJob?.cancel()
 
         try { callSocket?.close() } catch (e: Exception) {}
-        callSocket = null
         try { audioRecord?.stop(); audioRecord?.release() } catch (e: Exception) {}
-        audioRecord = null
         try { audioTrack?.stop(); audioTrack?.release() } catch (e: Exception) {}
-        audioTrack = null
-        try { aec?.release(); ns?.release(); agc?.release() } catch (e: Exception) {}
-        aec = null; ns = null; agc = null
     }
 }

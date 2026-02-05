@@ -23,10 +23,12 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
@@ -43,6 +45,7 @@ import `in`.chinmoydas.signal.data.MainRepository
 import `in`.chinmoydas.signal.screens.*
 import `in`.chinmoydas.signal.ui.theme.CDSignalTheme
 import `in`.chinmoydas.signal.utils.CallSignaling
+import `in`.chinmoydas.signal.utils.CallStatus
 import `in`.chinmoydas.signal.viewmodel.ViewModelFactory
 import `in`.chinmoydas.signal.viewmodel.WalkieViewModel
 import kotlinx.coroutines.Dispatchers
@@ -52,7 +55,6 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
-    // [FIX] Static flag to prevent double-prompting the battery permission
     companion object {
         private var hasAskedBattery = false
     }
@@ -69,7 +71,6 @@ class MainActivity : ComponentActivity() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action == "in.chinmoydas.signal.ACTION_EXIT") {
                 Log.d("MainActivity", "Received Exit Signal. Closing App.")
-                // [LIFECYCLE FIX] This is the ONLY place we kill the Activity
                 finishAffinity()
             }
         }
@@ -82,8 +83,6 @@ class MainActivity : ComponentActivity() {
             voiceService = boundService
             isBound = true
             serviceBoundState.value = boundService
-
-            // Link Logic safely here
             linkServiceLogic(boundService)
         }
 
@@ -98,10 +97,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Initialize Signaling
         CallSignaling.initialize(applicationContext)
 
-        // [FIX] WhatsApp-Style Lock Screen Bypass
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
@@ -131,7 +128,6 @@ class MainActivity : ComponentActivity() {
 
         checkBatteryOptimizations()
 
-        // [CRITICAL] Auto-start radio if permissions exist
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             startAndBindService()
         }
@@ -142,9 +138,7 @@ class MainActivity : ComponentActivity() {
         )
 
         lifecycleScope.launch {
-            val repository = withContext(Dispatchers.IO) {
-                MainRepository(applicationContext)
-            }
+            val repository = withContext(Dispatchers.IO) { MainRepository(applicationContext) }
             val factory = ViewModelFactory(repository)
 
             setContent {
@@ -152,8 +146,19 @@ class MainActivity : ComponentActivity() {
                     var startDest by remember { mutableStateOf<String?>(null) }
                     val currentService by serviceBoundState
 
+                    // [UPGRADE] Observe Call Status for Global Overlay Logic
+                    val callStatus by CallSignaling.callStatus.collectAsState()
+                    var isCallMinimized by remember { mutableStateOf(false) }
+
                     val serviceState by currentService?.voiceServiceState?.collectAsState(initial = VoiceServiceState())
                         ?: remember { mutableStateOf(VoiceServiceState()) }
+
+                    // Reset minimize state when call ends
+                    LaunchedEffect(callStatus) {
+                        if (callStatus == CallStatus.Idle) {
+                            isCallMinimized = false
+                        }
+                    }
 
                     LaunchedEffect(Unit) {
                         val prefs = withContext(Dispatchers.IO) {
@@ -164,9 +169,7 @@ class MainActivity : ComponentActivity() {
 
                     LaunchedEffect(startDest) {
                         if (startDest == "home") {
-                            lifecycleScope.launch(Dispatchers.IO) {
-                                repository.syncFcmTokenToServer()
-                            }
+                            lifecycleScope.launch(Dispatchers.IO) { repository.syncFcmTokenToServer() }
                         }
                     }
 
@@ -174,17 +177,14 @@ class MainActivity : ComponentActivity() {
                         val navController = rememberNavController()
                         walkieViewModel = ViewModelProvider(this@MainActivity, factory)[WalkieViewModel::class.java]
 
-                        // Double-check linkage if service connects while UI is initializing
                         LaunchedEffect(currentService) {
-                            if (currentService != null) {
-                                linkServiceLogic(currentService!!)
-                            }
+                            if (currentService != null) linkServiceLogic(currentService!!)
                         }
 
                         val currentName by repository.myUsername.collectAsState()
-
                         LaunchedEffect(intent) { handleIntent(intent) }
 
+                        // 1. MAIN APP NAVIGATION
                         NavHost(navController = navController, startDestination = startDest!!) {
                             composable("login") { LoginScreen(navController, getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)) }
                             composable("help") { HelpScreen(navController) }
@@ -212,13 +212,46 @@ class MainActivity : ComponentActivity() {
                             contact?.name ?: if (walkieViewModel.getCurrentTargetIp() == ip) walkieViewModel.targetUser else ip
                         }
 
-                        CallOverlay(
-                            nameResolver = nameResolverHelper,
-                            onSpeakerToggle = { currentService?.toggleSpeaker(!serviceState.isSpeakerOn) },
-                            isSpeakerOn = serviceState.isSpeakerOn
-                        )
-
+                        // 2. SAFETY OVERLAYS (SOS/Location) - Always on top
                         SafetyOverlay(nameResolver = nameResolverHelper)
+
+                        // 3. Updated Call UI Logic.
+
+                        if (callStatus != CallStatus.Idle) {
+                            if (!isCallMinimized) {
+                                // A. Full Screen Call UI
+                                CallScreen(
+                                    nameResolver = nameResolverHelper,
+                                    onSpeakerToggle = { currentService?.toggleSpeaker(!serviceState.isSpeakerOn) },
+                                    isSpeakerOn = serviceState.isSpeakerOn,
+
+                                    // Red Button (End/Decline)
+                                    onHangup = {
+                                        walkieViewModel.hangUp(currentService)
+                                    },
+
+                                    // [NEW] Green Button (Accept Incoming)
+                                    onAccept = {
+                                        lifecycleScope.launch {
+                                            `in`.chinmoydas.signal.utils.CallSignaling.acceptCall()
+                                        }
+                                    },
+
+                                    onMinimize = { isCallMinimized = true } // Down Arrow
+                                )
+                            } else {
+                                // B. Mini Bar (Floating over Map/Home)
+                                Box(modifier = Modifier.fillMaxSize()) {
+                                    MiniCallBar(
+                                        modifier = Modifier
+                                            .align(Alignment.TopCenter)
+                                            .padding(top = 48.dp, start = 16.dp, end = 16.dp), // Avoid Status Bar
+                                        status = callStatus,
+                                        onReturnToCall = { isCallMinimized = false } // Maximizes Screen
+                                    )
+                                }
+                            }
+                        }
 
                     } else {
                         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -282,8 +315,6 @@ class MainActivity : ComponentActivity() {
         appUpdateManager.completeUpdate()
     }
 
-    // [FIX] Cleaned up: Removed redundant CallSignaling listener
-    // The VoiceService now handles audio/call mode directly.
     private fun linkServiceLogic(service: VoiceService) {
         if (!::walkieViewModel.isInitialized) return
 
@@ -306,8 +337,6 @@ class MainActivity : ComponentActivity() {
         val autoChannel = intent?.getStringExtra("auto_connect_channel")
         val isCloudWake = intent?.getBooleanExtra("is_cloud_wake", false) == true
         val wokenBy = intent?.getStringExtra("woken_by")
-
-        // [FIX] Detect if this launch is for an Incoming Voice Call
         val isCall = intent?.getBooleanExtra("is_call", false) == true
 
         if (::walkieViewModel.isInitialized) {
@@ -318,7 +347,6 @@ class MainActivity : ComponentActivity() {
                 walkieViewModel.setTarget(autoChannel)
             }
 
-            // [FIX] If this is a Call, force the screen to stay on so it doesn't sleep while ringing
             if (isCall) {
                 window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             }
@@ -326,18 +354,14 @@ class MainActivity : ComponentActivity() {
             intent?.removeExtra("auto_connect_channel")
             intent?.removeExtra("is_cloud_wake")
             intent?.removeExtra("woken_by")
-            // Don't remove "is_call" immediately if other components need it,
-            // but usually safe to remove here if only used for flags.
             intent?.removeExtra("is_call")
         }
     }
 
     private fun checkBatteryOptimizations() {
         if (hasAskedBattery) return
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-
             if (!pm.isIgnoringBatteryOptimizations(packageName)) {
                 hasAskedBattery = true
                 try {
@@ -376,8 +400,6 @@ class MainActivity : ComponentActivity() {
             action = "STOP_SERVICE"
         }
         startService(stopIntent)
-
-        // UI closes immediately, service cleans up in background
         finishAffinity()
     }
 

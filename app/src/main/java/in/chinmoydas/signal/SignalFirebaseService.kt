@@ -1,6 +1,5 @@
 package `in`.chinmoydas.signal
 
-import android.app.ActivityManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -55,25 +54,23 @@ class SignalFirebaseService : FirebaseMessagingService() {
         val data = remoteMessage.data
         if (data["action"] == "WAKE_RADIO") {
             val sender = data["sender"] ?: "Unknown"
-
-            // [BREACH PROTOCOL] Extract Sender Network Info
             val senderIp = data["sender_ip"]
             val senderPort = data["sender_port"]?.toIntOrNull() ?: 50005
 
             Log.d(tag, "Wake Signal from $sender ($senderIp:$senderPort)")
 
+            // Acquire temporary lock just to process this logic
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
             val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Signal:CloudWakeLock")
-            wakeLock.acquire(10 * 1000L)
+            wakeLock.acquire(5 * 1000L) // 5s timeout is enough to launch service
 
-            // Trigger "Punch Back"
             startVoiceServiceForPunchBack(sender, senderIp, senderPort)
         }
     }
 
     private fun startVoiceServiceForPunchBack(sender: String, ip: String?, port: Int) {
         val intent = Intent(this, VoiceService::class.java).apply {
-            action = "ACTION_PUNCH_BACK" // [NEW] Special Intent
+            action = "ACTION_PUNCH_BACK"
             putExtra("target_ip", ip)
             putExtra("target_port", port)
             putExtra("sender_name", sender)
@@ -87,39 +84,9 @@ class SignalFirebaseService : FirebaseMessagingService() {
                 startService(intent)
             }
         } catch (e: Exception) {
-            Log.e(tag, "Failed to start service: ${e.message}")
+            // [FIX] Android 12+ "ForegroundServiceStartNotAllowedException"
+            Log.e(tag, "Background Start Failed: ${e.message}. Posting Fallback Notification.")
             postFallbackNotification(sender)
-        }
-    }
-
-    private fun isAppInForeground(): Boolean {
-        val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        val appProcesses = activityManager.runningAppProcesses ?: return false
-        val packageName = packageName
-        for (appProcess in appProcesses) {
-            if (appProcess.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND &&
-                appProcess.processName == packageName) {
-                return true
-            }
-        }
-        return false
-    }
-
-    private fun startVoiceServiceDirectly(sender: String) {
-        val intent = Intent(this, VoiceService::class.java).apply {
-            action = "START_SERVICE"
-            putExtra("is_cloud_wake", true)
-            putExtra("woken_by", sender)
-        }
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(intent)
-            } else {
-                startService(intent)
-            }
-        } catch (e: Exception) {
-            Log.e(tag, "Service Start Failed: ${e.message}")
-            postFallbackNotification(sender) // Fail-safe
         }
     }
 
@@ -127,22 +94,23 @@ class SignalFirebaseService : FirebaseMessagingService() {
         val channelId = "cd_signal_wake"
         val manager = getSystemService(NotificationManager::class.java)
 
-        // Create High Importance Channel (Bypasses Do Not Disturb if possible)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(channelId, "Wake Alerts", NotificationManager.IMPORTANCE_HIGH).apply {
                 description = "Incoming Call Alerts"
                 enableVibration(true)
                 lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
+                // [FIX] Ensure sound plays even in Do Not Disturb if allowed
+                setBypassDnd(true)
             }
             manager.createNotificationChannel(channel)
         }
 
-        // PendingIntent that launches MainActivity
         val intent = Intent(this, MainActivity::class.java).apply {
-            // These flags ensure a fresh task if the app was killed
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra("is_cloud_wake", true)
             putExtra("woken_by", sender)
+            // [FIX] Pass "is_call" so MainActivity keeps screen on
+            putExtra("is_call", true)
         }
 
         val pendingIntent = PendingIntent.getActivity(
@@ -153,14 +121,15 @@ class SignalFirebaseService : FirebaseMessagingService() {
         )
 
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Incoming Radio Call")
-            .setContentText("$sender is calling...")
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setPriority(NotificationCompat.PRIORITY_HIGH) // for pre-Oreo
+            .setContentTitle("Incoming Signal")
+            .setContentText("$sender is transmitting...")
+            // [FIX] Use your own icon, system icons are unsafe
+            .setSmallIcon(R.mipmap.ic_launcher_foreground)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_CALL)
-            .setFullScreenIntent(pendingIntent, true) // <--- THIS WAKES THE DEVICE
+            .setFullScreenIntent(pendingIntent, true)
             .setAutoCancel(true)
-            .setTimeoutAfter(30000) // Auto-dismiss if ignored
+            .setTimeoutAfter(30000)
             .build()
 
         manager.notify(999, notification)

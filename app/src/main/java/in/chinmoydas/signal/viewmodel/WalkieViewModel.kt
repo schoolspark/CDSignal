@@ -21,6 +21,8 @@ import `in`.chinmoydas.signal.data.CallLog
 import `in`.chinmoydas.signal.data.MainRepository
 import `in`.chinmoydas.signal.data.PagerEntry
 import `in`.chinmoydas.signal.utils.LocalLinkManager
+import `in`.chinmoydas.signal.utils.CallSignaling
+import `in`.chinmoydas.signal.utils.CallStatus
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
@@ -443,12 +445,39 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     }
 
     fun hangUp(service: VoiceService?) {
+        // 1. Reset PTT UI to default
         _uiState.value = if (targetUser.isNotEmpty()) UiState.Connected(targetUser) else UiState.Ready
-        if (service == null) return
-        val state = service.voiceServiceState.value
-        if (state.isTransmitting) service.stopTalk()
-        else if (state.incomingCall != null) service.sendRemoteHangup()
-        else service.stopReceiving()
+
+        // 2. Handle VoIP (Priority)
+        // Check if we are in the middle of a Phone Call
+        val callState = `in`.chinmoydas.signal.utils.CallSignaling.callStatus.value
+        if (callState != `in`.chinmoydas.signal.utils.CallStatus.Idle) {
+            viewModelScope.launch {
+                if (callState == `in`.chinmoydas.signal.utils.CallStatus.Ringing) {
+                    `in`.chinmoydas.signal.utils.CallSignaling.declineCall()
+                } else {
+                    `in`.chinmoydas.signal.utils.CallSignaling.endCall()
+                }
+            }
+        }
+
+        // 3. Handle PTT (Walkie Talkie)
+        // If we were transmitting or receiving a PTT burst, kill that too.
+        if (service != null) {
+            val state = service.voiceServiceState.value
+
+            if (state.isTransmitting) {
+                service.stopTalk()
+            } else {
+                // Stop listening to PTT audio
+                service.stopReceiving()
+
+                // Legacy support: If you still use the old "sendRemoteHangup" for something else
+                if (state.incomingCall != null && callState == `in`.chinmoydas.signal.utils.CallStatus.Idle) {
+                    service.sendRemoteHangup()
+                }
+            }
+        }
     }
 
     fun onReceptionStarted(from: String, ip: String) {

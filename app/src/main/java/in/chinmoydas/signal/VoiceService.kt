@@ -11,6 +11,8 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.MediaPlayer
+import android.media.RingtoneManager
 import android.media.MediaRecorder
 import android.net.ConnectivityManager
 import android.net.Network
@@ -124,6 +126,7 @@ class VoiceService : Service() {
     private var cleanupJob: Job? = null
 
     private var callWatchdogJob: Job? = null
+    private var ringtonePlayer: MediaPlayer? = null
     @Volatile private var lastCallPacketTime: Long = 0L
 
     @Volatile var lastIncomingIp: String? = null
@@ -278,8 +281,10 @@ class VoiceService : Service() {
     override fun onCreate() {
         super.onCreate()
 
+        // 1. UPDATE AUDIO ROUTER INITIALIZATION
         audioRouter = AudioRouter(this)
         audioRouter.initialize()
+        // [NEW] Add this listener so the UI updates when hardware changes
         audioRouter.onRouteChanged = { isSpeakerOn ->
             userPrefersSpeaker = isSpeakerOn
             updateState()
@@ -325,20 +330,63 @@ class VoiceService : Service() {
                         val name = activeIpCache.entries.find { it.value == event.ip }?.key
                             ?: repository.findContactByIp(event.ip)?.name
                             ?: "Unknown Caller"
+
+                        _voiceServiceState.update { it.copy(incomingCall = name, incomingIp = event.ip) }
+
+                        // Trigger Ringing
+                        startRinging()
                         showIncomingCallNotification(name, "Incoming Voice Call", isAlarm = false)
                     }
+
                     is CallSignaling.CallEvent.CallConnected -> {
+                        // Stop Ringing
                         getSystemService(NotificationManager::class.java).cancel(2)
+                        stopRinging()
+
+                        // Haptic Feedback
+                        if (Build.VERSION.SDK_INT >= 26) {
+                            vibrator.vibrate(VibrationEffect.createOneShot(200, VibrationEffect.DEFAULT_AMPLITUDE))
+                        }
+
+                        // Stop PTT if active (VoIP Priority)
                         if (isSending) stopTalk()
                         if (_voiceServiceState.value.isVoxEnabled) toggleVox(false)
+
+                        // [CRITICAL] Switch Audio Mode & Start Engine
                         setCallMode(true)
-                        startCallWatchdog()
+
+                        val targetIp = _voiceServiceState.value.incomingIp
+                            ?: activeIpCache[repository.getTargetUser()]
+                            ?: repository.findContactByIp(repository.getTargetUser())?.ip
+
+                        if (!targetIp.isNullOrBlank()) {
+                            // Launch separate VoIP Engine
+                            val key = getEncryptionKey()
+                            `in`.chinmoydas.signal.utils.CallEngine.startCall(targetIp, key)
+                            startCallWatchdog()
+                        } else {
+                            speakText("Connection Error")
+                            `in`.chinmoydas.signal.utils.CallSignaling.endCall()
+                        }
                     }
+
                     is CallSignaling.CallEvent.CallEnded,
                     is CallSignaling.CallEvent.CallRejected -> {
                         getSystemService(NotificationManager::class.java).cancel(2)
+                        stopRinging()
+
+                        // Reset Audio Mode
                         setCallMode(false)
                         callWatchdogJob?.cancel()
+
+                        // Stop Engine
+                        `in`.chinmoydas.signal.utils.CallEngine.stopCall()
+
+                        _voiceServiceState.update { it.copy(incomingCall = null, incomingIp = null) }
+
+                        if (Build.VERSION.SDK_INT >= 26) {
+                            vibrator.vibrate(VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE))
+                        }
                     }
                     else -> {}
                 }
@@ -385,6 +433,13 @@ class VoiceService : Service() {
             }
         }
 
+        scope.launch {
+            `in`.chinmoydas.signal.utils.CallSignaling.commandEvents.collect { (targetIp, cmd) ->
+                // This makes the function ACTIVE
+                sendReliableCmd(targetIp, cmd)
+            }
+        }
+
         registerReceiver(audioNoisyReceiver, IntentFilter(android.media.AudioManager.ACTION_AUDIO_BECOMING_NOISY))
 
         multicastLock.setReferenceCounted(false)
@@ -392,12 +447,6 @@ class VoiceService : Service() {
         wifiLock.setReferenceCounted(false)
         val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         connectivityManager.registerNetworkCallback(NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), networkCallback)
-    }
-
-    fun setCallMode(active: Boolean) {
-        if (::audioRouter.isInitialized) {
-            audioRouter.setCallMode(active)
-        }
     }
 
     fun speakText(text: String) {
@@ -1491,38 +1540,117 @@ class VoiceService : Service() {
     }
 
     private fun showIncomingCallNotification(callerName: String, msgBody: String = "Incoming Signal", isAlarm: Boolean = false) {
-        val channelId = "cd_signal_call_alert_v2"
         val manager = getSystemService(NotificationManager::class.java)
+
+        // 1. SELECT CHANNEL ID BASED ON TYPE
+        val channelId = if (isAlarm) "cd_signal_sos_alert" else "cd_signal_voip_silent"
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, "Incoming Alerts", NotificationManager.IMPORTANCE_HIGH).apply {
-                description = "Wakes device for Calls and SOS"
-                setSound(Settings.System.DEFAULT_RINGTONE_URI, null)
-                enableVibration(true)
-                lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
-                setBypassDnd(true)
+            if (manager.getNotificationChannel(channelId) == null) {
+                val channelName = if (isAlarm) "SOS Emergency Alerts" else "Incoming Voice Calls"
+                val importance = NotificationManager.IMPORTANCE_HIGH
+
+                val channel = NotificationChannel(channelId, channelName, importance).apply {
+                    description = if (isAlarm) "Loud Emergency Alerts" else "Silent visual alerts for calls"
+                    lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
+                    setBypassDnd(true)
+
+                    if (isAlarm) {
+                        // [SOS CONFIG] Loud Alarm Sound + Vibration
+                        val alarmSound = android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_ALARM)
+                        val alarmAttributes = android.media.AudioAttributes.Builder()
+                            .setUsage(android.media.AudioAttributes.USAGE_ALARM)
+                            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build()
+
+                        // [FIX] Pass attributes here, not as a separate function
+                        setSound(alarmSound, alarmAttributes)
+
+                        enableVibration(true)
+                        vibrationPattern = longArrayOf(0, 1000, 500, 1000, 500, 1000)
+                    } else {
+                        // [VOIP CONFIG] Silent (MediaPlayer handles the ringing)
+                        setSound(null, null)
+                        enableVibration(false)
+                    }
+                }
+                manager.createNotificationChannel(channel)
             }
-            manager.createNotificationChannel(channel)
         }
+
         val fullScreenIntent = Intent(this, MainActivity::class.java).apply {
             action = "INCOMING_CALL"
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NO_USER_ACTION
             putExtra("auto_connect_channel", callerName)
-            putExtra("is_call", true)
+            putExtra("is_call", !isAlarm)
         }
-        val fullScreenPendingIntent = PendingIntent.getActivity(this, 119, fullScreenIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val notification = NotificationCompat.Builder(this, channelId)
+
+        val fullScreenPendingIntent = PendingIntent.getActivity(
+            this,
+            if (isAlarm) 911 else 119,
+            fullScreenIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notificationBuilder = NotificationCompat.Builder(this, channelId)
             .setSmallIcon(R.mipmap.ic_launcher_foreground)
-            .setContentTitle(if(isAlarm) "SOS ALERT" else "INCOMING SIGNAL")
-            .setContentText("$msgBody from $callerName")
+            .setContentTitle(if (isAlarm) "🚨 SOS ALERT 🚨" else "Incoming Call")
+            .setContentText(if (isAlarm) "EMERGENCY: $callerName needs help!" else "$callerName is calling...")
             .setPriority(NotificationCompat.PRIORITY_MAX)
-            .setCategory(if(isAlarm) NotificationCompat.CATEGORY_ALARM else NotificationCompat.CATEGORY_CALL)
+            .setCategory(if (isAlarm) NotificationCompat.CATEGORY_ALARM else NotificationCompat.CATEGORY_CALL)
             .setFullScreenIntent(fullScreenPendingIntent, true)
             .setAutoCancel(true)
             .setOngoing(true)
-            .setVibrate(longArrayOf(0, 500, 500, 500))
-            .addAction(android.R.drawable.ic_menu_call, "OPEN", fullScreenPendingIntent)
-            .build()
-        manager.notify(2, notification)
+            .addAction(android.R.drawable.ic_menu_call, if (isAlarm) "VIEW ALERT" else "ANSWER", fullScreenPendingIntent)
+
+        if (!isAlarm) {
+            notificationBuilder.setSilent(true)
+        }
+
+        val notificationId = if (isAlarm) 3 else 2
+        manager.notify(notificationId, notificationBuilder.build())
+    }
+
+    // [NEW] Consolidated Audio Mode Switcher
+    private fun setCallMode(isActive: Boolean) {
+        // 1. Tell AudioRouter to switch modes
+        audioRouter.setVoipMode(isActive)
+
+        // 2. Double check PTT Safety
+        if (!isActive) {
+            // When call ends, ensure we are back to "Ready" (Loudspeaker)
+            audioRouter.setSpeakerphone(true)
+        }
+    }
+
+    // [NEW] Ringing Helpers
+    private fun startRinging() {
+        try {
+            if (ringtonePlayer == null) {
+                val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+                ringtonePlayer = MediaPlayer.create(this, uri).apply {
+                    isLooping = true
+                    start()
+                }
+            }
+            // Vibration pattern
+            val pattern = longArrayOf(0, 1000, 1000)
+            if (Build.VERSION.SDK_INT >= 26) {
+                vibrator.vibrate(VibrationEffect.createWaveform(pattern, 0))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(pattern, 0)
+            }
+        } catch (e: Exception) { Log.e(tag, "Ringing Failed", e) }
+    }
+
+    private fun stopRinging() {
+        try {
+            ringtonePlayer?.stop()
+            ringtonePlayer?.release()
+        } catch (e: Exception) {}
+        ringtonePlayer = null
+        vibrator.cancel()
     }
 
     override fun onDestroy() {
