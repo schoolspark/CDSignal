@@ -163,7 +163,7 @@ class VoiceService : Service() {
 
     private val sequenceMap = ConcurrentHashMap<String, Int>()
 
-    // [FIX] Added Port Cache to remember NAT ports
+    // [FIX] Port Cache for Breach Protocol
     private val activeIpCache = ConcurrentHashMap<String, String>()
     private val activePortCache = ConcurrentHashMap<String, Int>()
 
@@ -234,7 +234,7 @@ class VoiceService : Service() {
                     try { networkEngine.stop() } catch (e: Exception) {}
                     delay(100)
 
-                    // [FIX] Update network start to pass PORT
+                    // [FIX] Capture PORT from packet
                     val networkStarted = networkEngine.start { packet ->
                         handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "", packet.port)
                     }
@@ -250,7 +250,7 @@ class VoiceService : Service() {
                         broadcastHello()
                         localLinkManager?.startAdvertising(myUsername, UDP_PORT)
 
-                        // [FIX] Use ConnectionManager STUN logic instead of hard reset
+                        // [FIX] Let ConnectionManager handle STUN/Port mapping
                         connectionManager.triggerImmediateHeartbeat()
                     }
                 } else if (myLocalIp.isEmpty()) {
@@ -576,7 +576,7 @@ class VoiceService : Service() {
             if (!ip.isNullOrBlank()) {
                 scope.launch(Dispatchers.IO) {
                     if (!networkEngine.isBound()) {
-                        // [FIX] Pass 0 or default since packet is null here
+                        // [FIX] Update to pass PORT from packet
                         val networkStarted = networkEngine.start { packet ->
                             handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "", packet.port)
                         }
@@ -846,17 +846,17 @@ class VoiceService : Service() {
         }
     }
 
+    // [FIX] Added senderPort argument
     private fun handleIncomingPacket(data: ByteArray, length: Int, senderIp: String, senderPort: Int) {
-        // 1. SELF FILTER (IP Based)
-        if (senderIp == myLocalIp) return
-        if (length <= 5) return
+        // 1. SELF FILTER
+        if (senderIp == myLocalIp || length <= 5) return
 
         // 2. PARSE HEADER
         val nameLen = data[0].toInt() and 0xFF
         if (nameLen + 5 > length) return
         val senderName = String(data, 1, nameLen)
 
-        // 3. PROTOCOL COMMANDS (Hello, Ping, Pong)
+        // 3. PROTOCOL COMMANDS
         if (senderName.startsWith("HELLO:")) {
             val parts = senderName.split(":")
             if (parts.size >= 3) {
@@ -893,8 +893,7 @@ class VoiceService : Service() {
             return
         }
 
-        // 5. SELF FILTER (Name Based) & BLOCKING
-        // [CRITICAL FIX] Nuclear Self Filter - Trim and IgnoreCase
+        // 5. SELF & BLOCK FILTER
         if (senderName.trim().equals(myUsername.trim(), ignoreCase = true)) return
         if (blockedCache.contains(senderName)) return
         if (senderIp == ignoredSender) return
@@ -915,15 +914,15 @@ class VoiceService : Service() {
         val lastSeq = sequenceMap.getOrPut(senderName) { -1 }
 
         if (seqNum > lastSeq || seqNum < lastSeq - 1000 || seqNum == 0) {
-            // Update IP and PORT mapping
+            // [FIX] Update IP and PORT cache
             if (!senderName.startsWith("group:")) {
-                activeIpCache[senderName] = senderIp
-                // [CRITICAL] Update Port Cache to punch back correctly
-                if (senderPort > 1024) {
+                if (senderPort > 1024 && activePortCache[senderName] != senderPort) {
                     activePortCache[senderName] = senderPort
+                    Log.d(tag, "NAT Port Updated: $senderName -> $senderPort")
                 }
 
                 if (activeIpCache[senderName] != senderIp) {
+                    activeIpCache[senderName] = senderIp
                     scope.launch {
                         val rowsAffected = repository.updateContactIp(senderName, senderIp)
                         if (rowsAffected == 0) repository.saveContact(name = senderName, ip = senderIp, code = "", isPriority = false)
@@ -934,13 +933,12 @@ class VoiceService : Service() {
             sequenceMap[senderName] = seqNum
             lastIncomingIp = senderIp
 
-            // Check PUNCH packet
             if (payloadLen == 9) {
                 val checkPunch = String(data, payloadOffset, payloadLen)
                 if (checkPunch == PUNCH_PACKET) return
             }
 
-            // 7. DECRYPTION (Do this BEFORE deciding if it's Audio or Text)
+            // 7. DECRYPTION
             var payload = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
             val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
             val isSecureMode = prefs.getBoolean("secure_mode", false)
@@ -950,7 +948,6 @@ class VoiceService : Service() {
                 val secretKey = getDecryptionKey(isGroup)
                 if (secretKey != null) {
                     var decrypted = CryptoEngine.decrypt(payload, seqNum, secretKey)
-                    // Retry for G711 frame size mismatch
                     if (decrypted == null && payload.size > 656 && payload.size < 720) {
                         try {
                             val trimmedPayload = payload.copyOfRange(0, 656)
@@ -961,20 +958,18 @@ class VoiceService : Service() {
                 }
             }
 
-            // 8. ROUTING LOGIC (The Fix)
+            // 8. TEXT ROUTING
             val isTextOrCmd = if (payload.size > 4) {
                 val header = String(payload, 0, 4, Charsets.UTF_8)
                 header == "TXT:" || header == "CMD:" || header == "LOC:"
             } else false
 
             if (isTextOrCmd) {
-                // --- IT IS A MESSAGE ---
                 try {
                     val textData = String(payload, Charsets.UTF_8)
                     if (textData.startsWith("TXT:")) {
                         val cleanMessage = textData.substring(4)
 
-                        // Internal Signals
                         if (cleanMessage == "CMD:CALL:PING") { lastCallPacketTime = System.currentTimeMillis(); return }
                         if (cleanMessage.startsWith("ACK:")) {
                             val originalCmd = cleanMessage.removePrefix("ACK:")
@@ -983,27 +978,19 @@ class VoiceService : Service() {
                             pendingAckJobs.remove(jobKey)
                             return
                         }
-
-                        // SOS
                         if (cleanMessage == "CMD:SOS") {
                             sendTextMessage(senderIp, "ACK:CMD:SOS")
-                            showIncomingCallNotification(senderName, "SOS ALERT", isAlarm = true) // Specific SOS Alert
+                            showIncomingCallNotification(senderName, "SOS ALERT", isAlarm = true)
                             SafetySignaling.triggerSOS(senderName)
                             return
                         }
-
-                        // UI Interceptor (Chat Dialogs)
                         if (packetInterceptor?.invoke(cleanMessage, senderIp) == true) return
-
-                        // Remote Control Logic
                         if (cleanMessage.startsWith("CMD:REMOTE_")) {
                             handleRemoteCommand(cleanMessage, senderIp, senderName, isPrincipal, prefs)
                             return
                         }
-
-                        // Normal Text Message
                         if (!cleanMessage.startsWith("CMD:") && !cleanMessage.startsWith("LOC:")) {
-                            speakText(cleanMessage) // TTS
+                            speakText(cleanMessage)
                             scope.launch {
                                 val db = AppDatabase.getDatabase(applicationContext)
                                 db.pagerDao().insert(PagerEntry(sender = senderName, type = "TEXT", content = cleanMessage, isRead = false))
@@ -1018,11 +1005,11 @@ class VoiceService : Service() {
             // --- IT IS AUDIO ---
 
             // [CRITICAL FIX] ALLOW AUDIO DURING CALL
+            // If call is active, we update the timer and ALLOW the audio to pass through.
             if (CallEngine.isCallActive) {
                 lastCallPacketTime = System.currentTimeMillis()
-                // Do NOT return here. Play the audio.
             } else if (isSending) {
-                return // Half-duplex PTT only suppresses Rx while Tx
+                return // Only suppress incoming if we are PTT transmitting (Half-Duplex)
             }
 
             // 9. HANDLE SIGNAL
@@ -1278,12 +1265,15 @@ class VoiceService : Service() {
         lastPort = port
         updateState()
 
+        // [BREACH PROTOCOL] OPTIMIZED SMART WAKE
         val currentTime = System.currentTimeMillis()
         val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
         dataSaverEnabled = prefs.getBoolean("data_saver", false)
         val isEco = prefs.getBoolean("eco_mode", false)
 
+        // 1. Check if the "UDP Tunnel" is still open (Packet received recently)
         val isTunnelOpen = (currentTime - lastReceiveTime) < WAKE_THRESHOLD_MS
+        // 2. Check if we just sent a wake signal (Debounce)
         val recentlyWoken = (currentTime - lastWakeSentTime) < WAKE_DEBOUNCE_MS
 
         val shouldWake = if (isEco) {

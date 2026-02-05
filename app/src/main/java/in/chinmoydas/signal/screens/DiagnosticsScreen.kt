@@ -75,15 +75,14 @@ fun DiagnosticsScreen(navController: NavController) {
     var audioFxStatus by remember { mutableStateOf(checkAudioEffects()) }
     var fcmStatus by remember { mutableStateOf(checkFcmToken(context)) }
 
-    // [NEW] Sensor Check for Impact Shield
+    // Sensor Check for Impact Shield
     var sensorStatus by remember { mutableStateOf(checkSensors(context)) }
 
     // Connectivity
     var stunStatus by remember { mutableStateOf("Checking...") }
     var portStatus by remember { mutableStateOf(checkPort(50005)) }
 
-    // [NEW] Port 50006 Check for Secure Calls
-    var callPortStatus by remember { mutableStateOf(checkPort(50006)) }
+    // [REMOVED] Port 50006 Check (Single Port Architecture)
 
     var volumeStatus by remember { mutableStateOf(checkVolume(context)) }
 
@@ -120,7 +119,6 @@ fun DiagnosticsScreen(navController: NavController) {
         ttsEngine = tts
 
         onDispose {
-            // [FIX] Ensure we don't leave the audio system in a weird state
             val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             am.mode = AudioManager.MODE_NORMAL
             am.isSpeakerphoneOn = false
@@ -137,7 +135,6 @@ fun DiagnosticsScreen(navController: NavController) {
         stunStatus = checkStunConnectivity()
         volumeStatus = checkVolume(context)
         portStatus = checkPort(50005)
-        callPortStatus = checkPort(50006)
     }
 
     fun copyReport() {
@@ -152,7 +149,6 @@ fun DiagnosticsScreen(navController: NavController) {
             Local IP: $localIp
             Server: $serverStatus
             Port 50005 (PTT): $portStatus
-            Port 50006 (Call): $callPortStatus
             Sensors: $sensorStatus
             Cloud Token: $fcmStatus
             Voice Vol: $volumeStatus
@@ -189,7 +185,6 @@ fun DiagnosticsScreen(navController: NavController) {
                         audioRouteInfo = getAudioRoute(context)
                         localIp = getLocalIpAddress()
                         portStatus = checkPort(50005)
-                        callPortStatus = checkPort(50006)
                         sensorStatus = checkSensors(context)
                         volumeStatus = checkVolume(context)
 
@@ -218,8 +213,7 @@ fun DiagnosticsScreen(navController: NavController) {
             DiagnosticRow("Cloud Token", fcmStatus)
             DiagnosticRow("Local IP", localIp)
             DiagnosticRow("Server API", serverStatus)
-            DiagnosticRow("Port 50005 (PTT)", portStatus)
-            DiagnosticRow("Port 50006 (Call)", callPortStatus)
+            DiagnosticRow("Port 50005 (UDP)", portStatus)
             DiagnosticRow("Sensors (Fall)", sensorStatus)
             DiagnosticRow("Voice Vol", volumeStatus)
             DiagnosticRow("TTS Engine", ttsStatus)
@@ -540,7 +534,7 @@ fun checkSensors(context: Context): String {
     return if (accel != null) "OK (Found)" else "Fail (Missing)"
 }
 
-// [FIXED] Updated to use the new StunClient.buildRequest() and manually creating the packet
+// [FIXED] Uses new StunClient API and displays public port
 suspend fun checkStunConnectivity(): String = withContext(Dispatchers.IO) {
     try {
         val socket = DatagramSocket()
@@ -560,7 +554,7 @@ suspend fun checkStunConnectivity(): String = withContext(Dispatchers.IO) {
         val res = StunClient.parseResponse(p.data)
         socket.close()
 
-        if (res != null) "OK (Public IP Resolved)" else "Fail (Parse Error)"
+        if (res != null) "OK (${res.ip}:${res.port})" else "Fail (Parse Error)"
     } catch (e: SocketTimeoutException) {
         "Fail (UDP Blocked/Timeout)"
     } catch (e: Exception) {
