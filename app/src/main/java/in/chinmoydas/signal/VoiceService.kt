@@ -169,8 +169,6 @@ class VoiceService : Service() {
 
     // [FIX] Port Cache for Breach Protocol
     private val activeIpCache = ConcurrentHashMap<String, String>()
-    private val activePortCache = ConcurrentHashMap<String, Int>()
-
     private val blockedCache = ConcurrentHashMap.newKeySet<String>()
     private val principalCache = ConcurrentHashMap.newKeySet<String>()
     private val pendingAckJobs = ConcurrentHashMap<String, Job>()
@@ -307,7 +305,7 @@ class VoiceService : Service() {
 
         // [SERVERLESS] Register Signal Callback
         networkEngine.onSignalPacket = { data, senderIp ->
-            handleIncomingPacket(data, data.size, senderIp, UDP_PORT)
+            handleIncomingPacket(data, data.size, senderIp)
         }
 
         // [SERVERLESS] Initialize CallEngine with the same NetworkEngine
@@ -921,22 +919,24 @@ class VoiceService : Service() {
                 val packetData = buffer.array()
 
                 // 2. Identify Network Type
-                val isLocal = targetIp.startsWith("192.168.") || targetIp.startsWith("10.")
+                val isLocal = targetIp.startsWith("192.168.") || targetIp.startsWith("10.") || targetIp.contains("%") // % indicates link-local IPv6
                 val isMobile = !isLocal
 
-                // 3. Smart Wake Check
-                val lastSeen = _voiceServiceState.value.lastPingResponse
-                val isCold = (System.currentTimeMillis() - lastReceiveTime) > WAKE_THRESHOLD_MS
+                // 3. Smart Wake Check (Throttled)
+                val currentTime = System.currentTimeMillis()
+                val isCold = (currentTime - lastReceiveTime) > WAKE_THRESHOLD_MS
+                val recentlyWoken = (currentTime - lastWakeSentTime) < WAKE_DEBOUNCE_MS
 
-                if (isMobile && isCold) {
+                if (isMobile && isCold && !recentlyWoken) {
+                    lastWakeSentTime = currentTime // [FIX] Update timestamp immediately
                     val contact = repository.getAllContacts().find { it.ip == targetIp }
                     if (contact != null && contact.fcmToken.isNotEmpty()) {
+                        Log.d(tag, "Sending Cloud Wake to ${contact.name}")
                         repository.sendWakeSignal("Bearer ${repository.getToken()}", myUsername, contact.fcmToken)
                     }
                 }
 
                 // 4. BURST SEND
-                // [SERVERLESS] Send with TYPE_TEXT_SIGNAL
                 networkEngine.sendBurst(NetworkEngine.TYPE_TEXT_SIGNAL, packetData, listOf(targetIp), UDP_PORT, 5)
 
             } catch (e: Exception) { e.printStackTrace() }
@@ -944,8 +944,7 @@ class VoiceService : Service() {
     }
 
     // [SERVERLESS] Updated Handler - Now receives stripped payload + senderIP from NetworkEngine
-    // [SERVERLESS] Updated Handler - Now receives stripped payload + senderIP from NetworkEngine
-    private fun handleIncomingPacket(data: ByteArray, length: Int, senderIp: String, senderPort: Int) {
+    private fun handleIncomingPacket(data: ByteArray, length: Int, senderIp: String) {
         // [FIX] Update Activity Monitor to save battery
         if (::connectionManager.isInitialized) connectionManager.notifyNetworkActivity()
 
@@ -1227,18 +1226,28 @@ class VoiceService : Service() {
     }
 
     fun sendReliableCmd(targetIp: String, cmd: String) {
-        if (pendingAckJobs.containsKey(targetIp + cmd)) return
+        val cmdKey = targetIp + cmd
+        if (pendingAckJobs.containsKey(cmdKey)) return
+
+        // [FIX] Logical Cancellation: If sending END, kill any pending REQ
+        if (cmd.contains("CMD:CALL:END")) {
+            val reqKey = targetIp + "CMD:CALL:REQ"
+            pendingAckJobs[reqKey]?.cancel()
+            pendingAckJobs.remove(reqKey)
+        }
+
         val job = scope.launch(Dispatchers.IO) {
             var attempts = 0
-            while (isActive && attempts < 30) {
+            // [FIX] Cap retries to 15 (30 seconds) to prevent eternal loops
+            while (isActive && attempts < 15) {
                 sendTextMessage(targetIp, cmd)
                 attempts++
-                if (attempts % 5 == 0) Log.d(tag, "Retrying $cmd to $targetIp ($attempts/30)")
+                if (attempts % 5 == 0) Log.d(tag, "Retrying $cmd to $targetIp ($attempts/15)")
                 delay(2000)
             }
-            pendingAckJobs.remove(targetIp + cmd)
+            pendingAckJobs.remove(cmdKey)
         }
-        pendingAckJobs[targetIp + cmd] = job
+        pendingAckJobs[cmdKey] = job
     }
 
     // [BREACH PROTOCOL] Nuclear SOS with Burst Mode

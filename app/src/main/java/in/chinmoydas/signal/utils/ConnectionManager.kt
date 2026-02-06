@@ -3,6 +3,9 @@ package `in`.chinmoydas.signal.utils
 import android.util.Log
 import `in`.chinmoydas.signal.data.MainRepository
 import kotlinx.coroutines.*
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.NetworkInterface
 
 class ConnectionManager(
     private val repository: MainRepository,
@@ -41,7 +44,6 @@ class ConnectionManager(
     }
 
     // [CRITICAL] Called by VoiceService when Audio/Data flows
-    // Resets the timer so we don't ping while user is talking (Battery Saving)
     fun notifyNetworkActivity() {
         lastActivityTime = System.currentTimeMillis()
     }
@@ -65,7 +67,6 @@ class ConnectionManager(
                 val timeSinceActivity = now - lastActivityTime
 
                 // Eco: Allow 25s silence. Normal: Allow 15s silence.
-                // (Carrier NATs usually close after 30s)
                 val silenceThreshold = if (isEcoMode) 25_000L else 15_000L
 
                 if (timeSinceActivity > silenceThreshold) {
@@ -89,7 +90,6 @@ class ConnectionManager(
                     }
 
                     // 3. Keep Server Updated (Heartbeat)
-                    // We throttle this to run every 30s (Eco) or 10s (Normal) to save data
                     val heartbeatInterval = if (isEcoMode) 30_000L else 10_000L
                     if (now - lastHeartbeatTime > heartbeatInterval) {
                         sendHeartbeat(channel, key)
@@ -97,7 +97,6 @@ class ConnectionManager(
                     }
                 }
 
-                // Check again in 5 seconds
                 delay(5000)
             }
         }
@@ -125,7 +124,9 @@ class ConnectionManager(
         if (token == "OFFLINE_TOKEN") return
 
         val portToSend = if (lastPublicPort > 0) lastPublicPort else localPort
-        val ipToSend = if (lastPublicIp.isNotEmpty()) lastPublicIp else "0.0.0.0"
+
+        // Note: We don't forcefully send our local IP here if STUN works,
+        // but the 'getLocalIp()' helper is used if the server needs it.
 
         try {
             repository.sendHeartbeat(token, portToSend, getLocalIp(), channel, key)
@@ -140,19 +141,40 @@ class ConnectionManager(
         maintenanceJob?.cancel()
     }
 
+    // [CRITICAL UPDATE] IPv6-Aware IP Detection
     private fun getLocalIp(): String {
         try {
-            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            var ipv4 = ""
+            var ipv6 = ""
+
             while (interfaces.hasMoreElements()) {
                 val iface = interfaces.nextElement()
+                // Skip Loopback and inactive interfaces
+                if (iface.isLoopback || !iface.isUp) continue
+
                 val addresses = iface.inetAddresses
                 while (addresses.hasMoreElements()) {
                     val addr = addresses.nextElement()
-                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
-                        return addr.hostAddress ?: ""
+
+                    if (!addr.isLoopbackAddress) {
+                        val ip = addr.hostAddress ?: ""
+                        // 1. Check for IPv6 (ignore link-local fe80::)
+                        if (addr is Inet6Address && !ip.startsWith("fe80")) {
+                            // If we find a Global IPv6 address, this is gold for 4G networks
+                            ipv6 = ip
+                        }
+                        // 2. Check for IPv4
+                        else if (addr is Inet4Address) {
+                            ipv4 = ip
+                        }
                     }
                 }
             }
+
+            // Prefer IPv6 if available (crucial for Jio/Mobile), otherwise fall back to IPv4
+            return if (ipv6.isNotEmpty()) ipv6 else ipv4.ifEmpty { "127.0.0.1" }
+
         } catch (e: Exception) { }
         return "127.0.0.1"
     }

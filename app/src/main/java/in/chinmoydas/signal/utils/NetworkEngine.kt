@@ -5,6 +5,7 @@ import kotlinx.coroutines.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
@@ -22,7 +23,6 @@ class NetworkEngine(
     var onSignalPacket: ((ByteArray, String) -> Unit)? = null // For VoiceService (PTT/Text)
     var onVoipPacket: ((ByteArray, String) -> Unit)? = null   // For CallEngine (VoIP)
 
-    // Packet Type Headers (Magic Bytes)
     companion object {
         const val TYPE_TEXT_SIGNAL: Byte = 0x10
         const val TYPE_PTT_AUDIO: Byte = 0x11
@@ -40,13 +40,20 @@ class NetworkEngine(
         if (isRunning.getAndSet(true)) return true
 
         try {
-            // [CRITICAL] Single Socket for Everything
-            socket = DatagramSocket(port).apply {
+            // [CRITICAL CHANGE] Dual-Stack Socket Binding
+            // "::0" is the IPv6 Wildcard address.
+            // On Android, binding to this allows receiving BOTH IPv4 and IPv6 packets.
+            val dualStackAddress = InetSocketAddress(InetAddress.getByName("::0"), port)
+
+            socket = DatagramSocket(null).apply {
                 reuseAddress = true
-                receiveBufferSize = 1024 * 1024 // 1MB Buffer to prevent overflow
+                receiveBufferSize = 1024 * 1024 // 1MB Buffer
                 broadcast = true
                 soTimeout = 0
+                bind(dualStackAddress) // Explicit Bind
             }
+
+            Log.i(tag, "NetworkEngine Started: Listening on Dual-Stack Port $port")
 
             // Receiver Thread
             Thread {
@@ -60,7 +67,7 @@ class NetworkEngine(
                             val data = packet.data.copyOf(packet.length)
                             val senderIp = packet.address.hostAddress ?: ""
 
-                            // [ROUTING LOGIC]
+                            // Routing Logic
                             if (StunClient.isStunResponse(data)) {
                                 onStunPacket(data)
                             } else {
@@ -73,7 +80,7 @@ class NetworkEngine(
                 }
             }.start()
 
-            // Sender Thread (Standard Queue Consumer)
+            // Sender Thread
             Thread {
                 while (isRunning.get()) {
                     try {
@@ -100,11 +107,11 @@ class NetworkEngine(
 
         when (type) {
             TYPE_TEXT_SIGNAL -> onSignalPacket?.invoke(payload, senderIp)
-            TYPE_PTT_AUDIO -> onSignalPacket?.invoke(payload, senderIp) // PTT handled by VoiceService
-            TYPE_VOIP_CALL -> onVoipPacket?.invoke(payload, senderIp)   // VoIP handled by CallEngine
+            TYPE_PTT_AUDIO -> onSignalPacket?.invoke(payload, senderIp)
+            TYPE_VOIP_CALL -> onVoipPacket?.invoke(payload, senderIp)
             TYPE_KEEP_ALIVE -> { /* Just a ping to keep NAT open */ }
             else -> {
-                // Legacy Fallback (No Header) -> Assume Signal/PTT for backward compatibility
+                // Legacy Fallback (No Header) -> Assume Signal for backward compatibility
                 onSignalPacket?.invoke(data, senderIp)
             }
         }
@@ -140,8 +147,7 @@ class NetworkEngine(
                 targets.forEach { ip ->
                     sendDirectly(packetData, ip, targetPort)
                 }
-                // [FIX] Non-blocking delay allowing other traffic to flow
-                delay(10)
+                delay(10) // Allow other traffic to interleave
             }
         }
     }
@@ -166,6 +172,7 @@ class NetworkEngine(
         return try {
             var address = ipCache[ip]
             if (address == null) {
+                // [IPv6 Fix] getByName automatically parses IPv4 and IPv6 literals
                 address = InetAddress.getByName(ip)
                 ipCache[ip] = address
             }
