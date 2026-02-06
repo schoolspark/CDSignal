@@ -57,9 +57,11 @@ class ConnectionManager(
             while (isActive) {
                 try {
                     val server = stunServers.random()
-                    // [Requirement] StunClient.buildRequest() must exist
                     val request = StunClient.buildRequest()
-                    networkEngine.send(request, listOf(server.first), server.second)
+
+                    // [FIX] Use sendRaw for STUN packets so no header is added
+                    networkEngine.sendRaw(request, listOf(server.first), server.second)
+
                 } catch (e: Exception) { Log.e(tag, "STUN send failed", e) }
                 delay(if (isEcoMode) 25000 else 15000)
             }

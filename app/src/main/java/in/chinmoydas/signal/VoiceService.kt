@@ -12,15 +12,14 @@ import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaPlayer
-import android.media.RingtoneManager
 import android.media.MediaRecorder
+import android.media.RingtoneManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.*
-import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import android.support.v4.media.session.MediaSessionCompat
 import android.view.KeyEvent
@@ -112,7 +111,9 @@ class VoiceService : Service() {
     private var lastWakeSentTime: Long = 0L
     private val WAKE_DEBOUNCE_MS = 10_000L
 
+    // [SERVERLESS] Unified Port
     private val UDP_PORT = 50005
+
     @Volatile private var isOnWifi = false
     @Volatile private var dataSaverEnabled = false
     @Volatile private var activeKeySpec: javax.crypto.spec.SecretKeySpec? = null
@@ -234,28 +235,20 @@ class VoiceService : Service() {
                     Log.i(tag, "Network Handover: $myLocalIp -> $newIp")
                     myLocalIp = newIp
 
-                    try { networkEngine.stop() } catch (e: Exception) {}
-                    delay(100)
+                    // [SERVERLESS] No need to stop/start network engine here.
+                    // UDP socket binds to 0.0.0.0, so it handles interface changes automatically
+                    // or fails gracefully. We just re-announce.
 
-                    // [FIX] Capture PORT from packet
-                    val networkStarted = networkEngine.start { packet ->
-                        handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "", packet.port)
-                    }
+                    _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
+                    sendTextMessage("255.255.255.255", "CMD:I_MOVED")
 
-                    if (networkStarted) {
-                        _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
-                        sendTextMessage("255.255.255.255", "CMD:I_MOVED")
+                    val currentTarget = repository.getTargetUser()
+                    val targetIp = activeIpCache[currentTarget]
+                    if (!targetIp.isNullOrBlank()) sendPing(targetIp)
 
-                        val currentTarget = repository.getTargetUser()
-                        val targetIp = activeIpCache[currentTarget]
-                        if (!targetIp.isNullOrBlank()) sendPing(targetIp)
-
-                        broadcastHello()
-                        localLinkManager?.startAdvertising(myUsername, UDP_PORT)
-
-                        // [FIX] Let ConnectionManager handle STUN/Port mapping
-                        connectionManager.triggerImmediateHeartbeat()
-                    }
+                    broadcastHello()
+                    localLinkManager?.startAdvertising(myUsername, UDP_PORT)
+                    connectionManager.triggerImmediateHeartbeat()
                 } else if (myLocalIp.isEmpty()) {
                     myLocalIp = newIp
                 }
@@ -281,10 +274,8 @@ class VoiceService : Service() {
     override fun onCreate() {
         super.onCreate()
 
-        // 1. UPDATE AUDIO ROUTER INITIALIZATION
         audioRouter = AudioRouter(this)
         audioRouter.initialize()
-        // [NEW] Add this listener so the UI updates when hardware changes
         audioRouter.onRouteChanged = { isSpeakerOn ->
             userPrefersSpeaker = isSpeakerOn
             updateState()
@@ -293,11 +284,20 @@ class VoiceService : Service() {
         audioEngine = AudioEngine(this)
         repository = MainRepository(applicationContext)
 
+        // [SERVERLESS] Initialize NetworkEngine once on Port 50005
         networkEngine = NetworkEngine(UDP_PORT) { stunData ->
             if (::connectionManager.isInitialized) {
                 connectionManager.handleStunResponse(stunData)
             }
         }
+
+        // [SERVERLESS] Register Signal Callback
+        networkEngine.onSignalPacket = { data, senderIp ->
+            handleIncomingPacket(data, data.size, senderIp, UDP_PORT)
+        }
+
+        // [SERVERLESS] Initialize CallEngine with the same NetworkEngine
+        CallEngine.initialize(networkEngine)
 
         connectionManager = ConnectionManager(repository, networkEngine)
 
@@ -332,27 +332,20 @@ class VoiceService : Service() {
                             ?: "Unknown Caller"
 
                         _voiceServiceState.update { it.copy(incomingCall = name, incomingIp = event.ip) }
-
-                        // Trigger Ringing
                         startRinging()
                         showIncomingCallNotification(name, "Incoming Voice Call", isAlarm = false)
                     }
 
                     is CallSignaling.CallEvent.CallConnected -> {
-                        // Stop Ringing
                         getSystemService(NotificationManager::class.java).cancel(2)
                         stopRinging()
-
-                        // Haptic Feedback
                         if (Build.VERSION.SDK_INT >= 26) {
                             vibrator.vibrate(VibrationEffect.createOneShot(200, VibrationEffect.DEFAULT_AMPLITUDE))
                         }
 
-                        // Stop PTT if active (VoIP Priority)
                         if (isSending) stopTalk()
                         if (_voiceServiceState.value.isVoxEnabled) toggleVox(false)
 
-                        // [CRITICAL] Switch Audio Mode & Start Engine
                         setCallMode(true)
 
                         val targetIp = _voiceServiceState.value.incomingIp
@@ -360,9 +353,8 @@ class VoiceService : Service() {
                             ?: repository.findContactByIp(repository.getTargetUser())?.ip
 
                         if (!targetIp.isNullOrBlank()) {
-                            // Launch separate VoIP Engine
                             val key = getEncryptionKey()
-                            `in`.chinmoydas.signal.utils.CallEngine.startCall(targetIp, key)
+                            CallEngine.startCall(targetIp, key)
                             startCallWatchdog()
                         } else {
                             speakText("Connection Error")
@@ -374,13 +366,9 @@ class VoiceService : Service() {
                     is CallSignaling.CallEvent.CallRejected -> {
                         getSystemService(NotificationManager::class.java).cancel(2)
                         stopRinging()
-
-                        // Reset Audio Mode
                         setCallMode(false)
                         callWatchdogJob?.cancel()
-
-                        // Stop Engine
-                        `in`.chinmoydas.signal.utils.CallEngine.stopCall()
+                        CallEngine.stopCall()
 
                         _voiceServiceState.update { it.copy(incomingCall = null, incomingIp = null) }
 
@@ -435,7 +423,6 @@ class VoiceService : Service() {
 
         scope.launch {
             `in`.chinmoydas.signal.utils.CallSignaling.commandEvents.collect { (targetIp, cmd) ->
-                // This makes the function ACTIVE
                 sendReliableCmd(targetIp, cmd)
             }
         }
@@ -494,8 +481,7 @@ class VoiceService : Service() {
                 if (target.isBlank()) return@launch
 
                 var ip = activeIpCache[target]
-                // [FIX] Use cached port if available
-                var port = activePortCache[target] ?: UDP_PORT
+                val port = UDP_PORT // [SERVERLESS] Always 50005
 
                 if (ip == null) {
                     val contact = repository.getAllContacts().find { it.name == target }
@@ -506,7 +492,7 @@ class VoiceService : Service() {
                 if (!ip.isNullOrBlank()) {
                     if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                         if (!fromVox) vibrate()
-                        startTalk(listOf(ip), port) // Use dynamic port
+                        startTalk(listOf(ip), port)
                     }
                 } else {
                     if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
@@ -619,20 +605,16 @@ class VoiceService : Service() {
 
         if (action == "ACTION_PUNCH_BACK") {
             val ip = intent.getStringExtra("target_ip")
-            val port = intent.getIntExtra("target_port", 50005)
             val sender = intent.getStringExtra("sender_name") ?: "Unknown"
 
             if (!ip.isNullOrBlank()) {
                 scope.launch(Dispatchers.IO) {
                     if (!networkEngine.isBound()) {
-                        // [FIX] Update to pass PORT from packet
-                        val networkStarted = networkEngine.start { packet ->
-                            handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "", packet.port)
-                        }
+                        val networkStarted = networkEngine.start()
                         if (!networkStarted) return@launch
                         delay(150)
                     }
-                    Log.d(tag, "BREACH: Punching hole to $ip:$port")
+                    Log.d(tag, "BREACH: Punching hole to $ip:$UDP_PORT")
 
                     val punchPayload = PUNCH_PACKET.toByteArray()
                     val nameBytes = myUsername.toByteArray()
@@ -644,7 +626,8 @@ class VoiceService : Service() {
                     buffer.put(punchPayload)
                     val fullPacket = buffer.array()
 
-                    networkEngine.sendBurst(fullPacket, listOf(ip), port, isMobileTarget = true, burstCount = 10)
+                    // [SERVERLESS] Send burst using Signal Type
+                    networkEngine.sendBurst(NetworkEngine.TYPE_TEXT_SIGNAL, fullPacket, listOf(ip), UDP_PORT, 10)
                 }
             }
 
@@ -718,7 +701,6 @@ class VoiceService : Service() {
         }
 
         if (intent?.getBooleanExtra("is_cloud_wake", false) == true) {
-            val wokenBy = intent.getStringExtra("woken_by")
             broadcastHello()
         }
 
@@ -732,9 +714,8 @@ class VoiceService : Service() {
                 if (!multicastLock.isHeld) multicastLock.acquire()
                 audioEngine.startPlayback()
 
-                val networkStarted = networkEngine.start { packet ->
-                    handleIncomingPacket(packet.data, packet.length, packet.address?.hostAddress ?: "", packet.port)
-                }
+                // [SERVERLESS] Start NetworkEngine (if not already)
+                val networkStarted = networkEngine.start()
 
                 if (!networkStarted) {
                     _voiceServiceState.update { it.copy(networkStatus = "Error: UDP Bind Failed") }
@@ -762,10 +743,7 @@ class VoiceService : Service() {
         signalingJob?.cancel()
         signalingJob = scope.launch {
             while (isActive) {
-                // [ECO MODE FIX]
-                // We do NOT stop the loop. We just poll slower.
                 val pollInterval = if (::connectionManager.isInitialized && connectionManager.isEcoMode) 10_000L else 2000L
-
                 delay(pollInterval)
 
                 val token = repository.getToken()
@@ -775,7 +753,6 @@ class VoiceService : Service() {
                         val callers = response.callers
                         if (!callers.isNullOrEmpty()) {
                             if (isSending) {
-                                // Interruption Logic
                                 val interrupter = callers.firstOrNull { caller ->
                                     val ip = activeIpCache[caller]
                                     (ip != null && activeTargets.contains(ip)) || (repository.getTargetUser() == caller)
@@ -813,7 +790,11 @@ class VoiceService : Service() {
             val buf = ByteArray(1 + signalBytes.size + 4)
             buf[0] = signalBytes.size.toByte()
             System.arraycopy(signalBytes, 0, buf, 1, signalBytes.size)
-            repeat(3) { networkEngine.send(buf, listOf(ip), port); delay(20) }
+            // [SERVERLESS] Send Raw/Text Type
+            repeat(3) {
+                networkEngine.send(NetworkEngine.TYPE_TEXT_SIGNAL, buf, listOf(ip), port)
+                delay(20)
+            }
         }
     }
 
@@ -827,10 +808,15 @@ class VoiceService : Service() {
             buf[0] = payloadBytes.size.toByte()
             System.arraycopy(payloadBytes, 0, buf, 1, payloadBytes.size)
             ByteBuffer.wrap(buf, 1 + payloadBytes.size, 4).putInt(0)
-            networkEngine.send(buf, listOf("255.255.255.255"), UDP_PORT)
+
+            // [SERVERLESS] Send to 255.255.255.255 and known contacts
+            networkEngine.send(NetworkEngine.TYPE_TEXT_SIGNAL, buf, listOf("255.255.255.255"), UDP_PORT)
+
             val contacts = repository.getAllContacts()
             val knownIps = contacts.mapNotNull { it.ip }.filter { it != "SERVER_LINK" && it.isNotEmpty() }
-            if (knownIps.isNotEmpty()) networkEngine.send(buf, knownIps, UDP_PORT)
+            if (knownIps.isNotEmpty()) {
+                networkEngine.send(NetworkEngine.TYPE_TEXT_SIGNAL, buf, knownIps, UDP_PORT)
+            }
         }
     }
 
@@ -840,7 +826,7 @@ class VoiceService : Service() {
             val buf = ByteArray(1 + signalBytes.size + 4)
             buf[0] = signalBytes.size.toByte()
             System.arraycopy(signalBytes, 0, buf, 1, signalBytes.size)
-            networkEngine.send(buf, listOf(ip), UDP_PORT)
+            networkEngine.send(NetworkEngine.TYPE_TEXT_SIGNAL, buf, listOf(ip), UDP_PORT)
         }
     }
 
@@ -887,15 +873,14 @@ class VoiceService : Service() {
                 }
 
                 // 4. BURST SEND
-                // [FIX] Use activePortCache if available, otherwise UDP_PORT
-                val targetPort = activePortCache[targetIp] ?: UDP_PORT
-                networkEngine.sendBurst(packetData, listOf(targetIp), targetPort, isMobileTarget = isMobile, burstCount = 5)
+                // [SERVERLESS] Send with TYPE_TEXT_SIGNAL
+                networkEngine.sendBurst(NetworkEngine.TYPE_TEXT_SIGNAL, packetData, listOf(targetIp), UDP_PORT, 5)
 
             } catch (e: Exception) { e.printStackTrace() }
         }
     }
 
-    // [FIX] Added senderPort argument
+    // [SERVERLESS] Updated Handler - Now receives stripped payload + senderIP from NetworkEngine
     private fun handleIncomingPacket(data: ByteArray, length: Int, senderIp: String, senderPort: Int) {
         // 1. SELF FILTER
         if (senderIp == myLocalIp || length <= 5) return
@@ -963,19 +948,12 @@ class VoiceService : Service() {
         val lastSeq = sequenceMap.getOrPut(senderName) { -1 }
 
         if (seqNum > lastSeq || seqNum < lastSeq - 1000 || seqNum == 0) {
-            // [FIX] Update IP and PORT cache
-            if (!senderName.startsWith("group:")) {
-                if (senderPort > 1024 && activePortCache[senderName] != senderPort) {
-                    activePortCache[senderName] = senderPort
-                    Log.d(tag, "NAT Port Updated: $senderName -> $senderPort")
-                }
-
-                if (activeIpCache[senderName] != senderIp) {
-                    activeIpCache[senderName] = senderIp
-                    scope.launch {
-                        val rowsAffected = repository.updateContactIp(senderName, senderIp)
-                        if (rowsAffected == 0) repository.saveContact(name = senderName, ip = senderIp, code = "", isPriority = false)
-                    }
+            // [SERVERLESS] Just update IP logic, port caching handled implicitly via reply
+            if (!senderName.startsWith("group:") && activeIpCache[senderName] != senderIp) {
+                activeIpCache[senderName] = senderIp
+                scope.launch {
+                    val rowsAffected = repository.updateContactIp(senderName, senderIp)
+                    if (rowsAffected == 0) repository.saveContact(name = senderName, ip = senderIp, code = "", isPriority = false)
                 }
             }
 
@@ -1051,20 +1029,14 @@ class VoiceService : Service() {
                 return
             }
 
-            // --- IT IS AUDIO ---
-
-            // [CRITICAL FIX] ALLOW AUDIO DURING CALL
-            // If call is active, we update the timer and ALLOW the audio to pass through.
+            // --- IT IS AUDIO (PTT) ---
+            // If CallEngine is active, we ignore PTT audio (Split Audio Priority)
             if (CallEngine.isCallActive) {
-                lastCallPacketTime = System.currentTimeMillis()
-            } else if (isSending) {
-                return // Only suppress incoming if we are PTT transmitting (Half-Duplex)
+                return
             }
 
             // 9. HANDLE SIGNAL
-            if (!CallEngine.isCallActive) {
-                handleIncomingSignal(senderName, isPrincipal)
-            }
+            handleIncomingSignal(senderName, isPrincipal)
 
             // G711 Decode
             if (payload.size >= 640 && payload.size < 720) {
@@ -1072,7 +1044,7 @@ class VoiceService : Service() {
             }
 
             // [FIX] Play Audio always if allowed
-            if (!isSilenced || isPrincipal || CallEngine.isCallActive) {
+            if (!isSilenced || isPrincipal) {
                 try { audioEngine.playPcmChunk(payload, seqNum) } catch (e: Exception) {}
             }
             if (isRecordingEnabled) {
@@ -1081,7 +1053,7 @@ class VoiceService : Service() {
         }
     }
 
-    // Helper for Remote Commands (Cleaned up from main logic)
+    // Helper for Remote Commands
     private fun handleRemoteCommand(cmd: String, ip: String, name: String, isPrincipal: Boolean, prefs: android.content.SharedPreferences) {
         val isRemoteAllowed = prefs.getBoolean("allow_remote_control", false)
         if (!isRemoteAllowed) {
@@ -1204,13 +1176,10 @@ class VoiceService : Service() {
             buf.put(sosPayload)
             val packet = buf.array()
 
-            // Aggressive Flood (8 copies repeated 5 times)
+            // Aggressive Flood
             repeat(5) {
-                targets.forEach { ip ->
-                    val isMobile = !ip.startsWith("192.") && !ip.startsWith("10.")
-                    val port = activePortCache[ip] ?: UDP_PORT
-                    networkEngine.sendBurst(packet, listOf(ip), port, isMobileTarget = isMobile, burstCount = 8)
-                }
+                // [SERVERLESS] Send as TEXT SIGNAL
+                networkEngine.sendBurst(NetworkEngine.TYPE_TEXT_SIGNAL, packet, targets, UDP_PORT, 8)
                 delay(1000)
             }
         }
@@ -1293,7 +1262,6 @@ class VoiceService : Service() {
         cleanupJob?.cancel()
         cleanupJob = null
         if (CallEngine.isCallActive) {
-            // [FIX] Allow PTT during call? Usually no, but let's log it.
             Log.w(tag, "PTT Triggered during Call - Mixed Audio Mode")
         }
         if (isSending) return
@@ -1314,15 +1282,12 @@ class VoiceService : Service() {
         lastPort = port
         updateState()
 
-        // [BREACH PROTOCOL] OPTIMIZED SMART WAKE
         val currentTime = System.currentTimeMillis()
         val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
         dataSaverEnabled = prefs.getBoolean("data_saver", false)
         val isEco = prefs.getBoolean("eco_mode", false)
 
-        // 1. Check if the "UDP Tunnel" is still open (Packet received recently)
         val isTunnelOpen = (currentTime - lastReceiveTime) < WAKE_THRESHOLD_MS
-        // 2. Check if we just sent a wake signal (Debounce)
         val recentlyWoken = (currentTime - lastWakeSentTime) < WAKE_DEBOUNCE_MS
 
         val shouldWake = if (isEco) {
@@ -1366,8 +1331,9 @@ class VoiceService : Service() {
             System.arraycopy(payloadToSend, 0, sendBuf, headerLen, payloadToSend.size)
 
             val burstCount = if (currentSequenceNumber < 5) 2 else 1
-            // [FIX] Use dynamic lastPort from cache if available
-            networkEngine.sendBurst(sendBuf, activeTargets, lastPort, isMobileTarget = !isLocal, burstCount = burstCount)
+
+            // [SERVERLESS] Send as PTT_AUDIO
+            networkEngine.sendBurst(NetworkEngine.TYPE_PTT_AUDIO, sendBuf, activeTargets, lastPort, burstCount)
         }
     }
 
@@ -1385,7 +1351,8 @@ class VoiceService : Service() {
             System.arraycopy(endNameBytes, 0, buf, 1, endNameBytes.size)
             repeat(3) {
                 if (isActive) {
-                    networkEngine.send(buf, activeTargets, lastPort)
+                    // [SERVERLESS] Send End Stream marker via TEXT signal to ensure delivery
+                    networkEngine.send(NetworkEngine.TYPE_TEXT_SIGNAL, buf, activeTargets, lastPort)
                     delay(20)
                 }
             }
@@ -1452,8 +1419,10 @@ class VoiceService : Service() {
         }
         lastReceiveTime = currentTime
         resetJob?.cancel()
+
+        // [FIX] Extended silence timeout to 10 seconds to prevent clipping
         resetJob = scope.launch {
-            delay(5000)
+            delay(10_000)
             if (isReceiving) stopReceiving()
         }
     }
@@ -1542,7 +1511,6 @@ class VoiceService : Service() {
     private fun showIncomingCallNotification(callerName: String, msgBody: String = "Incoming Signal", isAlarm: Boolean = false) {
         val manager = getSystemService(NotificationManager::class.java)
 
-        // 1. SELECT CHANNEL ID BASED ON TYPE
         val channelId = if (isAlarm) "cd_signal_sos_alert" else "cd_signal_voip_silent"
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -1556,20 +1524,15 @@ class VoiceService : Service() {
                     setBypassDnd(true)
 
                     if (isAlarm) {
-                        // [SOS CONFIG] Loud Alarm Sound + Vibration
                         val alarmSound = android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_ALARM)
                         val alarmAttributes = android.media.AudioAttributes.Builder()
                             .setUsage(android.media.AudioAttributes.USAGE_ALARM)
                             .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
                             .build()
-
-                        // [FIX] Pass attributes here, not as a separate function
                         setSound(alarmSound, alarmAttributes)
-
                         enableVibration(true)
                         vibrationPattern = longArrayOf(0, 1000, 500, 1000, 500, 1000)
                     } else {
-                        // [VOIP CONFIG] Silent (MediaPlayer handles the ringing)
                         setSound(null, null)
                         enableVibration(false)
                     }
@@ -1611,19 +1574,13 @@ class VoiceService : Service() {
         manager.notify(notificationId, notificationBuilder.build())
     }
 
-    // [NEW] Consolidated Audio Mode Switcher
     private fun setCallMode(isActive: Boolean) {
-        // 1. Tell AudioRouter to switch modes
         audioRouter.setVoipMode(isActive)
-
-        // 2. Double check PTT Safety
         if (!isActive) {
-            // When call ends, ensure we are back to "Ready" (Loudspeaker)
             audioRouter.setSpeakerphone(true)
         }
     }
 
-    // [NEW] Ringing Helpers
     private fun startRinging() {
         try {
             if (ringtonePlayer == null) {
@@ -1633,7 +1590,6 @@ class VoiceService : Service() {
                     start()
                 }
             }
-            // Vibration pattern
             val pattern = longArrayOf(0, 1000, 1000)
             if (Build.VERSION.SDK_INT >= 26) {
                 vibrator.vibrate(VibrationEffect.createWaveform(pattern, 0))

@@ -6,31 +6,26 @@ import android.media.audiofx.*
 import android.os.Process
 import android.util.Log
 import kotlinx.coroutines.*
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentSkipListMap
 import javax.crypto.spec.SecretKeySpec
-import kotlin.math.abs
 
 object CallEngine {
 
     private const val TAG = "CallEngine"
     private const val SAMPLE_RATE = 16000
     private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
+    private const val JITTER_BUFFER_MS = 60
+    private const val PACKET_INTERVAL_MS = 20
 
-    // [TUNING] Carrier Grade Settings
-    private const val JITTER_BUFFER_MS = 60 // 60ms "Waiting Room" to fix ordering
-    private const val PACKET_INTERVAL_MS = 20 // Send audio every 20ms
-
-    // [BREACH PROTOCOL]
-    private const val CALL_PORT = 50006
-    private val TARGET_PORTS = listOf(50006, 50005, 50007)
+    // [FIX] Port MUST match NetworkEngine port for P2P to work (Single Socket)
+    private const val TARGET_PORT = 50005
 
     @Volatile private var audioRecord: AudioRecord? = null
     @Volatile private var audioTrack: AudioTrack? = null
-    @Volatile private var callSocket: DatagramSocket? = null
+
+    // Reference to the centralized NetworkEngine
+    private var networkEngine: NetworkEngine? = null
 
     private var aec: AcousticEchoCanceler? = null
     private var ns: NoiseSuppressor? = null
@@ -39,51 +34,52 @@ object CallEngine {
     @Volatile var isCallActive = false
         private set
 
-    @Volatile private var targetAddress: InetAddress? = null
-    @Volatile private var activeTargetPort: Int = CALL_PORT
+    @Volatile private var targetIp: String? = null
     private var activeSecretKey: SecretKeySpec? = null
 
     private var recordJob: Job? = null
     private var playJob: Job? = null
-    private var netJob: Job? = null
-    private var punchJob: Job? = null
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private val _muteStatus = kotlinx.coroutines.flow.MutableStateFlow(false)
-
-    // [JITTER BUFFER] Sorts packets by Sequence Number automatically
     private val jitterBuffer = ConcurrentSkipListMap<Int, ByteArray>()
-
-    // [FEC] Redundancy Cache
     @Volatile private var previousFrame: ByteArray? = null
+
+    // [INIT] Called by VoiceService when it starts up
+    fun initialize(engine: NetworkEngine) {
+        this.networkEngine = engine
+
+        // Register callback to receive VoIP packets
+        engine.onVoipPacket = { data, senderIp ->
+            if (isCallActive && (targetIp == null || senderIp == targetIp)) {
+                // Lock onto the first sender IP if we initiated blindly
+                if (targetIp == null) targetIp = senderIp
+                processIncomingPacket(data)
+            }
+        }
+    }
 
     @SuppressLint("MissingPermission")
     fun startCall(ip: String, secretKey: SecretKeySpec? = null) {
         if (isCallActive) return
-        Log.d(TAG, "STARTING CARRIER GRADE VOIP -> $ip")
+        if (networkEngine == null) {
+            Log.e(TAG, "CallEngine not initialized with NetworkEngine!")
+            return
+        }
 
-        // Reset State
-        activeTargetPort = CALL_PORT
-        updateTargetIp(ip)
+        Log.d(TAG, "STARTING SINGLE-SOCKET CALL -> $ip")
+
+        targetIp = ip
         activeSecretKey = secretKey
         isCallActive = true
         _muteStatus.value = false
         jitterBuffer.clear()
         previousFrame = null
 
-        CoroutineScope(Dispatchers.IO).launch {
+        scope.launch {
             try {
-                // 1. Networking (Aggressive Timeout)
-                callSocket = DatagramSocket(CALL_PORT).apply {
-                    reuseAddress = true
-                    soTimeout = 1000 // 1s disconnect timeout
-                    receiveBufferSize = 64 * 1024 // Large OS buffer
-                }
-
-                punchHole(ip)
-
-                // 2. Audio Hardware (Low Latency Mode)
-                // Calculate precise buffer size for 20ms chunks
-                val frameSize = (SAMPLE_RATE * PACKET_INTERVAL_MS / 1000) * 2 // 16-bit = 2 bytes
+                // 1. Audio Hardware Setup (Low Latency)
+                val frameSize = (SAMPLE_RATE * PACKET_INTERVAL_MS / 1000) * 2
                 val minBufRec = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AUDIO_FORMAT) * 2
                 val minBufTrack = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AUDIO_FORMAT) * 2
 
@@ -92,7 +88,7 @@ object CallEngine {
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_OUT_MONO,
                     AUDIO_FORMAT,
-                    maxOf(minBufTrack, frameSize * 4), // Ensure track has breathing room
+                    maxOf(minBufTrack, frameSize * 4),
                     AudioTrack.MODE_STREAM
                 )
                 audioTrack = track
@@ -107,10 +103,10 @@ object CallEngine {
                 audioRecord = record
 
                 if (record.state != AudioRecord.STATE_INITIALIZED || track.state != AudioTrack.STATE_INITIALIZED) {
-                    throw Exception("Hardware Init Failed")
+                    throw Exception("Audio Hardware Init Failed")
                 }
 
-                // 3. Audio Effects (Critical for Speakerphone)
+                // 2. Audio Effects
                 val sId = record.audioSessionId
                 if (AcousticEchoCanceler.isAvailable()) aec = AcousticEchoCanceler.create(sId)?.apply { enabled = true }
                 if (NoiseSuppressor.isAvailable()) ns = NoiseSuppressor.create(sId)?.apply { enabled = true }
@@ -119,10 +115,9 @@ object CallEngine {
                 record.startRecording()
                 track.play()
 
-                // 4. Start Triple-Thread Architecture
-                startMicrophoneLoop(frameSize)   // Thread A: Capture & Send
-                startNetworkLoop()               // Thread B: Receive & Sort
-                startSpeakerLoop(frameSize)      // Thread C: De-Jitter & Play
+                // 3. Start Threads
+                startMicrophoneLoop(frameSize)   // Capture & Send
+                startSpeakerLoop()               // De-Jitter & Play
 
             } catch (e: Exception) {
                 Log.e(TAG, "Startup Crash: ${e.message}")
@@ -131,133 +126,101 @@ object CallEngine {
         }
     }
 
-    // --- THREAD A: MICROPHONE & SENDER (With Redundancy) ---
     private fun startMicrophoneLoop(frameSize: Int) {
-        recordJob = CoroutineScope(Dispatchers.IO).launch {
+        recordJob = scope.launch {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             val rawBuffer = ShortArray(frameSize / 2)
             var seqNumber = 0
 
             while (isActive && isCallActive) {
-                // [FIX] Capture volatile address locally as InetAddress?
-                // This prevents the 'Any' type mismatch error
-                val currentAddress: InetAddress? = targetAddress
-
-                if (currentAddress == null) {
-                    delay(50)
+                if (_muteStatus.value) {
+                    delay(20)
                     continue
                 }
 
-                if (_muteStatus.value) {
-                    delay(20)
-                } else {
-                    val read = audioRecord?.read(rawBuffer, 0, rawBuffer.size) ?: 0
-                    if (read > 0) {
-                        // 1. Compress Current Frame
-                        val currentEncoded = G711.encode(rawBuffer, read)
+                val currentTarget = targetIp ?: continue
+                val read = audioRecord?.read(rawBuffer, 0, rawBuffer.size) ?: 0
 
-                        // 2. Get Previous Frame (for Redundancy)
-                        val prevEncoded = previousFrame ?: ByteArray(0)
-                        previousFrame = currentEncoded // Save current for next loop
+                if (read > 0) {
+                    // Encode
+                    val currentEncoded = G711.encode(rawBuffer, read)
+                    val prevEncoded = previousFrame ?: ByteArray(0)
+                    previousFrame = currentEncoded
 
-                        // 3. Send Both (Packet = [Header][Current][Previous])
-                        sendPacket(currentEncoded, prevEncoded, seqNumber++, currentAddress)
+                    // Prepare Payload
+                    val payload = ByteBuffer.allocate(4 + 2 + currentEncoded.size + prevEncoded.size) // Seq(4) + Len(2) + Data + Redundancy
+                        .putInt(seqNumber++)
+                        .putShort(currentEncoded.size.toShort())
+                        .put(currentEncoded)
+                        .put(prevEncoded)
+                        .array()
+
+                    // Encrypt
+                    val finalPayload = if (activeSecretKey != null) {
+                        CryptoEngine.encrypt(payload, seqNumber, activeSecretKey!!) ?: payload
+                    } else {
+                        payload
                     }
+
+                    // [CRITICAL] Send via NetworkEngine using VoIP Header (0x12)
+                    networkEngine?.send(
+                        NetworkEngine.TYPE_VOIP_CALL,
+                        finalPayload,
+                        listOf(currentTarget),
+                        TARGET_PORT
+                    )
                 }
             }
         }
     }
 
-    private fun sendPacket(current: ByteArray, previous: ByteArray, seq: Int, address: InetAddress) {
+    // Called automatically by NetworkEngine callback
+    private fun processIncomingPacket(data: ByteArray) {
         try {
-            // Payload = [Len_Cur(2)][Current_Data][Previous_Data]
-            val payload = ByteBuffer.allocate(2 + current.size + previous.size)
-                .putShort(current.size.toShort())
-                .put(current)
-                .put(previous)
-                .array()
-
-            // Encrypt
+            // Decrypt
+            var decrypted = data
             val key = activeSecretKey
-            val encrypted = if (key != null) CryptoEngine.encrypt(payload, seq, key) ?: payload else payload
 
-            // Header = [Seq(4)][Encrypted_Payload]
-            val packetData = ByteBuffer.allocate(4 + encrypted.size)
-                .putInt(seq)
-                .put(encrypted)
-                .array()
+            // Peek at Sequence (First 4 bytes)
+            val tempBb = ByteBuffer.wrap(data)
+            val seq = tempBb.int
 
-            callSocket?.send(DatagramPacket(packetData, packetData.size, address, activeTargetPort))
-        } catch (e: Exception) {}
-    }
-
-    // --- THREAD B: NETWORK RECEIVER (Packet Sorting) ---
-    private fun startNetworkLoop() {
-        netJob = CoroutineScope(Dispatchers.IO).launch {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-            val buffer = ByteArray(4096)
-            val p = DatagramPacket(buffer, buffer.size)
-
-            while (isActive && isCallActive) {
-                try {
-                    callSocket?.receive(p)
-                    if (p.length < 4) continue
-
-                    // [LATCHING] Fixes Mobile Data NAT issues
-                    if (p.port != activeTargetPort) activeTargetPort = p.port
-
-                    val wrapped = ByteBuffer.wrap(p.data, 0, p.length)
-                    val seq = wrapped.int // Header
-
-                    val payloadLen = p.length - 4
-                    val encrypted = ByteArray(payloadLen)
-                    wrapped.get(encrypted)
-
-                    val key = activeSecretKey
-                    val decrypted = if (key != null) CryptoEngine.decrypt(encrypted, seq, key) else encrypted
-
-                    if (decrypted != null) {
-                        // DECODE HYBRID PACKET
-                        val bb = ByteBuffer.wrap(decrypted)
-                        val curLen = bb.short.toInt()
-
-                        val currentFrame = ByteArray(curLen)
-                        bb.get(currentFrame)
-
-                        val prevLen = decrypted.size - 2 - curLen
-                        val prevFrame = ByteArray(maxOf(0, prevLen))
-                        if (prevLen > 0) bb.get(prevFrame)
-
-                        // [CRITICAL] Insert into Jitter Buffer
-                        // 1. Add Current Frame
-                        if (!jitterBuffer.containsKey(seq)) {
-                            jitterBuffer[seq] = currentFrame
-                        }
-
-                        // 2. Recover LOST Previous Frame (FEC)
-                        // If we missed packet (seq-1), we restore it now from this packet's backup!
-                        if (seq > 0 && !jitterBuffer.containsKey(seq - 1) && prevFrame.isNotEmpty()) {
-                            Log.w(TAG, "FEC: Recovered lost packet ${seq - 1} using redundancy")
-                            jitterBuffer[seq - 1] = prevFrame
-                        }
-                    }
-                } catch (e: Exception) {
-                    // Socket Timeout is normal, just loop
-                }
+            if (key != null) {
+                val result = CryptoEngine.decrypt(data, seq, key)
+                if (result != null) decrypted = result
             }
-        }
+
+            val bb = ByteBuffer.wrap(decrypted)
+            val seqNum = bb.int
+            val curLen = bb.short.toInt()
+
+            val currentFrame = ByteArray(curLen)
+            bb.get(currentFrame)
+
+            // Redundancy extraction
+            val prevLen = decrypted.size - 4 - 2 - curLen
+            val prevFrame = ByteArray(maxOf(0, prevLen))
+            if (prevLen > 0) bb.get(prevFrame)
+
+            // Jitter Buffer Logic
+            if (!jitterBuffer.containsKey(seqNum)) {
+                jitterBuffer[seqNum] = currentFrame
+            }
+            // FEC Recovery
+            if (seqNum > 0 && !jitterBuffer.containsKey(seqNum - 1) && prevFrame.isNotEmpty()) {
+                jitterBuffer[seqNum - 1] = prevFrame
+            }
+
+        } catch (e: Exception) { }
     }
 
-    // --- THREAD C: SPEAKER LOOP (De-Jitter & Play) ---
-    private fun startSpeakerLoop(frameSize: Int) {
-        playJob = CoroutineScope(Dispatchers.IO).launch {
+    private fun startSpeakerLoop() {
+        playJob = scope.launch {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-
             var nextSeqToPlay = -1
             var buffering = true
 
             while (isActive && isCallActive) {
-                // Initial Buffering (Wait for 3 packets)
                 if (buffering) {
                     if (jitterBuffer.size >= 3) {
                         buffering = false
@@ -268,23 +231,16 @@ object CallEngine {
                     }
                 }
 
-                // Check if we have the next packet
                 val data = jitterBuffer.remove(nextSeqToPlay)
-
                 if (data != null) {
-                    // Packet Found! Decode G711 -> PCM
                     val pcm = G711.decode(data, data.size)
                     audioTrack?.write(pcm, 0, pcm.size)
                     nextSeqToPlay++
                 } else {
-                    // Packet Missing (Even after FEC recovery)
-                    // Check if we fell too far behind (Latency catch-up)
+                    // Packet Loss / Catch-up logic
                     if (jitterBuffer.isNotEmpty() && jitterBuffer.firstKey() > nextSeqToPlay + 10) {
-                        // We are 10 packets behind -> Jump ahead
                         nextSeqToPlay = jitterBuffer.firstKey()
                     } else {
-                        // Genuine network gap -> Wait briefly (Concealment) or Silence
-                        // Ideally write comfort noise here, but silence is okay for now
                         delay(5)
                     }
                 }
@@ -292,43 +248,20 @@ object CallEngine {
         }
     }
 
-    private fun punchHole(targetIp: String) {
-        punchJob = CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val address = InetAddress.getByName(targetIp)
-                val dummy = "HOLE_PUNCH".toByteArray()
-                repeat(15) {
-                    TARGET_PORTS.forEach { port ->
-                        try {
-                            callSocket?.send(DatagramPacket(dummy, dummy.size, address, port))
-                        } catch (e: Exception) {}
-                    }
-                    delay(40)
-                }
-            } catch (e: Exception) {}
-        }
-    }
-
-    fun updateTargetIp(newIp: String) {
-        try {
-            targetAddress = InetAddress.getByName(newIp)
-            if (isCallActive) punchHole(newIp)
-        } catch (e: Exception) {}
-    }
-
     fun toggleMute() { _muteStatus.value = !_muteStatus.value }
 
     fun stopCall() {
         isCallActive = false
         _muteStatus.value = false
-        targetAddress = null
+        targetIp = null
         activeSecretKey = null
         previousFrame = null
         jitterBuffer.clear()
 
-        recordJob?.cancel(); playJob?.cancel(); netJob?.cancel(); punchJob?.cancel()
+        // Don't close NetworkEngine! It's shared.
 
-        try { callSocket?.close() } catch (e: Exception) {}
+        recordJob?.cancel(); playJob?.cancel()
+
         try { audioRecord?.stop(); audioRecord?.release() } catch (e: Exception) {}
         try { audioTrack?.stop(); audioTrack?.release() } catch (e: Exception) {}
     }
