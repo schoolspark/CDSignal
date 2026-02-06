@@ -5,38 +5,30 @@ import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.util.Log
 import java.net.InetAddress
+import java.util.concurrent.ConcurrentLinkedQueue
 
 class LocalLinkManager(
     context: Context,
     private val onServiceFound: (String, InetAddress, Int) -> Unit,
     private val onServiceLost: (String) -> Unit
 ) {
-
     private val tag = "LocalLink"
     private val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
-
-    // Using ._tcp is generally more reliable for NSD resolution on Android than ._udp,
-    // even if the actual traffic is UDP.
     private val SERVICE_TYPE = "_cdsignal._tcp."
 
-    // Important: We hold references to the CURRENT listeners so we can unregister them.
-    // We do NOT define them as 'val' objects here, or they cannot be reused.
     private var registrationListener: NsdManager.RegistrationListener? = null
     private var discoveryListener: NsdManager.DiscoveryListener? = null
+
+    // [FIX] Resolution Queue to prevent "FAILURE_ALREADY_ACTIVE"
+    private val resolveQueue = ConcurrentLinkedQueue<NsdServiceInfo>()
+    @Volatile private var isResolving = false
 
     @Volatile private var isDiscoveryStarted = false
     @Volatile private var currentRegisteredName: String? = null
 
-    // --- FIX: ROBUST ADVERTISING ---
     fun startAdvertising(name: String, port: Int) {
         val cleanName = name.replace(Regex("[^A-Za-z0-9]"), "")
-
-        // 1. Prevention: If we are already advertising this EXACT name, do nothing.
-        if (currentRegisteredName == cleanName && registrationListener != null) {
-            return
-        }
-
-        // 2. Cleanup: Stop any existing advertisement first.
+        if (currentRegisteredName == cleanName && registrationListener != null) return
         stopAdvertising()
 
         val serviceInfo = NsdServiceInfo().apply {
@@ -45,128 +37,113 @@ class LocalLinkManager(
             this.port = port
         }
 
-        // 3. New Listener: Create a FRESH listener object for every registration.
-        // This prevents the "listener already in use" crash.
         val newListener = object : NsdManager.RegistrationListener {
-            override fun onServiceRegistered(NsdServiceInfo: NsdServiceInfo) {
+            override fun onServiceRegistered(info: NsdServiceInfo) {
                 currentRegisteredName = cleanName
-                Log.d(tag, "Service Registered: ${NsdServiceInfo.serviceName}")
+                Log.d(tag, "LAN Broadcast Active: ${info.serviceName}")
             }
-
-            override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                Log.e(tag, "Registration failed: Error $errorCode")
-                currentRegisteredName = null
+            override fun onRegistrationFailed(info: NsdServiceInfo, err: Int) {
                 registrationListener = null
             }
-
-            override fun onServiceUnregistered(arg0: NsdServiceInfo) {
-                Log.d(tag, "Service Unregistered")
+            override fun onServiceUnregistered(info: NsdServiceInfo) {
                 currentRegisteredName = null
             }
-
-            override fun onUnregistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                Log.e(tag, "Unregistration failed: Error $errorCode")
-            }
+            override fun onUnregistrationFailed(info: NsdServiceInfo, err: Int) {}
         }
 
         registrationListener = newListener
         try {
             nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, newListener)
         } catch (e: Exception) {
-            Log.e(tag, "Failed to register service", e)
-            registrationListener = null
+            Log.e(tag, "LAN Adv Failed", e)
         }
     }
 
     fun stopAdvertising() {
-        val listener = registrationListener
-        if (listener != null) {
-            try {
-                nsdManager.unregisterService(listener)
-            } catch (e: Exception) {
-                // Ignore "Service not registered" errors, just clean up
-            }
+        registrationListener?.let {
+            try { nsdManager.unregisterService(it) } catch (e: Exception) {}
         }
         registrationListener = null
         currentRegisteredName = null
     }
 
-    // --- DISCOVERY LOGIC ---
     fun startDiscovery() {
         if (isDiscoveryStarted) return
+        resolveQueue.clear()
+        isResolving = false
 
-        // Create a FRESH discovery listener every time
         val newListener = object : NsdManager.DiscoveryListener {
-            override fun onDiscoveryStarted(regType: String) {
+            override fun onDiscoveryStarted(type: String) {
                 isDiscoveryStarted = true
-                Log.d(tag, "Discovery started")
+                Log.d(tag, "LAN Discovery Started")
             }
 
             override fun onServiceFound(service: NsdServiceInfo) {
-                // Filter specifically for our service type
                 if (service.serviceType.contains("cdsignal")) {
-                    try {
-                        nsdManager.resolveService(service, object : NsdManager.ResolveListener {
-                            override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                                Log.e(tag, "Resolve failed: $errorCode")
-                            }
-
-                            override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
-                                // Ignore our own signal
-                                if (serviceInfo.serviceName.contains(currentRegisteredName ?: "SKIP_CHECK")) return
-
-                                val host = serviceInfo.host
-                                val port = serviceInfo.port
-                                // Remove prefix if present for cleaner UI
-                                val cleanFoundName = serviceInfo.serviceName.removePrefix("CD-")
-                                onServiceFound(cleanFoundName, host, port)
-                            }
-                        })
-                    } catch (e: Exception) {
-                        Log.e(tag, "Resolution error", e)
-                    }
+                    // [CRITICAL] Queue the service, don't resolve immediately
+                    resolveQueue.add(service)
+                    processResolveQueue()
                 }
             }
 
             override fun onServiceLost(service: NsdServiceInfo) {
-                val cleanLostName = service.serviceName.removePrefix("CD-")
-                onServiceLost(cleanLostName)
+                val cleanName = service.serviceName.removePrefix("CD-")
+                onServiceLost(cleanName)
             }
 
-            override fun onDiscoveryStopped(serviceType: String) {
-                isDiscoveryStarted = false
-            }
-
-            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
-                Log.e(tag, "Discovery start failed: $errorCode")
-                stopDiscovery()
-            }
-
-            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
-                stopDiscovery()
-            }
+            override fun onDiscoveryStopped(type: String) { isDiscoveryStarted = false }
+            override fun onStartDiscoveryFailed(type: String, err: Int) { stopDiscovery() }
+            override fun onStopDiscoveryFailed(type: String, err: Int) { stopDiscovery() }
         }
 
         discoveryListener = newListener
         try {
             nsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, newListener)
         } catch (e: Exception) {
-            Log.e(tag, "Discovery init failed", e)
             isDiscoveryStarted = false
         }
     }
 
+    // [FIX] Serialize Resolutions
+    private fun processResolveQueue() {
+        if (isResolving || resolveQueue.isEmpty()) return
+        val service = resolveQueue.peek() ?: return
+        isResolving = true
+
+        try {
+            nsdManager.resolveService(service, object : NsdManager.ResolveListener {
+                override fun onResolveFailed(info: NsdServiceInfo, err: Int) {
+                    resolveQueue.poll() // Remove failed
+                    isResolving = false
+                    processResolveQueue() // Next
+                }
+
+                override fun onServiceResolved(info: NsdServiceInfo) {
+                    resolveQueue.poll() // Remove success
+                    isResolving = false
+
+                    if (!info.serviceName.contains(currentRegisteredName ?: "SKIP_CHECK")) {
+                        val host = info.host
+                        val port = info.port
+                        val cleanName = info.serviceName.removePrefix("CD-")
+                        // Trigger Callback with LAN IP
+                        onServiceFound(cleanName, host, port)
+                    }
+                    processResolveQueue() // Next
+                }
+            })
+        } catch (e: Exception) {
+            isResolving = false
+        }
+    }
+
     fun stopDiscovery() {
-        val listener = discoveryListener
-        if (listener != null && isDiscoveryStarted) {
-            try {
-                nsdManager.stopServiceDiscovery(listener)
-            } catch (e: Exception) {
-                Log.w(tag, "Error stopping discovery", e)
-            }
+        discoveryListener?.let {
+            if (isDiscoveryStarted) try { nsdManager.stopServiceDiscovery(it) } catch (e: Exception) {}
         }
         discoveryListener = null
         isDiscoveryStarted = false
+        resolveQueue.clear()
     }
 
     fun stop() {

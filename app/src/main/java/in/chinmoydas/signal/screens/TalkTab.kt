@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.view.MotionEvent
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -50,7 +51,6 @@ import `in`.chinmoydas.signal.data.PagerEntry
 import `in`.chinmoydas.signal.viewmodel.ConnectionStatus
 import `in`.chinmoydas.signal.viewmodel.UiState
 import `in`.chinmoydas.signal.viewmodel.WalkieViewModel
-import `in`.chinmoydas.signal.utils.CallSignaling
 import kotlinx.coroutines.delay
 import java.util.Date
 import java.text.SimpleDateFormat
@@ -71,6 +71,15 @@ fun TalkTab(
     val pagerEntries by viewModel.pagerEntries.collectAsState()
     val isSecureMode = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE).getBoolean("secure_mode", false)
 
+    // [NEW] Keep Screen On while in PTT mode
+    DisposableEffect(Unit) {
+        val window = (context as? android.app.Activity)?.window
+        window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        onDispose {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
     // --- DIALOG STATES ---
     var showTextDialog by rememberSaveable { mutableStateOf(false) }
     var showSettingsDialog by rememberSaveable { mutableStateOf(false) }
@@ -84,14 +93,12 @@ fun TalkTab(
     val serviceState by service?.voiceServiceState?.collectAsState(initial = VoiceServiceState()) ?: remember { mutableStateOf(VoiceServiceState()) }
     val listState = rememberLazyListState()
 
-    // [MODIFIED] Permission Callback: Only calls logic, does NOT trigger system check
     val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
         if (results.getOrDefault(Manifest.permission.RECORD_AUDIO, false)) {
             onPermissionsGranted()
         }
     }
 
-    // [MODIFIED] Startup Logic: Requests Permissions if needed, but removed Auto-Diagnostics
     LaunchedEffect(Unit) {
         val perms = mutableListOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.VIBRATE, Manifest.permission.ACCESS_FINE_LOCATION)
         if (Build.VERSION.SDK_INT >= 34) perms.add(Manifest.permission.FOREGROUND_SERVICE_MICROPHONE)
@@ -105,7 +112,6 @@ fun TalkTab(
         if (!hasAllPermissions) {
             permLauncher.launch(perms.toTypedArray())
         }
-        // Removed the 'else { onCheckSystem() }' block
     }
 
     LaunchedEffect(service) {
@@ -139,7 +145,7 @@ fun TalkTab(
             item {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
 
-                    // [NEW] ACTIVE TARGET CARD & CLEAR BUTTON
+                    // TARGET CARD
                     if (viewModel.targetUser.isNotEmpty()) {
                         Card(
                             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
@@ -167,7 +173,6 @@ fun TalkTab(
                                         overflow = TextOverflow.Ellipsis
                                     )
                                 }
-                                // THE DISCONNECT BUTTON
                                 IconButton(onClick = { viewModel.clearTarget() }) {
                                     Icon(
                                         imageVector = Icons.Default.Close,
@@ -225,7 +230,6 @@ fun TalkTab(
                         Icon(Icons.Default.Sync, "Sync", tint = MaterialTheme.colorScheme.primary)
                     }
 
-                    // This Manual Button remains as requested
                     IconButton(onClick = onCheckSystem) {
                         Icon(Icons.Default.VerifiedUser, "System Check", tint = MaterialTheme.colorScheme.primary)
                     }
@@ -263,9 +267,8 @@ fun TalkTab(
                 }
             }
 
-            // --- 3. PTT BUTTON (FIXED) ---
+            // --- 3. PTT BUTTON ---
             item {
-                // Debounce state to prevent rapid-fire crashes
                 var lastTouchTime by remember { mutableLongStateOf(0L) }
 
                 Box(
@@ -277,12 +280,9 @@ fun TalkTab(
                             when (motionEvent.action) {
                                 MotionEvent.ACTION_DOWN -> {
                                     val now = System.currentTimeMillis()
-                                    // [FIX 1] Debounce: Ignore touches faster than 500ms
                                     if (now - lastTouchTime < 500) return@pointerInteropFilter true
                                     lastTouchTime = now
 
-                                    // [FIX 2] Permission Trap: Check permission BEFORE starting logic
-                                    // If we don't have it, launch dialog and STOP. Do not start transmitting.
                                     if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                                         permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
                                         return@pointerInteropFilter true
@@ -291,7 +291,6 @@ fun TalkTab(
                                     isPressed = true
                                     if (service != null) {
                                         if (viewModel.isHandsFree) {
-                                            // HANDS-FREE TOGGLE LOGIC
                                             if (serviceState.isTransmitting) {
                                                 viewModel.stopTransmission { service.stopTalk() }
                                             } else {
@@ -301,7 +300,6 @@ fun TalkTab(
                                                 )
                                             }
                                         } else {
-                                            // PUSH-TO-TALK LOGIC
                                             viewModel.startTransmission(
                                                 onIpsFound = { ips, port -> service.startTalk(ips, port) },
                                                 onUpdateIps = { newIps, port -> service.updateTalkTargets(newIps, port) }
@@ -311,7 +309,6 @@ fun TalkTab(
                                 }
                                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                                     isPressed = false
-                                    // Only stop if we are NOT in HandsFree mode
                                     if (!viewModel.isHandsFree && service != null) {
                                         viewModel.stopTransmission { service.stopTalk() }
                                     }
@@ -345,7 +342,6 @@ fun TalkTab(
                         selected = viewModel.isHandsFree,
                         onClick = {
                             viewModel.isHandsFree = !viewModel.isHandsFree
-                            // Safe stop if we toggle off while talking
                             if (serviceState.isTransmitting) viewModel.stopTransmission { service?.stopTalk() }
                             val status = if (viewModel.isHandsFree) "Handsfree: ON" else "Handsfree: OFF"
                             Toast.makeText(context, status, Toast.LENGTH_SHORT).show()
@@ -441,10 +437,11 @@ fun TalkTab(
         FloatingActionButton(
             onClick = {
                 if (canCall) {
-                    val contact = viewModel.savedContacts.find { it.name == targetUser }
-                    val ip = contact?.ip ?: ""
-                    if (ip.isNotEmpty()) CallSignaling.startOutgoingCall(ip) else Toast.makeText(context, "Target Offline", Toast.LENGTH_SHORT).show()
-                } else { Toast.makeText(context, "Select Target", Toast.LENGTH_SHORT).show() }
+                    // [FIX] Use ViewModel wrapper to ensure safety and IP resolution
+                    viewModel.startCall(context)
+                } else {
+                    Toast.makeText(context, "Select Target", Toast.LENGTH_SHORT).show()
+                }
             },
             containerColor = if (canCall) Color(0xFF43A047) else Color.Gray,
             contentColor = Color.White,

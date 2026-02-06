@@ -205,6 +205,7 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
                     onCheckedChange = { check ->
                         if (check) {
                             showGuardianConsent = true
+                            isRemoteAllowed = true // Optimistic update, reverted if cancelled
                         } else {
                             isRemoteAllowed = false
                             prefs.edit().putBoolean("allow_remote_control", false).apply()
@@ -216,7 +217,7 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
         }
         Spacer(Modifier.height(16.dp))
 
-        // [ADD THIS CARD]
+        // D. Eco Mode
         Card(
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha=0.5f)),
             modifier = Modifier.fillMaxWidth()
@@ -254,6 +255,8 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
                 )
             }
         }
+
+        Spacer(Modifier.height(16.dp))
 
         // --- NEW: RECOVERY EMAIL CARD ---
         Card(
@@ -337,7 +340,11 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
     // 2. Guardian Consent Dialog
     if (showGuardianConsent) {
         AlertDialog(
-            onDismissRequest = { showGuardianConsent = false },
+            onDismissRequest = {
+                // [FIX] If cancelled, revert the switch
+                showGuardianConsent = false
+                isRemoteAllowed = false
+            },
             icon = { Icon(Icons.Default.Warning, null, tint = MaterialTheme.colorScheme.error) },
             title = { Text("Enable Guardian Mode?", fontWeight = FontWeight.Bold) },
             text = {
@@ -361,13 +368,17 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showGuardianConsent = false }) { Text("CANCEL") }
+                TextButton(onClick = {
+                    // [FIX] If cancelled, revert the switch
+                    showGuardianConsent = false
+                    isRemoteAllowed = false
+                }) { Text("CANCEL") }
             }
         )
     }
-    // 3. RECOVERY EMAIL DIALOG (Fixed)
+
+    // 3. RECOVERY EMAIL DIALOG
     if (showEmailDialog) {
-        // Initialize with the current value from the ViewModel
         var emailInput by remember { mutableStateOf(if(recoveryEmail == "Not Set") "" else recoveryEmail) }
 
         AlertDialog(
@@ -389,15 +400,11 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
                         modifier = Modifier.fillMaxWidth()
                     )
 
-                    // Remove Button
                     if (recoveryEmail != "Not Set" && recoveryEmail.isNotBlank()) {
                         Spacer(Modifier.height(16.dp))
                         OutlinedButton(
                             onClick = {
-                                // Save empty string to clear
-                                viewModel.saveRecoveryEmail(context, "") {
-                                    showEmailDialog = false
-                                }
+                                viewModel.saveRecoveryEmail(context, "") { showEmailDialog = false }
                             },
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
@@ -411,10 +418,7 @@ fun ProfileTab(modifier: Modifier = Modifier, navController: NavController, myNa
             },
             confirmButton = {
                 Button(onClick = {
-                    viewModel.saveRecoveryEmail(context, emailInput) {
-                        showEmailDialog = false
-                        // No manual Prefs update needed here!
-                    }
+                    viewModel.saveRecoveryEmail(context, emailInput) { showEmailDialog = false }
                 }) { Text("SAVE") }
             },
             dismissButton = {

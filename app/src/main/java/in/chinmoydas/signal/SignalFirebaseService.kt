@@ -55,14 +55,15 @@ class SignalFirebaseService : FirebaseMessagingService() {
         if (data["action"] == "WAKE_RADIO") {
             val sender = data["sender"] ?: "Unknown"
             val senderIp = data["sender_ip"]
+            // Default to our Unified Port 50005 if missing
             val senderPort = data["sender_port"]?.toIntOrNull() ?: 50005
 
             Log.d(tag, "Wake Signal from $sender ($senderIp:$senderPort)")
 
-            // Acquire temporary lock just to process this logic
+            // Acquire temporary lock to ensure processing finishes
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
             val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Signal:CloudWakeLock")
-            wakeLock.acquire(5 * 1000L) // 5s timeout is enough to launch service
+            wakeLock.acquire(5 * 1000L)
 
             startVoiceServiceForPunchBack(sender, senderIp, senderPort)
         }
@@ -79,13 +80,13 @@ class SignalFirebaseService : FirebaseMessagingService() {
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                // This might throw exception on Android 12+ if app is in background
                 startForegroundService(intent)
             } else {
                 startService(intent)
             }
         } catch (e: Exception) {
-            // [FIX] Android 12+ "ForegroundServiceStartNotAllowedException"
-            Log.e(tag, "Background Start Failed: ${e.message}. Posting Fallback Notification.")
+            Log.e(tag, "Background Service Start Blocked: ${e.message}. Using High-Priority Notification.")
             postFallbackNotification(sender)
         }
     }
@@ -96,11 +97,18 @@ class SignalFirebaseService : FirebaseMessagingService() {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(channelId, "Wake Alerts", NotificationManager.IMPORTANCE_HIGH).apply {
-                description = "Incoming Call Alerts"
+                description = "Incoming PTT Wake Signals"
                 enableVibration(true)
                 lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
-                // [FIX] Ensure sound plays even in Do Not Disturb if allowed
-                setBypassDnd(true)
+                setBypassDnd(true) // Ensure it rings even in DND
+
+                // Use a loud sound or default notification sound
+                val soundUri = android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION)
+                val audioAttributes = android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_INSTANT)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build()
+                setSound(soundUri, audioAttributes)
             }
             manager.createNotificationChannel(channel)
         }
@@ -109,8 +117,7 @@ class SignalFirebaseService : FirebaseMessagingService() {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra("is_cloud_wake", true)
             putExtra("woken_by", sender)
-            // [FIX] Pass "is_call" so MainActivity keeps screen on
-            putExtra("is_call", true)
+            putExtra("is_call", true) // Forces screen on logic in MainActivity
         }
 
         val pendingIntent = PendingIntent.getActivity(
@@ -122,11 +129,11 @@ class SignalFirebaseService : FirebaseMessagingService() {
 
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("Incoming Signal")
-            .setContentText("$sender is transmitting...")
-            // [FIX] Use your own icon, system icons are unsafe
+            .setContentText("$sender is trying to connect...")
             .setSmallIcon(R.mipmap.ic_launcher_foreground)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_CALL)
+            // Full Screen Intent creates the "Incoming Call" style popup
             .setFullScreenIntent(pendingIntent, true)
             .setAutoCancel(true)
             .setTimeoutAfter(30000)

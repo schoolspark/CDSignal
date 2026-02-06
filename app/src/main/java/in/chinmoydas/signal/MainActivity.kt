@@ -97,6 +97,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // [INIT] Initialize Signaling for VoIP
         CallSignaling.initialize(applicationContext)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
@@ -215,8 +216,7 @@ class MainActivity : ComponentActivity() {
                         // 2. SAFETY OVERLAYS (SOS/Location) - Always on top
                         SafetyOverlay(nameResolver = nameResolverHelper)
 
-                        // 3. Updated Call UI Logic.
-
+                        // 3. VoIP CALL OVERLAY (Global)
                         if (callStatus != CallStatus.Idle) {
                             if (!isCallMinimized) {
                                 // A. Full Screen Call UI
@@ -230,7 +230,7 @@ class MainActivity : ComponentActivity() {
                                         walkieViewModel.hangUp(currentService)
                                     },
 
-                                    // [NEW] Green Button (Accept Incoming)
+                                    // Green Button (Accept Incoming)
                                     onAccept = {
                                         lifecycleScope.launch {
                                             `in`.chinmoydas.signal.utils.CallSignaling.acceptCall()

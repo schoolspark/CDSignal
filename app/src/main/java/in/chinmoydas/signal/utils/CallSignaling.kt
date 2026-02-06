@@ -22,7 +22,7 @@ object CallSignaling {
     private const val TAG = "CallSignaling"
 
     // [PROTOCOL COMMANDS]
-    const val CMD_REQ = "CMD:CALL:REQ" // Updated to match VoiceService filters
+    const val CMD_REQ = "CMD:CALL:REQ"
     const val CMD_ACC = "CMD:CALL:ACC"
     const val CMD_REJ = "CMD:CALL:REJ"
     const val CMD_END = "CMD:CALL:END"
@@ -49,23 +49,22 @@ object CallSignaling {
         appContext = context.applicationContext
     }
 
-    // --- INCOMING SIGNAL HANDLER ---
+    // --- INCOMING SIGNAL HANDLER (Called by VoiceService) ---
+    //
     fun handleSignal(payload: String, ip: String) {
-        // Filter: Only handle CALL commands
         if (!payload.startsWith("CMD:CALL")) return
         Log.d(TAG, "Signal: $payload from $ip")
 
         when (payload) {
             CMD_REQ -> {
-                // [FIX] Idempotency: Ignore if we are already ringing for this IP
+                // [FIX] Idempotency: If already ringing for THIS ip, just re-ack
                 if (_callStatus.value == CallStatus.Ringing && currentCallerIp == ip) {
-                    // Re-ACK just in case they didn't get the first one
                     queueCommand(ip, "ACK:$CMD_REQ")
                     return
                 }
 
                 if (isBusy || CallEngine.isCallActive) {
-                    queueCommand(ip, CMD_BUSY) // Tell them we are busy
+                    queueCommand(ip, CMD_BUSY)
                     return
                 }
 
@@ -78,10 +77,10 @@ object CallSignaling {
                 launchIncomingCallUI()
                 scope.launch { _callEvents.emit(CallEvent.IncomingCall(ip)) }
 
-                // 3. [CRITICAL] Send ACK (Stops the caller's retry loop)
+                // 3. Send ACK (Stops caller retry loop)
                 queueCommand(ip, "ACK:$CMD_REQ")
 
-                // 4. Safety Timeout (Stop ringing if no answer in 30s)
+                // 4. Safety Timeout (30s Ringing Limit)
                 callTimeoutJob = scope.launch {
                     delay(30_000)
                     if (_callStatus.value == CallStatus.Ringing) declineCall()
@@ -93,34 +92,34 @@ object CallSignaling {
                     callTimeoutJob?.cancel()
                     _callStatus.value = CallStatus.Active
                     scope.launch { _callEvents.emit(CallEvent.CallConnected) }
-                    // ACK the Acceptance
+                    // ACK the Acceptance to stop their retry loop
                     queueCommand(ip, "ACK:$CMD_ACC")
                 }
             }
 
             CMD_REJ -> {
                 if (_callStatus.value == CallStatus.Dialing) {
-                    reset()
                     scope.launch { _callEvents.emit(CallEvent.CallRejected) }
+                    reset()
                 }
             }
 
             CMD_BUSY -> {
                 if (_callStatus.value == CallStatus.Dialing) {
-                    reset()
                     scope.launch { _callEvents.emit(CallEvent.CallBusy) }
+                    reset()
                 }
             }
 
             CMD_END -> {
                 // Remote hangup
-                reset()
                 scope.launch { _callEvents.emit(CallEvent.CallEnded) }
+                reset()
             }
         }
     }
 
-    // --- OUTGOING ACTIONS ---
+    // --- OUTGOING ACTIONS (Called by UI) ---
 
     fun startOutgoingCall(ip: String) {
         if (isBusy) return
@@ -128,7 +127,7 @@ object CallSignaling {
         currentCallerIp = ip
         _callStatus.value = CallStatus.Dialing
 
-        // [FIX] Use Reliable Command (Retries until ACK or Timeout)
+        // Send Reliable Invite
         queueCommand(ip, CMD_REQ)
 
         scope.launch { _callEvents.emit(CallEvent.OutgoingCall(ip)) }
@@ -147,10 +146,10 @@ object CallSignaling {
 
     fun acceptCall() {
         val ip = currentCallerIp ?: return
-        isBusy = true
+        callTimeoutJob?.cancel() // Stop the "Missed Call" timer
         _callStatus.value = CallStatus.Active
 
-        // [FIX] Send Reliable Accept
+        // Send Reliable Accept
         queueCommand(ip, CMD_ACC)
 
         scope.launch { _callEvents.emit(CallEvent.CallConnected) }
@@ -159,21 +158,18 @@ object CallSignaling {
     fun declineCall() {
         val ip = currentCallerIp
         if (ip != null) queueCommand(ip, CMD_REJ)
-        reset()
         scope.launch { _callEvents.emit(CallEvent.CallRejected) }
+        reset()
     }
 
     fun endCall() {
-        callTimeoutJob?.cancel()
         val ip = currentCallerIp
-
-        // Notify other party
         if (ip != null) queueCommand(ip, CMD_END)
-
         scope.launch { _callEvents.emit(CallEvent.CallEnded) }
         reset()
     }
 
+    // Reset internal state
     private fun reset() {
         isBusy = false
         currentCallerIp = null
@@ -188,16 +184,34 @@ object CallSignaling {
         }
     }
 
+    // --- HELPER: Android 12+ Background Activity Start ---
+    fun onIncomingCall(ip: String) {
+        // Wrapper for VoiceService to call
+        handleSignal(CMD_REQ, ip)
+    }
+
+    fun onCallAccepted() { acceptCall() }
+    fun onCallRejected() { declineCall() }
+    fun onCallEnded() { endCall() }
+    fun onPeerBusy() {
+        scope.launch { _callEvents.emit(CallEvent.CallBusy) }
+        reset()
+    }
+
     private fun launchIncomingCallUI() {
         appContext?.let { ctx ->
-            val intent = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)?.apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-                addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                // These extras ensure MainActivity opens the Call Overlay
-                action = "INCOMING_CALL"
-                putExtra("is_call", true)
+            try {
+                val intent = Intent(ctx, `in`.chinmoydas.signal.MainActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                    addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                    // These extras ensure MainActivity opens the Call Overlay
+                    action = "INCOMING_CALL"
+                    putExtra("is_call", true)
+                }
+                ctx.startActivity(intent)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to launch UI", e)
             }
-            ctx.startActivity(intent)
         }
     }
 

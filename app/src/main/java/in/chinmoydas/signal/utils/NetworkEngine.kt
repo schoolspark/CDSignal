@@ -30,10 +30,10 @@ class NetworkEngine(
         const val TYPE_KEEP_ALIVE: Byte = 0x13
     }
 
-    // DNS Cache
+    // DNS Cache to prevent "Stutter" during frequent lookups
     private val ipCache = ConcurrentHashMap<String, InetAddress>()
 
-    // Outgoing Queue
+    // Outgoing Queue for the Sender Thread
     private val sendQueue = LinkedBlockingQueue<DatagramPacket>(256)
 
     fun start(): Boolean {
@@ -73,7 +73,7 @@ class NetworkEngine(
                 }
             }.start()
 
-            // Sender Thread (Standard Queue)
+            // Sender Thread (Standard Queue Consumer)
             Thread {
                 while (isRunning.get()) {
                     try {
@@ -127,7 +127,7 @@ class NetworkEngine(
         queuePacket(data, targets, targetPort)
     }
 
-    // [Burst Send] - Now uses Coroutines (Non-blocking)
+    // [Burst Send] - Uses Coroutines (Non-blocking)
     fun sendBurst(type: Byte, data: ByteArray, targets: List<String>, targetPort: Int, burstCount: Int) {
         if (!isRunning.get() || targets.isEmpty()) return
 

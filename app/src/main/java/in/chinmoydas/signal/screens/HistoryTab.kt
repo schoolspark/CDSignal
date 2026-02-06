@@ -29,6 +29,9 @@ fun HistoryTab(
     val context = LocalContext.current
     val callLogs by viewModel.callLogs.collectAsState()
     val pagerEntries by viewModel.pagerEntries.collectAsState()
+
+    // [OPTIMIZATION] Create formatter once. SimpleDateFormat is not thread-safe,
+    // but safe here as it's confined to the Main Thread UI recomposition.
     val sdf = remember { SimpleDateFormat("MMM dd, HH:mm", Locale.getDefault()) }
 
     Column(modifier = modifier.fillMaxSize().padding(16.dp)) {
@@ -51,7 +54,7 @@ fun HistoryTab(
                     item {
                         Text("Unread Messages", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 8.dp))
                     }
-                    items(pagerEntries) { entry ->
+                    items(pagerEntries, key = { it.id }) { entry -> // [FIX] Added Key for performance
                         val isText = entry.type == "TEXT"
                         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer), modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                             Row(modifier = Modifier.padding(12.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
@@ -83,20 +86,23 @@ fun HistoryTab(
                 // --- SECTION 2: CALL LOGS ---
                 if (callLogs.isNotEmpty()) {
                     item { Text("Call History", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 8.dp)) }
-                    items(callLogs) { log ->
+
+                    items(callLogs, key = { it.timestamp }) { log -> // [FIX] Added Key
                         var showMenu by remember { mutableStateOf(false) }
 
-                        val isPrincipal = viewModel.savedContacts.find { it.name == log.callerName }?.isPriority == true
+                        // Resolve Data efficiently
+                        val callerName = if (log.callerName.startsWith("group:")) log.callerName.substringAfter(":") else log.callerName
 
-                        // [Privacy Logic] Resolve IP safely to allow "Call Back"
-                        val contactIp = remember(log.callerName) {
-                            viewModel.savedContacts.find { it.name == log.callerName }?.ip
-                                ?: viewModel.nearbyUsers.find { it.name == log.callerName }?.ip
-                        }
+                        // [OPTIMIZED] Logic moved inside a remember block or accessed directly
+                        // We access the lists directly as they are unlikely to change DURING a scroll
+                        val isPrincipal = viewModel.savedContacts.find { it.name == log.callerName }?.isPriority == true
+                        val contactIp = viewModel.savedContacts.find { it.name == log.callerName }?.ip
+                            ?: viewModel.nearbyUsers.find { it.name == log.callerName }?.ip
+
                         val isCallable = contactIp != null && contactIp != "SERVER_LINK"
 
                         ListItem(
-                            headlineContent = { Text(if (log.callerName.startsWith("group:")) log.callerName.substringAfter(":") else log.callerName, fontWeight = FontWeight.Bold) },
+                            headlineContent = { Text(callerName, fontWeight = FontWeight.Bold) },
                             supportingContent = { Text(sdf.format(Date(log.timestamp))) },
                             leadingContent = { Icon(if (log.isIncoming) Icons.Default.CallReceived else Icons.Default.CallMade, null, tint = if (log.isIncoming) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary) },
                             trailingContent = {
@@ -105,7 +111,11 @@ fun HistoryTab(
                                     DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
 
                                         // Action 1: Connect via PTT Radio
-                                        DropdownMenuItem(text = { Text("PTT Connect") }, onClick = { viewModel.setTarget(log.callerName); showMenu = false }, leadingIcon = { Icon(Icons.Default.GraphicEq, null) })
+                                        DropdownMenuItem(
+                                            text = { Text("PTT Connect") },
+                                            onClick = { viewModel.setTarget(log.callerName); showMenu = false },
+                                            leadingIcon = { Icon(Icons.Default.GraphicEq, null) }
+                                        )
 
                                         // Action 2: Secure Voice Call Back
                                         if (!log.callerName.startsWith("group:")) {
@@ -133,7 +143,11 @@ fun HistoryTab(
                                                 leadingIcon = { Icon(Icons.Default.Star, null, tint = if(isPrincipal) Color.Yellow else Color.Gray) }
                                             )
                                             // Action 4: Block
-                                            DropdownMenuItem(text = { Text("Block User") }, onClick = { viewModel.blockContact(log.callerName); showMenu = false }, leadingIcon = { Icon(Icons.Default.Block, null, tint = Color.Red) })
+                                            DropdownMenuItem(
+                                                text = { Text("Block User") },
+                                                onClick = { viewModel.blockContact(log.callerName); showMenu = false },
+                                                leadingIcon = { Icon(Icons.Default.Block, null, tint = Color.Red) }
+                                            )
                                         }
                                     }
                                 }

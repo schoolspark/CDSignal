@@ -125,7 +125,7 @@ class VoiceService : Service() {
     private var lastReceiveTime = 0L
     private var resetJob: Job? = null
     private var cleanupJob: Job? = null
-
+    private var ringTimeoutJob: Job? = null
     private var callWatchdogJob: Job? = null
     private var ringtonePlayer: MediaPlayer? = null
     @Volatile private var lastCallPacketTime: Long = 0L
@@ -220,11 +220,25 @@ class VoiceService : Service() {
         }
     }
 
+    // [UPDATE] Network Callback with Automatic LAN Discovery Logic
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
             super.onCapabilitiesChanged(network, networkCapabilities)
             val isWifiNow = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
-            if (isOnWifi != isWifiNow) isOnWifi = isWifiNow
+
+            if (isOnWifi != isWifiNow) {
+                isOnWifi = isWifiNow
+                if (isOnWifi) {
+                    Log.d(tag, "Switched to Wi-Fi: Starting LAN Discovery")
+                    localLinkManager?.startDiscovery()
+                    localLinkManager?.startAdvertising(myUsername, UDP_PORT)
+                } else {
+                    Log.d(tag, "Left Wi-Fi: Stopping LAN Discovery")
+                    localLinkManager?.stopDiscovery()
+                    // Stop advertising on mobile data to save battery/bandwidth
+                    localLinkManager?.stopAdvertising()
+                }
+            }
         }
 
         override fun onAvailable(network: Network) {
@@ -237,7 +251,6 @@ class VoiceService : Service() {
 
                     // [SERVERLESS] No need to stop/start network engine here.
                     // UDP socket binds to 0.0.0.0, so it handles interface changes automatically
-                    // or fails gracefully. We just re-announce.
 
                     _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
                     sendTextMessage("255.255.255.255", "CMD:I_MOVED")
@@ -247,7 +260,8 @@ class VoiceService : Service() {
                     if (!targetIp.isNullOrBlank()) sendPing(targetIp)
 
                     broadcastHello()
-                    localLinkManager?.startAdvertising(myUsername, UDP_PORT)
+                    // Restart advertising on new network
+                    if (isOnWifi) localLinkManager?.startAdvertising(myUsername, UDP_PORT)
                     connectionManager.triggerImmediateHeartbeat()
                 } else if (myLocalIp.isEmpty()) {
                     myLocalIp = newIp
@@ -434,6 +448,40 @@ class VoiceService : Service() {
         wifiLock.setReferenceCounted(false)
         val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         connectivityManager.registerNetworkCallback(NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), networkCallback)
+
+        // [UPDATE] Initialize LocalLinkManager with Bypass Logic
+        try {
+            if (localLinkManager == null) {
+                localLinkManager = LocalLinkManager(
+                    context = this,
+                    onServiceFound = { name, ip, port ->
+                        val ipString = ip.hostAddress
+                        // 1. Bypass Logic: If peer is local, override cache immediately
+                        if (ipString != null && ipString != myLocalIp) {
+                            Log.i(tag, "LAN PEER FOUND: $name at $ipString")
+                            activeIpCache[name] = ipString
+
+                            scope.launch {
+                                // 2. Persist to DB
+                                repository.updateContactIp(name, ipString)
+
+                                // 3. If currently targeted, refresh connection loop with new Local IP
+                                if (repository.getTargetUser() == name) {
+                                    connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey, ipString)
+                                    sendPing(ipString) // Send "Hello" locally
+                                    updateNotification("LAN: Connected to $name", null)
+                                }
+                            }
+                        }
+                    },
+                    onServiceLost = { name ->
+                        Log.i(tag, "LAN PEER LOST: $name")
+                    }
+                )
+            }
+            // Start advertising if on WiFi
+            if (isOnWifi) localLinkManager?.startAdvertising(myUsername, UDP_PORT)
+        } catch (e: Exception) { Log.e(tag, "LocalLink Init Failed", e) }
     }
 
     fun speakText(text: String) {
@@ -530,11 +578,14 @@ class VoiceService : Service() {
         voxJob = null
     }
 
+    // [UPDATE] Modified to pass Target IP to ConnectionManager (Dual Heartbeat)
     private fun observeRepositoryFlows() {
-        scope.launch { repository.myUsername.collect { myUsername = it; localLinkManager?.startAdvertising(it, UDP_PORT) } }
+        scope.launch { repository.myUsername.collect { myUsername = it; if(isOnWifi) localLinkManager?.startAdvertising(it, UDP_PORT) } }
         scope.launch { repository.myPairingCode.collect { myIdentityKey = it } }
         scope.launch {
             repository.targetUser.collect { target ->
+                var targetIp: String? = null
+
                 if (target.startsWith("group:", ignoreCase = true)) {
                     val raw = target.substringAfter(":")
                     if (raw.contains(":")) {
@@ -543,12 +594,19 @@ class VoiceService : Service() {
                     } else { currentChannel = raw }
                 } else {
                     currentChannel = null
-                    val savedContact = repository.getAllContacts().find { it.name == target }
-                    if (savedContact != null) targetContactKey = savedContact.savedCode else targetContactKey = null
+                    // 1. Resolve IP immediately so we can lock onto the target
+                    val contact = repository.getAllContacts().find { it.name == target }
+                    targetIp = activeIpCache[target] ?: contact?.ip
+
+                    // 2. Initial "Hole Punch" (The burst ping you already had)
+                    if (!targetIp.isNullOrBlank() && targetIp != "SERVER_LINK") {
+                        sendPing(targetIp)
+                    }
                 }
-                connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey)
-                val ip = activeIpCache[target] ?: repository.getAllContacts().find { it.name == target }?.ip
-                if (!ip.isNullOrBlank() && ip != "SERVER_LINK") sendPing(ip)
+
+                // 3. Start the "Dual Loop" (Server + Target Keep-Alive)
+                // This passes the resolved IP to ConnectionManager to ping every 20s
+                connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey, targetIp)
             }
         }
         scope.launch {
@@ -565,6 +623,11 @@ class VoiceService : Service() {
             repository.channelKey.collect { key ->
                 currentChannelKey = key
                 if (currentChannel != null) targetContactKey = key
+
+                // Update heartbeat if key changes, preserving target IP logic
+                val target = repository.getTargetUser()
+                val ip = activeIpCache[target]
+                connectionManager.startHeartbeatLoop(currentChannel, key, ip)
             }
         }
     }
@@ -881,7 +944,11 @@ class VoiceService : Service() {
     }
 
     // [SERVERLESS] Updated Handler - Now receives stripped payload + senderIP from NetworkEngine
+    // [SERVERLESS] Updated Handler - Now receives stripped payload + senderIP from NetworkEngine
     private fun handleIncomingPacket(data: ByteArray, length: Int, senderIp: String, senderPort: Int) {
+        // [FIX] Update Activity Monitor to save battery
+        if (::connectionManager.isInitialized) connectionManager.notifyNetworkActivity()
+
         // 1. SELF FILTER
         if (senderIp == myLocalIp || length <= 5) return
 
@@ -890,7 +957,7 @@ class VoiceService : Service() {
         if (nameLen + 5 > length) return
         val senderName = String(data, 1, nameLen)
 
-        // 3. PROTOCOL COMMANDS
+        // 3. PROTOCOL COMMANDS (Network Level)
         if (senderName.startsWith("HELLO:")) {
             val parts = senderName.split(":")
             if (parts.size >= 3) {
@@ -948,7 +1015,6 @@ class VoiceService : Service() {
         val lastSeq = sequenceMap.getOrPut(senderName) { -1 }
 
         if (seqNum > lastSeq || seqNum < lastSeq - 1000 || seqNum == 0) {
-            // [SERVERLESS] Just update IP logic, port caching handled implicitly via reply
             if (!senderName.startsWith("group:") && activeIpCache[senderName] != senderIp) {
                 activeIpCache[senderName] = senderIp
                 scope.launch {
@@ -985,7 +1051,7 @@ class VoiceService : Service() {
                 }
             }
 
-            // 8. TEXT ROUTING
+            // 8. TEXT ROUTING & SIGNALING
             val isTextOrCmd = if (payload.size > 4) {
                 val header = String(payload, 0, 4, Charsets.UTF_8)
                 header == "TXT:" || header == "CMD:" || header == "LOC:"
@@ -997,6 +1063,9 @@ class VoiceService : Service() {
                     if (textData.startsWith("TXT:")) {
                         val cleanMessage = textData.substring(4)
 
+                        // --- [FIX START] CRITICAL PROTOCOL HANDLING ---
+
+                        // 1. PING/ACK Handlers
                         if (cleanMessage == "CMD:CALL:PING") { lastCallPacketTime = System.currentTimeMillis(); return }
                         if (cleanMessage.startsWith("ACK:")) {
                             val originalCmd = cleanMessage.removePrefix("ACK:")
@@ -1005,17 +1074,40 @@ class VoiceService : Service() {
                             pendingAckJobs.remove(jobKey)
                             return
                         }
+
+                        // 2. SOS Handler
                         if (cleanMessage == "CMD:SOS") {
                             sendTextMessage(senderIp, "ACK:CMD:SOS")
                             showIncomingCallNotification(senderName, "SOS ALERT", isAlarm = true)
                             SafetySignaling.triggerSOS(senderName)
                             return
                         }
-                        if (packetInterceptor?.invoke(cleanMessage, senderIp) == true) return
+
+                        // 3. CALL PROTOCOL (Handle Locally to wake Dead UI)
+                        if (cleanMessage.startsWith("CMD:CALL:")) {
+                            when (cleanMessage) {
+                                CallSignaling.CMD_REQ -> {
+                                    Log.d(tag, "Call Request from $senderName")
+                                    CallSignaling.onIncomingCall(senderIp)
+                                }
+                                CallSignaling.CMD_ACC -> CallSignaling.onCallAccepted()
+                                CallSignaling.CMD_REJ -> CallSignaling.onCallRejected()
+                                CallSignaling.CMD_END -> CallSignaling.onCallEnded()
+                                CallSignaling.CMD_BUSY -> CallSignaling.onPeerBusy()
+                            }
+                            return // Stop processing
+                        }
+
+                        // 4. Remote Control
                         if (cleanMessage.startsWith("CMD:REMOTE_")) {
                             handleRemoteCommand(cleanMessage, senderIp, senderName, isPrincipal, prefs)
                             return
                         }
+                        // --- [FIX END] ---
+
+                        // 5. Normal Text (UI Interceptor)
+                        if (packetInterceptor?.invoke(cleanMessage, senderIp) == true) return
+
                         if (!cleanMessage.startsWith("CMD:") && !cleanMessage.startsWith("LOC:")) {
                             speakText(cleanMessage)
                             scope.launch {
@@ -1030,7 +1122,6 @@ class VoiceService : Service() {
             }
 
             // --- IT IS AUDIO (PTT) ---
-            // If CallEngine is active, we ignore PTT audio (Split Audio Priority)
             if (CallEngine.isCallActive) {
                 return
             }
@@ -1043,7 +1134,7 @@ class VoiceService : Service() {
                 try { payload = G711.decode(payload, 640) } catch (e: Exception) { }
             }
 
-            // [FIX] Play Audio always if allowed
+            // Play Audio
             if (!isSilenced || isPrincipal) {
                 try { audioEngine.playPcmChunk(payload, seqNum) } catch (e: Exception) {}
             }
@@ -1582,6 +1673,9 @@ class VoiceService : Service() {
     }
 
     private fun startRinging() {
+        // 1. Cancel any existing timeout to prevent double-firing
+        ringTimeoutJob?.cancel()
+
         try {
             if (ringtonePlayer == null) {
                 val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
@@ -1597,10 +1691,26 @@ class VoiceService : Service() {
                 @Suppress("DEPRECATION")
                 vibrator.vibrate(pattern, 0)
             }
+
+            // [FIX] Safety Timeout: Stop ringing after 45 seconds if no answer
+            ringTimeoutJob = scope.launch {
+                delay(45_000) // 45 Seconds
+                Log.w(tag, "Ring Timeout: Force stopping vibration")
+                stopRinging()
+                // Update State to clear the "Incoming" UI if it reappears
+                _voiceServiceState.update { it.copy(incomingCall = null, incomingIp = null) }
+                // Notify signaling to reset
+                `in`.chinmoydas.signal.utils.CallSignaling.onCallEnded()
+            }
+
         } catch (e: Exception) { Log.e(tag, "Ringing Failed", e) }
     }
 
     private fun stopRinging() {
+        // [FIX] Cancel the safety timer so it doesn't kill a connected call later
+        ringTimeoutJob?.cancel()
+        ringTimeoutJob = null
+
         try {
             ringtonePlayer?.stop()
             ringtonePlayer?.release()

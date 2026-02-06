@@ -35,11 +35,13 @@ fun HomeScreen(
     var showDiagnostics by remember { mutableStateOf(false) }
     var showAssistant by remember { mutableStateOf(false) }
 
-    // Live count of nearby devices for the Badge
-    val nearbyCount = viewModel.nearbyUsers.size
+    // [OPTIMIZATION] derivedStateOf ensures we only recompose the badge when the count actually changes
+    val nearbyCount by remember {
+        derivedStateOf { viewModel.nearbyUsers.size }
+    }
 
     Scaffold(
-        // contentWindowInsets handles the edge-to-edge layout correctly.
+        contentWindowInsets = WindowInsets.systemBars,
         containerColor = MaterialTheme.colorScheme.surfaceVariant,
         topBar = {
             CenterAlignedTopAppBar(
@@ -65,7 +67,7 @@ fun HomeScreen(
                 }
             )
         },
-        // Pinned AI Button to Bottom-Left
+        // [UX] Pinned AI Button to Bottom-Left (Only visible on Radio Tab)
         floatingActionButtonPosition = FabPosition.Start,
         floatingActionButton = {
             if (selectedTab == 0) {
@@ -118,12 +120,11 @@ fun HomeScreen(
                 )
             }
         },
-        contentWindowInsets = WindowInsets.systemBars
     ) { innerPadding ->
 
         val contentModifier = Modifier.padding(innerPadding)
 
-        // Manual Readiness Check (Triggered by Button in TalkTab OR by CD-1 Assistant)
+        // 1. Manual Readiness Check Overlay
         if (showDiagnostics) {
             SystemReadinessDialog(
                 viewModel = viewModel,
@@ -132,32 +133,31 @@ fun HomeScreen(
             )
         }
 
-        // AI Assistant Sheet
+        // 2. AI Assistant Sheet Overlay
         if (showAssistant) {
             ModalBottomSheet(
                 onDismissRequest = { showAssistant = false },
                 sheetState = rememberModalBottomSheetState()
             ) {
-                // [FIXED] Now correctly handling the 4th parameter
                 AssistantSheet(
                     viewModel = viewModel,
                     service = service,
                     onDismiss = { showAssistant = false },
                     onOpenDiagnostics = {
-                        showAssistant = false // Close the sheet
-                        showDiagnostics = true // Open the System Check
+                        showAssistant = false
+                        showDiagnostics = true
                     }
                 )
             }
         }
 
+        // 3. Main Tab Content
         when (selectedTab) {
             0 -> TalkTab(
                 modifier = contentModifier,
                 viewModel = viewModel,
                 service = service,
                 onPermissionsGranted = onPermissionsGranted,
-                // Passing the lambda to show diagnostics manually
                 onCheckSystem = { showDiagnostics = true }
             )
             1 -> HistoryTab(
@@ -168,7 +168,7 @@ fun HomeScreen(
             2 -> ConnectTab(
                 modifier = contentModifier,
                 viewModel = viewModel,
-                onConnected = { selectedTab = 0 }
+                onConnected = { selectedTab = 0 } // Switch to Radio on Connect
             )
             3 -> ProfileTab(
                 modifier = contentModifier,
