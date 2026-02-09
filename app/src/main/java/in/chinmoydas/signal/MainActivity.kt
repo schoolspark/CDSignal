@@ -58,6 +58,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private var hasAskedBattery = false
+        private var hasAskedOverlay = false
     }
 
     private var voiceService: VoiceService? = null
@@ -66,6 +67,7 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var appUpdateManager: AppUpdateManager
     private val UPDATE_REQUEST_CODE = 123
+    private val OVERLAY_REQUEST_CODE = 101
     private val serviceBoundState = mutableStateOf<VoiceService?>(null)
 
     private val exitReceiver = object : BroadcastReceiver() {
@@ -100,7 +102,10 @@ class MainActivity : ComponentActivity() {
 
         CallSignaling.initialize(applicationContext)
 
-        // [FIX] Initial Wake Up check
+        // [FIX] 1. Check Overlay Permission first (Critical for Lock Screen visibility)
+        checkOverlayPermission()
+
+        // [FIX] 2. Apply Wake Up Logic
         wakeUpScreen()
 
         appUpdateManager = AppUpdateManagerFactory.create(this)
@@ -227,6 +232,25 @@ class MainActivity : ComponentActivity() {
                             CircularProgressIndicator()
                         }
                     }
+                }
+            }
+        }
+    }
+
+    private fun checkOverlayPermission() {
+        if (hasAskedOverlay) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (!Settings.canDrawOverlays(this)) {
+                hasAskedOverlay = true
+                Toast.makeText(this, "Please allow 'Display over other apps' to see incoming calls!", Toast.LENGTH_LONG).show()
+                try {
+                    val intent = Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    )
+                    startActivityForResult(intent, OVERLAY_REQUEST_CODE)
+                } catch (e: Exception) {
+                    Log.e("MainActivity", "Failed to open Overlay Settings", e)
                 }
             }
         }

@@ -10,6 +10,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaPlayer
 import android.media.MediaRecorder
@@ -182,6 +183,9 @@ class VoiceService : Service() {
     @Suppress("DEPRECATION")
     private val vibrator by lazy { getSystemService(Context.VIBRATOR_SERVICE) as Vibrator }
 
+    // [NEW] Required for checking Silent Mode settings
+    private val audioManager by lazy { getSystemService(Context.AUDIO_SERVICE) as AudioManager }
+
     private val wakeLock by lazy { (getSystemService(Context.POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CDSignal:VoiceLock") }
     private val wifiLock by lazy {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -233,7 +237,6 @@ class VoiceService : Service() {
                 } else {
                     Log.d(tag, "Left Wi-Fi: Stopping LAN Discovery")
                     localLinkManager?.stopDiscovery()
-                    // Stop advertising on mobile data to save battery/bandwidth
                     localLinkManager?.stopAdvertising()
                 }
             }
@@ -247,9 +250,6 @@ class VoiceService : Service() {
                     Log.i(tag, "Network Handover: $myLocalIp -> $newIp")
                     myLocalIp = newIp
 
-                    // [SERVERLESS] No need to stop/start network engine here.
-                    // UDP socket binds to 0.0.0.0, so it handles interface changes automatically
-
                     _voiceServiceState.update { it.copy(networkStatus = "Listening...") }
                     sendTextMessage("255.255.255.255", "CMD:I_MOVED")
 
@@ -258,7 +258,6 @@ class VoiceService : Service() {
                     if (!targetIp.isNullOrBlank()) sendPing(targetIp)
 
                     broadcastHello()
-                    // Restart advertising on new network
                     if (isOnWifi) localLinkManager?.startAdvertising(myUsername, UDP_PORT)
                     connectionManager.triggerImmediateHeartbeat()
                 } else if (myLocalIp.isEmpty()) {
@@ -454,19 +453,15 @@ class VoiceService : Service() {
                     context = this,
                     onServiceFound = { name, ip, port ->
                         val ipString = ip.hostAddress
-                        // 1. Bypass Logic: If peer is local, override cache immediately
                         if (ipString != null && ipString != myLocalIp) {
                             Log.i(tag, "LAN PEER FOUND: $name at $ipString")
                             activeIpCache[name] = ipString
 
                             scope.launch {
-                                // 2. Persist to DB
                                 repository.updateContactIp(name, ipString)
-
-                                // 3. If currently targeted, refresh connection loop with new Local IP
                                 if (repository.getTargetUser() == name) {
                                     connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey, ipString)
-                                    sendPing(ipString) // Send "Hello" locally
+                                    sendPing(ipString)
                                     updateNotification("LAN: Connected to $name", null)
                                 }
                             }
@@ -477,7 +472,6 @@ class VoiceService : Service() {
                     }
                 )
             }
-            // Start advertising if on WiFi
             if (isOnWifi) localLinkManager?.startAdvertising(myUsername, UDP_PORT)
         } catch (e: Exception) { Log.e(tag, "LocalLink Init Failed", e) }
     }
@@ -592,18 +586,13 @@ class VoiceService : Service() {
                     } else { currentChannel = raw }
                 } else {
                     currentChannel = null
-                    // 1. Resolve IP immediately so we can lock onto the target
                     val contact = repository.getAllContacts().find { it.name == target }
                     targetIp = activeIpCache[target] ?: contact?.ip
 
-                    // 2. Initial "Hole Punch" (The burst ping you already had)
                     if (!targetIp.isNullOrBlank() && targetIp != "SERVER_LINK") {
                         sendPing(targetIp)
                     }
                 }
-
-                // 3. Start the "Dual Loop" (Server + Target Keep-Alive)
-                // This passes the resolved IP to ConnectionManager to ping every 20s
                 connectionManager.startHeartbeatLoop(currentChannel, currentChannelKey, targetIp)
             }
         }
@@ -621,8 +610,6 @@ class VoiceService : Service() {
             repository.channelKey.collect { key ->
                 currentChannelKey = key
                 if (currentChannel != null) targetContactKey = key
-
-                // Update heartbeat if key changes, preserving target IP logic
                 val target = repository.getTargetUser()
                 val ip = activeIpCache[target]
                 connectionManager.startHeartbeatLoop(currentChannel, key, ip)
@@ -943,12 +930,11 @@ class VoiceService : Service() {
         }
     }
 
-    // [SERVERLESS] Updated Handler - Now receives stripped payload + senderIP from NetworkEngine
+    // [SERVERLESS] Robust Packet Handler with "Silent Pager" Logic
     private fun handleIncomingPacket(data: ByteArray, length: Int, senderIp: String) {
-        // [FIX] Update Activity Monitor to save battery
         if (::connectionManager.isInitialized) connectionManager.notifyNetworkActivity()
 
-        // 1. SELF FILTER
+        // 1. SELF & GARBAGE FILTER
         if (senderIp == myLocalIp || length <= 5) return
 
         // 2. PARSE HEADER
@@ -956,7 +942,7 @@ class VoiceService : Service() {
         if (nameLen + 5 > length) return
         val senderName = String(data, 1, nameLen)
 
-        // 3. PROTOCOL COMMANDS (Network Level)
+        // --- LAYER 1: NETWORK COMMANDS ---
         if (senderName.startsWith("HELLO:")) {
             val parts = senderName.split(":")
             if (parts.size >= 3) {
@@ -971,14 +957,14 @@ class VoiceService : Service() {
             }
             return
         }
-
         if (senderName == PING_SIGNAL) { sendPong(senderIp); return }
         if (senderName == PONG_SIGNAL) { _voiceServiceState.update { it.copy(lastPingResponse = System.currentTimeMillis()) }; return }
 
-        // 4. END STREAM LOGIC
         if (senderName == END_STREAM_SIGNAL) {
+            // [CRITICAL] This saves the Silent Pager message!
             if (isReceiving) {
                 isReceiving = false
+                // Save regardless of call status
                 if (isRecordingEnabled) {
                     val actualName = currentSpeakerName ?: "Unknown"
                     val dataToSave = synchronized(bufferLock) { val bytes = incomingBuffer.toByteArray(); incomingBuffer.reset(); bytes }
@@ -987,26 +973,24 @@ class VoiceService : Service() {
                 currentSpeakerName = null
                 resetJob?.cancel()
                 _voiceServiceState.update { it.copy(incomingCall = null, networkStatus = "Listening...") }
-                updateNotification("Listening...", null)
+                // Only reset notification text if NOT in a call (to avoid overwriting "In Call" status)
+                if (!CallEngine.isCallActive) updateNotification("Listening...", null)
                 releaseResourcesIfNeeded()
             }
             return
         }
 
-        // 5. SELF & BLOCK FILTER
+        // 3. USER FILTER
         if (senderName.trim().equals(myUsername.trim(), ignoreCase = true)) return
         if (blockedCache.contains(senderName)) return
         if (senderIp == ignoredSender) return
 
         val isPrincipal = principalCache.contains(senderName)
-
         if (currentSpeakerName != null && currentSpeakerName != senderName) {
-            if (isPrincipal) {
-                currentSpeakerName = senderName
-            } else { return }
+            if (isPrincipal) { currentSpeakerName = senderName } else { return }
         } else { currentSpeakerName = senderName }
 
-        // 6. SEQUENCE CHECK
+        // 4. DECRYPTION & SEQUENCE
         val seqOffset = 1 + nameLen
         val seqNum = ByteBuffer.wrap(data, seqOffset, 4).int
         val payloadOffset = seqOffset + 4
@@ -1025,12 +1009,8 @@ class VoiceService : Service() {
             sequenceMap[senderName] = seqNum
             lastIncomingIp = senderIp
 
-            if (payloadLen == 9) {
-                val checkPunch = String(data, payloadOffset, payloadLen)
-                if (checkPunch == PUNCH_PACKET) return
-            }
+            if (payloadLen == 9 && String(data, payloadOffset, payloadLen) == PUNCH_PACKET) return
 
-            // 7. DECRYPTION
             var payload = data.copyOfRange(payloadOffset, payloadOffset + payloadLen)
             val prefs = getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
             val isSecureMode = prefs.getBoolean("secure_mode", false)
@@ -1039,32 +1019,18 @@ class VoiceService : Service() {
                 val isGroup = senderName.startsWith("group:")
                 val secretKey = getDecryptionKey(isGroup)
                 if (secretKey != null) {
-                    var decrypted = CryptoEngine.decrypt(payload, seqNum, secretKey)
-                    if (decrypted == null && payload.size > 656 && payload.size < 720) {
-                        try {
-                            val trimmedPayload = payload.copyOfRange(0, 656)
-                            decrypted = CryptoEngine.decrypt(trimmedPayload, seqNum, secretKey)
-                        } catch (e: Exception) { }
-                    }
+                    val decrypted = CryptoEngine.decrypt(payload, seqNum, secretKey)
                     if (decrypted != null) payload = decrypted
                 }
             }
 
-            // 8. TEXT ROUTING & SIGNALING
-            val isTextOrCmd = if (payload.size > 4) {
-                val header = String(payload, 0, 4, Charsets.UTF_8)
-                header == "TXT:" || header == "CMD:" || header == "LOC:"
-            } else false
-
-            if (isTextOrCmd) {
+            // --- LAYER 2: PRIORITY LANE (Text/CMD) ---
+            val isTextHeader = if (payload.size > 4) String(payload, 0, 4, Charsets.UTF_8) else ""
+            if (isTextHeader == "TXT:" || isTextHeader == "CMD:" || isTextHeader == "LOC:") {
                 try {
                     val textData = String(payload, Charsets.UTF_8)
                     if (textData.startsWith("TXT:")) {
                         val cleanMessage = textData.substring(4)
-
-                        // --- [FIX START] CRITICAL PROTOCOL HANDLING ---
-
-                        // 1. PING/ACK Handlers
                         if (cleanMessage == "CMD:CALL:PING") { lastCallPacketTime = System.currentTimeMillis(); return }
                         if (cleanMessage.startsWith("ACK:")) {
                             val originalCmd = cleanMessage.removePrefix("ACK:")
@@ -1073,70 +1039,84 @@ class VoiceService : Service() {
                             pendingAckJobs.remove(jobKey)
                             return
                         }
-
-                        // 2. SOS Handler
                         if (cleanMessage == "CMD:SOS") {
                             sendTextMessage(senderIp, "ACK:CMD:SOS")
                             showIncomingCallNotification(senderName, "SOS ALERT", isAlarm = true)
                             SafetySignaling.triggerSOS(senderName)
                             return
                         }
-
-                        // 3. CALL PROTOCOL (Handle Locally to wake Dead UI)
                         if (cleanMessage.startsWith("CMD:CALL:")) {
                             when (cleanMessage) {
-                                CallSignaling.CMD_REQ -> {
-                                    Log.d(tag, "Call Request from $senderName")
-                                    CallSignaling.onIncomingCall(senderIp)
-                                }
+                                CallSignaling.CMD_REQ -> CallSignaling.onIncomingCall(senderIp)
                                 CallSignaling.CMD_ACC -> CallSignaling.onCallAccepted()
                                 CallSignaling.CMD_REJ -> CallSignaling.onCallRejected()
                                 CallSignaling.CMD_END -> CallSignaling.onCallEnded()
                                 CallSignaling.CMD_BUSY -> CallSignaling.onPeerBusy()
                             }
-                            return // Stop processing
+                            return
                         }
-
-                        // 4. Remote Control
                         if (cleanMessage.startsWith("CMD:REMOTE_")) {
                             handleRemoteCommand(cleanMessage, senderIp, senderName, isPrincipal, prefs)
                             return
                         }
-                        // --- [FIX END] ---
-
-                        // 5. Normal Text (UI Interceptor)
                         if (packetInterceptor?.invoke(cleanMessage, senderIp) == true) return
 
                         if (!cleanMessage.startsWith("CMD:") && !cleanMessage.startsWith("LOC:")) {
-                            speakText(cleanMessage)
+                            // [FIX] Silent Text if in Call
+                            if (!CallEngine.isCallActive) speakText(cleanMessage)
                             scope.launch {
                                 val db = AppDatabase.getDatabase(applicationContext)
                                 db.pagerDao().insert(PagerEntry(sender = senderName, type = "TEXT", content = cleanMessage, isRead = false))
                             }
-                            updateNotification("Message from $senderName", cleanMessage)
+                            if (CallEngine.isCallActive) {
+                                lastStatusMessage = "Msg: $senderName"
+                            } else {
+                                updateNotification("Message from $senderName", cleanMessage)
+                            }
                         }
                     }
                 } catch (e: Exception) { }
                 return
             }
 
-            // --- IT IS AUDIO (PTT) ---
-            if (CallEngine.isCallActive) {
-                return
+            // --- LAYER 3: AUDIO LANE (Voice Pager Logic) ---
+            val isInVoipCall = CallEngine.isCallActive ||
+                    `in`.chinmoydas.signal.utils.CallSignaling.callStatus.value != `in`.chinmoydas.signal.utils.CallStatus.Idle
+
+            if (!isInVoipCall) {
+                // Normal PTT Operation
+                handleIncomingSignal(senderName, isPrincipal)
+            } else {
+                // [SILENT PAGER]
+                if (!isReceiving) {
+                    isReceiving = true // Flag start of recording
+                    currentSpeakerName = senderName
+                    // Optional: You could update notification here "Recording Page..."
+                }
+                resetJob?.cancel()
+                resetJob = scope.launch {
+                    delay(10_000)
+                    if (isReceiving) {
+                        isReceiving = false
+                        if (isRecordingEnabled) {
+                            val dataToSave = synchronized(bufferLock) { val bytes = incomingBuffer.toByteArray(); incomingBuffer.reset(); bytes }
+                            if (dataToSave.isNotEmpty()) saveIncomingMessage(senderName, dataToSave)
+                        }
+                    }
+                }
             }
 
-            // 9. HANDLE SIGNAL
-            handleIncomingSignal(senderName, isPrincipal)
-
-            // G711 Decode
+            // 3. Audio Processing
             if (payload.size >= 640 && payload.size < 720) {
                 try { payload = G711.decode(payload, 640) } catch (e: Exception) { }
             }
 
-            // Play Audio
-            if (!isSilenced || isPrincipal) {
+            // 4. Playback Gatekeeper
+            if (!isInVoipCall && (!isSilenced || isPrincipal)) {
                 try { audioEngine.playPcmChunk(payload, seqNum) } catch (e: Exception) {}
             }
+
+            // 5. Recorder (The Pager Memory)
             if (isRecordingEnabled) {
                 synchronized(bufferLock) { try { incomingBuffer.write(payload) } catch (t: Throwable) {} }
             }
@@ -1361,9 +1341,14 @@ class VoiceService : Service() {
     fun startTalk(ips: List<String>, port: Int) {
         cleanupJob?.cancel()
         cleanupJob = null
-        if (CallEngine.isCallActive) {
-            Log.w(tag, "PTT Triggered during Call - Mixed Audio Mode")
+
+        // [FIX] Block Outgoing PTT if Call is Active
+        if (CallEngine.isCallActive ||
+            `in`.chinmoydas.signal.utils.CallSignaling.callStatus.value != `in`.chinmoydas.signal.utils.CallStatus.Idle) {
+            Toast.makeText(this, "Cannot PTT during a Call", Toast.LENGTH_SHORT).show()
+            return
         }
+
         if (isSending) return
         if (ips.isEmpty()) {
             speakText("Select a contact first")
@@ -1490,6 +1475,9 @@ class VoiceService : Service() {
 
     @Suppress("DEPRECATION")
     private fun vibrate() {
+        // [FIX] Respect System Settings (Silent Mode = No Vibrate)
+        if (audioManager.ringerMode == AudioManager.RINGER_MODE_SILENT) return
+
         try {
             val effect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE) else null
             if (effect != null) vibrator.vibrate(effect) else vibrator.vibrate(100)
@@ -1509,13 +1497,21 @@ class VoiceService : Service() {
 
     private fun handleIncomingSignal(callerName: String, isPriority: Boolean = false) {
         val currentTime = System.currentTimeMillis()
+
+        // [FIX] Check if we are in a VoIP call (Ringing/Active/Dialing)
+        val isCallIdle = `in`.chinmoydas.signal.utils.CallSignaling.callStatus.value == `in`.chinmoydas.signal.utils.CallStatus.Idle
+
         if (!isReceiving || (currentTime - lastReceiveTime > 3000) || isPriority) {
             acquireResources()
             isReceiving = true
             _voiceServiceState.update { it.copy(incomingCall = callerName, incomingIp = lastIncomingIp) }
             val status = if (isPriority) "⚠️ PRIORITY: $callerName" else if (isSilenced) "Missed: $callerName" else "Incoming: $callerName"
             updateNotification(status, callerName)
-            if (!isSilenced || isPriority) vibrate()
+
+            // [FIX] Vibrate only if not in a call AND system settings allow
+            if ((!isSilenced || isPriority) && isCallIdle) {
+                vibrate()
+            }
         }
         lastReceiveTime = currentTime
         resetJob?.cancel()
