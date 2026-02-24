@@ -202,10 +202,21 @@ object CallEngine {
             val prevFrame = ByteArray(maxOf(0, prevLen))
             if (prevLen > 0) bb.get(prevFrame)
 
-            // Jitter Buffer Logic
+            // [FIX] Jitter Buffer Logic & Memory Leak Prevention
+            // Calculate a safe boundary for old packets
+            val oldestAllowed = seqNum - 50
+
+            // If the buffer gets too large, purge the stale packets
+            // that the speaker thread skipped over due to network lag.
+            if (jitterBuffer.size > 100) {
+                val staleKeys = jitterBuffer.keys.filter { it < oldestAllowed }
+                staleKeys.forEach { jitterBuffer.remove(it) }
+            }
+
             if (!jitterBuffer.containsKey(seqNum)) {
                 jitterBuffer[seqNum] = currentFrame
             }
+
             // FEC Recovery
             if (seqNum > 0 && !jitterBuffer.containsKey(seqNum - 1) && prevFrame.isNotEmpty()) {
                 jitterBuffer[seqNum - 1] = prevFrame

@@ -130,6 +130,7 @@ class VoiceService : Service() {
     private var callWatchdogJob: Job? = null
     private var ringtonePlayer: MediaPlayer? = null
     @Volatile private var lastCallPacketTime: Long = 0L
+    @Volatile private var isRinging = false
 
     @Volatile var lastIncomingIp: String? = null
     @Volatile private var myUsername: String = "User"
@@ -284,6 +285,8 @@ class VoiceService : Service() {
     @SuppressLint("UnspecifiedRegisterReceiverFlag")
     override fun onCreate() {
         super.onCreate()
+
+        createNotificationChannel()
 
         audioRouter = AudioRouter(this)
         audioRouter.initialize()
@@ -490,6 +493,14 @@ class VoiceService : Service() {
         mediaSession = MediaSessionCompat(this, "VoiceServiceMediaSession", componentName, null)
         mediaSession.setFlags(MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS)
 
+        // [FIX] Android 11+ requires PlaybackState to be set to receive hardware buttons
+        val stateBuilder = android.support.v4.media.session.PlaybackStateCompat.Builder()
+            .setActions(android.support.v4.media.session.PlaybackStateCompat.ACTION_PLAY_PAUSE or
+                    android.support.v4.media.session.PlaybackStateCompat.ACTION_PLAY or
+                    android.support.v4.media.session.PlaybackStateCompat.ACTION_PAUSE)
+            .setState(android.support.v4.media.session.PlaybackStateCompat.STATE_PLAYING, 0L, 1.0f)
+        mediaSession.setPlaybackState(stateBuilder.build())
+
         mediaSession.setCallback(object : MediaSessionCompat.Callback() {
             override fun onMediaButtonEvent(mediaButtonEvent: Intent?): Boolean {
                 val keyEvent = mediaButtonEvent?.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
@@ -520,25 +531,31 @@ class VoiceService : Service() {
                 val target = repository.getTargetUser()
                 if (target.isBlank()) return@launch
 
-                var ip = activeIpCache[target]
-                val port = UDP_PORT // [SERVERLESS] Always 50005
+                val ipsToCall = mutableListOf<String>()
 
-                if (ip == null) {
-                    val contact = repository.getAllContacts().find { it.name == target }
-                    ip = contact?.ip
+                // [FIX] Handle "Everyone" and "Group" broadcasts
+                if (target.equals("Everyone", ignoreCase = true) || target.startsWith("group:", ignoreCase = true)) {
+                    ipsToCall.add("255.255.255.255") // Flood Local Subnet
+                    val activePeers = activeIpCache.values.filter { it != "SERVER_LINK" && it.isNotEmpty() }
+                    ipsToCall.addAll(activePeers) // Target known peers directly
+                } else {
+                    var ip = activeIpCache[target]
+                    if (ip == null) {
+                        val contact = repository.getAllContacts().find { it.name == target }
+                        ip = contact?.ip
+                    }
+                    if (ip == "SERVER_LINK") ip = "signal.chinmoydas.in"
+                    if (!ip.isNullOrBlank()) ipsToCall.add(ip)
                 }
-                if (ip == "SERVER_LINK") ip = "signal.chinmoydas.in"
 
-                if (!ip.isNullOrBlank()) {
+                if (ipsToCall.isNotEmpty()) {
                     if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                         if (!fromVox) vibrate()
-                        startTalk(listOf(ip), port)
+                        // .distinct() prevents duplicate packets to the same IP
+                        startTalk(ipsToCall.distinct(), UDP_PORT)
                     }
                 } else {
-                    if (ActivityCompat.checkSelfPermission(this@VoiceService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                        if (!fromVox) vibrate()
-                        startTalk(if(ip != null) listOf(ip) else emptyList(), UDP_PORT)
-                    }
+                    speakText("Select a valid contact")
                 }
             }
         }
@@ -754,7 +771,6 @@ class VoiceService : Service() {
 
         if (intent == null && _voiceServiceState.value.networkStatus != "Disconnected") return START_STICKY
 
-        createNotificationChannel()
         try { startForegroundServiceNotification("Initializing Radio...") } catch (e: Exception) { stopSelf(); return START_NOT_STICKY }
 
         scope.launch(Dispatchers.IO) {
@@ -1046,6 +1062,9 @@ class VoiceService : Service() {
                             return
                         }
                         if (cleanMessage.startsWith("CMD:CALL:")) {
+                            // [CRITICAL FIX] Instantly reply with an ACK to stop the sender's retry loop!
+                            sendTextMessage(senderIp, "ACK:$cleanMessage")
+
                             when (cleanMessage) {
                                 CallSignaling.CMD_REQ -> CallSignaling.onIncomingCall(senderIp)
                                 CallSignaling.CMD_ACC -> CallSignaling.onCallAccepted()
@@ -1070,8 +1089,10 @@ class VoiceService : Service() {
                             }
                             if (CallEngine.isCallActive) {
                                 lastStatusMessage = "Msg: $senderName"
+                                refreshNotification() // <--- ADD THIS LINE HERE
                             } else {
-                                updateNotification("Message from $senderName", cleanMessage)
+                                // Prevent the app from trying to connect to the "message content"
+                                updateNotification("Msg from $senderName: $cleanMessage", senderName)
                             }
                         }
                     }
@@ -1131,18 +1152,21 @@ class VoiceService : Service() {
             if (now - lastRejectTime > 5000) {
                 lastRejectTime = now
                 sendTextMessage(ip, "Remote Control is DISABLED on this device.")
-                updateNotification("🚫 Blocked CMD", "Ignored $name")
+                // [FIX] Pass exact username as second parameter
+                updateNotification("🚫 Blocked CMD from $name", name)
             }
             return
         }
         if (isPrincipal) {
             when (cmd) {
                 "CMD:REMOTE_MIC_ON" -> {
-                    updateNotification("🎙️ REMOTE ACTIVE", "Mic accessed by $name")
+                    // [FIX] Pass exact username as second parameter
+                    updateNotification("🎙️ REMOTE ACTIVE by $name", name)
                     if (!_voiceServiceState.value.isVoxEnabled) toggleVox(true)
                 }
                 "CMD:REMOTE_STEALTH" -> {
-                    updateNotification("🤫 STEALTH MODE", "Activated by $name")
+                    // [FIX] Pass exact username as second parameter
+                    updateNotification("🤫 STEALTH MODE by $name", name)
                     toggleSpeaker(false)
                     isSilenced = true
                     isTheaterMode = true
@@ -1155,7 +1179,8 @@ class VoiceService : Service() {
                             ?: locMgr.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
                         if (loc != null) {
                             sendTextMessage(ip, "LOC:${loc.latitude},${loc.longitude}")
-                            updateNotification("📍 LOCATION SHARED", "Sent to $name")
+                            // [FIX] Pass exact username as second parameter
+                            updateNotification("📍 LOCATION SHARED to $name", name)
                         } else { sendTextMessage(ip, "ERROR: No GPS Signal found") }
                     }
                 }
@@ -1166,13 +1191,15 @@ class VoiceService : Service() {
                     toggleSpeaker(true)
                     if (_voiceServiceState.value.isVoxEnabled) toggleVox(false)
                     speakText("Device restored to normal mode")
-                    updateNotification("✅ RESTORED", "Reset by $name")
+                    // [FIX] Pass exact username as second parameter
+                    updateNotification("✅ RESTORED by $name", name)
                     sendTextMessage(ip, "CONFIRM: Device Restored to Normal")
                 }
             }
         } else {
             scope.launch { SafetySignaling.triggerSecurityAlert(name) }
-            updateNotification("⚠️ SECURITY WARN", "Blocked CMD from $name")
+            // [FIX] Pass exact username as second parameter
+            updateNotification("⚠️ SECURITY WARN from $name", name)
         }
     }
 
@@ -1185,7 +1212,8 @@ class VoiceService : Service() {
                 WavUtils.saveWavFile(file, data)
                 val db = AppDatabase.getDatabase(applicationContext)
                 db.pagerDao().insert(PagerEntry(sender = sender, timestamp = timestamp, type = "AUDIO", content = file.absolutePath, isRead = false))
-                updateNotification("New Voice Message", "From $sender")
+                // Put the description in the first parameter, and the EXACT name in the second
+                updateNotification("New Voice Message from $sender", sender)
             } catch (e: Exception) { Log.e(tag, "Failed to save message", e) }
         }
     }
@@ -1548,7 +1576,11 @@ class VoiceService : Service() {
         lastStatusMessage = status
         val notification = buildNotification(status)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            // [FIX] Explicitly request all needed privileges for Android 14+
+            val fgsTypes = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            startForeground(1, notification, fgsTypes)
         } else {
             startForeground(1, notification)
         }
@@ -1678,33 +1710,43 @@ class VoiceService : Service() {
     }
 
     private fun startRinging() {
-        // 1. Cancel any existing timeout to prevent double-firing
+        if (isRinging) return // Prevent vibration loop
+        isRinging = true
+
         ringTimeoutJob?.cancel()
 
         try {
-            if (ringtonePlayer == null) {
-                val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-                ringtonePlayer = MediaPlayer.create(this, uri).apply {
-                    isLooping = true
-                    start()
+            // [FIX] Check hardware Ringer Mode (Normal, Vibrate, or Silent)
+            val ringerMode = audioManager.ringerMode
+
+            // Only play sound if NOT on silent/vibrate
+            if (ringerMode == AudioManager.RINGER_MODE_NORMAL) {
+                if (ringtonePlayer == null) {
+                    val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+                    ringtonePlayer = MediaPlayer.create(this, uri).apply {
+                        isLooping = true
+                        start()
+                    }
                 }
             }
-            val pattern = longArrayOf(0, 1000, 1000)
-            if (Build.VERSION.SDK_INT >= 26) {
-                vibrator.vibrate(VibrationEffect.createWaveform(pattern, 0))
-            } else {
-                @Suppress("DEPRECATION")
-                vibrator.vibrate(pattern, 0)
+
+            // Only vibrate if NOT completely silent
+            if (ringerMode != AudioManager.RINGER_MODE_SILENT) {
+                val pattern = longArrayOf(0, 1000, 1000)
+                if (Build.VERSION.SDK_INT >= 26) {
+                    vibrator.vibrate(VibrationEffect.createWaveform(pattern, 0))
+                } else {
+                    @Suppress("DEPRECATION")
+                    vibrator.vibrate(pattern, 0)
+                }
             }
 
-            // [FIX] Safety Timeout: Stop ringing after 45 seconds if no answer
+            // Safety Timeout
             ringTimeoutJob = scope.launch {
                 delay(45_000) // 45 Seconds
                 Log.w(tag, "Ring Timeout: Force stopping vibration")
                 stopRinging()
-                // Update State to clear the "Incoming" UI if it reappears
                 _voiceServiceState.update { it.copy(incomingCall = null, incomingIp = null) }
-                // Notify signaling to reset
                 `in`.chinmoydas.signal.utils.CallSignaling.onCallEnded()
             }
 
@@ -1712,7 +1754,7 @@ class VoiceService : Service() {
     }
 
     private fun stopRinging() {
-        // [FIX] Cancel the safety timer so it doesn't kill a connected call later
+        isRinging = false // [FIX] Reset flag
         ringTimeoutJob?.cancel()
         ringTimeoutJob = null
 
