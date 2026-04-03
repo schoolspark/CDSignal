@@ -1,181 +1,141 @@
 package `in`.chinmoydas.signal.utils
 
 import android.util.Log
-import `in`.chinmoydas.signal.data.MainRepository
+import `in`.chinmoydas.signal.RetrofitClient
 import kotlinx.coroutines.*
-import java.net.Inet4Address
-import java.net.Inet6Address
-import java.net.NetworkInterface
+import `in`.chinmoydas.signal.data.MainRepository
 
+/**
+ * CD Signal - Reflector-Optimized Connection Manager
+ * Mothership v2: Pure Reflector Path (No STUN/CoTURN)
+ */
 class ConnectionManager(
     private val repository: MainRepository,
     private val networkEngine: NetworkEngine
 ) {
     private val tag = "ConnectionManager"
+
+    private var heartbeatJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    // [OPTIMIZATION] Single Job to rule them all
-    private var maintenanceJob: Job? = null
-
     @Volatile var isEcoMode = false
-    @Volatile private var lastPublicIp: String = ""
-    @Volatile private var lastPublicPort: Int = 0
+        private set
 
-    // [NEW] Track Activity to prevent unnecessary pings
-    @Volatile private var lastActivityTime = System.currentTimeMillis()
-    private var lastHeartbeatTime = 0L
+    @Volatile private var currentChannel: String? = null
+    @Volatile private var currentKey: String? = null
+    @Volatile private var targetIp: String? = null
 
-    // [STATE] Store connection details for auto-restart
-    private var activeChannel: String? = null
-    private var activeKey: String? = null
-    private var activeTargetIp: String? = null
-
-    private val localPort = 50005
-
-    private val stunServers = listOf(
-        "stun.l.google.com" to 19302,
-        "stun1.l.google.com" to 19302
-    )
+    @Volatile private var lastActivityTime: Long = 0L
 
     fun updateEcoMode(enabled: Boolean) {
-        isEcoMode = enabled
-        Log.d(tag, "Eco Mode: $enabled. Restarting Logic.")
-        restartHeartbeat()
+        if (isEcoMode != enabled) {
+            isEcoMode = enabled
+            Log.d(tag, "Eco Mode: $enabled. Adjusting Reflector Heartbeat.")
+            startHeartbeatLoop(currentChannel, currentKey, targetIp)
+        }
     }
 
-    // [CRITICAL] Called by VoiceService when Audio/Data flows
-    fun notifyNetworkActivity() {
-        lastActivityTime = System.currentTimeMillis()
-    }
+    /**
+     * Smart Maintenance Loop.
+     * Keeps the UDP Reflector hole open and syncs presence with the API.
+     */
+    fun startHeartbeatLoop(channel: String? = null, key: String? = null, ip: String? = null) {
+        currentChannel = channel
+        currentKey = key
+        targetIp = ip
 
-    private fun restartHeartbeat() {
-        stop()
-        startHeartbeatLoop(activeChannel, activeKey, activeTargetIp)
-    }
-
-    fun startHeartbeatLoop(channel: String?, key: String?, targetIp: String? = null) {
-        stop()
-        activeChannel = channel
-        activeKey = key
-        activeTargetIp = targetIp
-
-        Log.d(tag, "Starting Smart Maintenance Loop. Target: $targetIp")
-
-        maintenanceJob = scope.launch {
+        heartbeatJob?.cancel()
+        heartbeatJob = scope.launch {
+            Log.d(tag, "Reflector Sync Active. Target: $targetIp")
             while (isActive) {
-                val now = System.currentTimeMillis()
-                val timeSinceActivity = now - lastActivityTime
-
-                // Eco: Allow 25s silence. Normal: Allow 15s silence.
-                val silenceThreshold = if (isEcoMode) 25_000L else 15_000L
-
-                if (timeSinceActivity > silenceThreshold) {
-                    // 1. Keep Public Port Open (STUN)
-                    try {
-                        val server = stunServers.random()
-                        val request = StunClient.buildRequest()
-                        networkEngine.sendRaw(request, listOf(server.first), server.second)
-                    } catch (e: Exception) {}
-
-                    // 2. Keep P2P Tunnel Open (Target Ping)
-                    if (!targetIp.isNullOrBlank() && targetIp != "SERVER_LINK") {
-                        try {
-                            networkEngine.send(
-                                NetworkEngine.TYPE_KEEP_ALIVE,
-                                ByteArray(0),
-                                listOf(targetIp),
-                                localPort
-                            )
-                        } catch (e: Exception) {}
-                    }
-
-                    // 3. Keep Server Updated (Heartbeat)
-                    val heartbeatInterval = if (isEcoMode) 30_000L else 10_000L
-                    if (now - lastHeartbeatTime > heartbeatInterval) {
-                        sendHeartbeat(channel, key)
-                        lastHeartbeatTime = now
-                    }
+                try {
+                    performMaintenanceCycle()
+                } catch (e: Exception) {
+                    Log.e(tag, "Maintenance cycle failed: ${e.message}")
                 }
 
-                delay(5000)
+                // 25s for High Performance, 55s for Eco Mode.
+                // Mobile NATs usually close UDP holes after 30-60 seconds.
+                val delayMs = if (isEcoMode) 55_000L else 25_000L
+                delay(delayMs)
             }
         }
     }
 
-    fun handleStunResponse(data: ByteArray) {
+    fun triggerImmediateHeartbeat() {
+        scope.launch { performMaintenanceCycle() }
+    }
+
+    fun notifyNetworkActivity() {
+        lastActivityTime = System.currentTimeMillis()
+    }
+
+    private suspend fun performMaintenanceCycle() {
+        // 1. Hole Punching: Keep the hole open on Port 443 (The Mothership)
+        // This is 200% more reliable than STUN for your setup.
+        networkEngine.registerWithMothership()
+
+        // 2. Database Sync: Update heartbeat.php so others can find our LAN IP
+        val token = repository.getToken()
+        if (!token.isNullOrBlank() && token != "OFFLINE_TOKEN") {
+            try {
+                val currentPort = networkEngine.getLocalPort()
+                val localIp = getLocalIpAddress()
+
+                // If no packets moved in 2 mins, mark as away
+                val status = if (System.currentTimeMillis() - lastActivityTime < 120_000) "online" else "away"
+
+                RetrofitClient.api.sendHeartbeat(
+                    "Bearer $token",
+                    currentPort,
+                    localIp,
+                    currentChannel,
+                    currentKey,
+                    status
+                )
+            } catch (e: Exception) {
+                Log.e(tag, "PHP API Sync Failed")
+            }
+        }
+
+        // 3. Peer Keep-Alive: Only if on LAN (Optional)
+        targetIp?.let { ip ->
+            if (isLocal(ip)) {
+                sendLanPing(ip)
+            }
+        }
+    }
+
+    private fun sendLanPing(ip: String) {
+        val pingPacket = "__PING__".toByteArray()
+        val buf = java.nio.ByteBuffer.allocate(5 + pingPacket.size)
+            .put(pingPacket.size.toByte())
+            .put(pingPacket)
+            .putInt(0)
+            .array()
+        networkEngine.sendRaw(buf, ip, 50005)
+    }
+
+    private fun isLocal(ip: String): Boolean {
+        return ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")
+    }
+
+    private fun getLocalIpAddress(): String {
         try {
-            val result = StunClient.parseResponse(data)
-            if (result != null) {
-                val (ip, port) = result
-                if (ip.isNotEmpty() && port > 0) {
-                    if (lastPublicPort != port) {
-                        Log.i(tag, "NAT Port Changed: $lastPublicPort -> $port")
-                        triggerImmediateHeartbeat()
+            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
+            for (intf in interfaces) {
+                val addrs = intf.inetAddresses
+                for (addr in addrs) {
+                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
+                        return addr.hostAddress ?: ""
                     }
-                    lastPublicIp = ip
-                    lastPublicPort = port
                 }
             }
-        } catch (e: Exception) { }
-    }
-
-    private suspend fun sendHeartbeat(channel: String?, key: String?) {
-        val token = repository.getToken() ?: return
-        if (token == "OFFLINE_TOKEN") return
-
-        val portToSend = if (lastPublicPort > 0) lastPublicPort else localPort
-
-        // Note: We don't forcefully send our local IP here if STUN works,
-        // but the 'getLocalIp()' helper is used if the server needs it.
-
-        try {
-            repository.sendHeartbeat(token, portToSend, getLocalIp(), channel, key)
-        } catch (e: Exception) { Log.e(tag, "Heartbeat Failed", e) }
-    }
-
-    fun triggerImmediateHeartbeat() {
-        scope.launch { sendHeartbeat(activeChannel, activeKey) }
+        } catch (e: Exception) {}
+        return ""
     }
 
     fun stop() {
-        maintenanceJob?.cancel()
-    }
-
-    // [CRITICAL UPDATE] IPv6-Aware IP Detection
-    private fun getLocalIp(): String {
-        try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            var ipv4 = ""
-            var ipv6 = ""
-
-            while (interfaces.hasMoreElements()) {
-                val iface = interfaces.nextElement()
-                // Skip Loopback and inactive interfaces
-                if (iface.isLoopback || !iface.isUp) continue
-
-                val addresses = iface.inetAddresses
-                while (addresses.hasMoreElements()) {
-                    val addr = addresses.nextElement()
-
-                    if (!addr.isLoopbackAddress) {
-                        val ip = addr.hostAddress ?: ""
-                        // 1. Check for IPv6 (ignore link-local fe80::)
-                        if (addr is Inet6Address && !ip.startsWith("fe80")) {
-                            // If we find a Global IPv6 address, this is gold for 4G networks
-                            ipv6 = ip
-                        }
-                        // 2. Check for IPv4
-                        else if (addr is Inet4Address) {
-                            ipv4 = ip
-                        }
-                    }
-                }
-            }
-
-            // Prefer IPv6 if available (crucial for Jio/Mobile), otherwise fall back to IPv4
-            return if (ipv6.isNotEmpty()) ipv6 else ipv4.ifEmpty { "127.0.0.1" }
-
-        } catch (e: Exception) { }
-        return "127.0.0.1"
+        heartbeatJob?.cancel()
     }
 }

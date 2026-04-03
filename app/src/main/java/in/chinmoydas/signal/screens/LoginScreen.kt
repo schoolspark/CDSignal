@@ -10,6 +10,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
@@ -32,10 +33,7 @@ import `in`.chinmoydas.signal.viewmodel.LoginViewModel
 fun LoginScreen(navController: NavController, prefs: SharedPreferences, viewModel: LoginViewModel = viewModel()) {
     LaunchedEffect(Unit) { viewModel.loadLastUser(prefs) }
 
-    // Required for potential server token synchronization or context-based alerts
     val context = LocalContext.current
-
-    // State for password visibility in the main login form
     var passwordVisible by remember { mutableStateOf(false) }
 
     Box(
@@ -106,6 +104,19 @@ fun LoginScreen(navController: NavController, prefs: SharedPreferences, viewMode
                     modifier = Modifier.fillMaxWidth()
                 )
 
+                Spacer(Modifier.height(16.dp))
+
+                // --- [NEW] PREMIUM ACCESS CODE FIELD ---
+                OutlinedTextField(
+                    value = viewModel.accessCode,
+                    onValueChange = { viewModel.accessCode = it },
+                    label = { Text("Access Code (Optional)") },
+                    placeholder = { Text("For Premium 5G Relay") },
+                    leadingIcon = { Icon(Icons.Default.Star, contentDescription = "Premium") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
                 // --- FORGOT PASSWORD LINK ---
                 Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
                     TextButton(onClick = { viewModel.showResetDialog = true }) {
@@ -124,7 +135,6 @@ fun LoginScreen(navController: NavController, prefs: SharedPreferences, viewMode
                 // --- LOGIN BUTTON ---
                 Button(
                     onClick = {
-                        // [FIX] Pass 'context' as the first argument
                         viewModel.login(context, prefs) {
                             navController.navigate("home") { popUpTo("login") { inclusive = true } }
                         }
@@ -169,7 +179,7 @@ fun LoginScreen(navController: NavController, prefs: SharedPreferences, viewMode
         }
     }
 
-    // --- RESET PASSWORD DIALOG (Two-Step State Machine) ---
+    // --- RESET PASSWORD DIALOG (Remains the same as your upload) ---
     if (viewModel.showResetDialog) {
         AlertDialog(
             onDismissRequest = { viewModel.showResetDialog = false },
@@ -184,7 +194,6 @@ fun LoginScreen(navController: NavController, prefs: SharedPreferences, viewMode
                     if (viewModel.resetStep == 0) {
                         Text("Enter your username. An OTP will be sent to your recovery email if you have configured one in Profile Settings.")
 
-                        // [NEW] Privacy Notice for Reset Feature
                         Spacer(Modifier.height(8.dp))
                         Text(
                             "Privacy Note: You must have previously linked a recovery email to use this feature. We use this email strictly for verification and never share it.",

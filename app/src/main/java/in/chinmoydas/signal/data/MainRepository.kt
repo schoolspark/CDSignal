@@ -76,37 +76,54 @@ class MainRepository(context: Context) {
 
     // --- CONTACTS ---
 
-    suspend fun getAllContacts() = withContext(Dispatchers.IO) { contactDao.getAllContacts() }
+    // [FIX 1] Changed to getActiveContacts to match DAO
+    suspend fun getAllContacts() = withContext(Dispatchers.IO) { contactDao.getActiveContacts() }
     suspend fun getBlockedContacts() = withContext(Dispatchers.IO) { contactDao.getBlockedContacts() }
 
+    // [FIX 2] Must check ALL contacts (including blocked) to effectively block IPs
     suspend fun findContactByIp(ip: String): ContactEntity? = withContext(Dispatchers.IO) {
-        contactDao.getAllContacts().find { it.ip == ip }
+        contactDao.getAbsolutelyAllContacts().find { it.ip == ip }
     }
 
     suspend fun saveContact(name: String, ip: String, code: String, isPriority: Boolean = false, fcmToken: String = "") = withContext(Dispatchers.IO) {
-        // Keep existing logic: check if user was previously blocked
-        val isBlocked = contactDao.isBlocked(name)
+        // [FIX 3] Prevent overwriting existing user flags. Check if they exist first.
+        val existingUsers = contactDao.getAbsolutelyAllContacts()
+        val existingUser = existingUsers.find { it.name == name }
 
-        contactDao.insert(ContactEntity(
-            name = name,
-            ip = ip,
-            savedCode = code,
-            isBlocked = isBlocked,
-            isPriority = isPriority, // [FIX] Now successfully passes the priority flag
-            fcmToken = fcmToken
-        ))
+        if (existingUser != null) {
+            // Update existing user safely without destroying their flags
+            contactDao.update(existingUser.copy(
+                ip = ip,
+                savedCode = if (code.isNotEmpty()) code else existingUser.savedCode,
+                fcmToken = if (fcmToken.isNotEmpty()) fcmToken else existingUser.fcmToken
+            ))
+        } else {
+            // Insert brand new user
+            contactDao.insert(ContactEntity(
+                name = name,
+                ip = ip,
+                savedCode = code,
+                isBlocked = false,
+                isPriority = isPriority,
+                fcmToken = fcmToken
+            ))
+        }
 
         triggerConfigRefresh()
     }
 
-    // Change return type to Int
     suspend fun updateContactIp(name: String, ip: String): Int {
         return contactDao.updateIp(name, ip)
     }
 
     suspend fun deleteContact(name: String) = withContext(Dispatchers.IO) {
-        contactDao.delete(ContactEntity(name, "", ""))
-        triggerConfigRefresh()
+        // Find existing to avoid creating a dummy object
+        val all = contactDao.getAbsolutelyAllContacts()
+        val toDelete = all.find { it.name == name }
+        if (toDelete != null) {
+            contactDao.delete(toDelete)
+            triggerConfigRefresh()
+        }
     }
 
     suspend fun setBlockedStatus(name: String, blocked: Boolean) = withContext(Dispatchers.IO) {

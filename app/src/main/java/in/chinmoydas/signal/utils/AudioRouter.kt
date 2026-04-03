@@ -37,12 +37,19 @@ class AudioRouter(private val context: Context) {
             addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED)
             addAction(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED)
         }
-        context.registerReceiver(headsetReceiver, filter)
+
+        // [CRITICAL FIX] Android 14+ Requires explicit RECEIVER_NOT_EXPORTED flag
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(headsetReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context.registerReceiver(headsetReceiver, filter)
+        }
 
         // Initial Check
+        @Suppress("DEPRECATION")
         isHeadsetPlugged = audioManager.isWiredHeadsetOn
 
-        // [CRASH FIX] Wrap this in try-catch for Android 12+ permission issues
+        // Wrap this in try-catch for Android 12+ permission issues
         try {
             isBluetoothConnected = audioManager.isBluetoothA2dpOn || audioManager.isBluetoothScoOn
         } catch (e: SecurityException) {
@@ -53,13 +60,11 @@ class AudioRouter(private val context: Context) {
         updateRoute()
     }
 
-    // --- [NEW] COMPATIBILITY BRIDGE for VoiceService ---
-    // VoiceService calls 'setVoipMode', so we map it to your 'setCallMode'
+    // --- COMPATIBILITY BRIDGE for VoiceService ---
     fun setVoipMode(isActive: Boolean) {
         setCallMode(isActive)
     }
 
-    // VoiceService might call this to set hardware speaker state
     fun setSpeakerphone(enable: Boolean) {
         if (audioManager.isSpeakerphoneOn != enable) {
             audioManager.isSpeakerphoneOn = enable
@@ -91,8 +96,8 @@ class AudioRouter(private val context: Context) {
                         }
                     } else if (state == AudioManager.SCO_AUDIO_STATE_DISCONNECTED) {
                         Log.d(tag, "Bluetooth SCO Disconnected.")
-                        // [FIX] Only restart if we still have permission
-                        if (isBluetoothConnected && isVoipCallActive) {
+                        // Only restart if we still have permission and should be connected
+                        if (isBluetoothConnected && isVoipCallActive && isFocusHeld) {
                             startBluetoothSco()
                         }
                     }
@@ -147,13 +152,17 @@ class AudioRouter(private val context: Context) {
     }
 
     fun setCallMode(active: Boolean) {
-        isVoipCallActive = active
-        updateRoute()
+        if (isVoipCallActive != active) {
+            isVoipCallActive = active
+            updateRoute()
+        }
     }
 
     fun setSpeakerPreferred(preferSpeaker: Boolean) {
-        isSpeakerPreferred = preferSpeaker
-        updateRoute()
+        if (isSpeakerPreferred != preferSpeaker) {
+            isSpeakerPreferred = preferSpeaker
+            updateRoute()
+        }
     }
 
     fun requestFocus(): Boolean {
@@ -171,7 +180,9 @@ class AudioRouter(private val context: Context) {
                         .build()
                 )
                 .setOnAudioFocusChangeListener { focusChange ->
-                    if (focusChange == AudioManager.AUDIOFOCUS_LOSS) abandonFocus()
+                    if (focusChange == AudioManager.AUDIOFOCUS_LOSS || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+                        abandonFocus()
+                    }
                 }
                 .build()
 
@@ -207,7 +218,7 @@ class AudioRouter(private val context: Context) {
     fun shutdown() {
         try { context.unregisterReceiver(headsetReceiver) } catch (e: Exception) { }
         isVoipCallActive = false
-        isFocusHeld = true
+        isFocusHeld = true // Force abandonFocus to execute
         abandonFocus()
     }
 }

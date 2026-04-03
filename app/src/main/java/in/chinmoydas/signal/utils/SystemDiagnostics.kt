@@ -7,16 +7,15 @@ import android.hardware.Sensor
 import android.hardware.SensorManager
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.PowerManager
 import androidx.core.content.ContextCompat
 import `in`.chinmoydas.signal.VoiceService
 import `in`.chinmoydas.signal.RetrofitClient
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.flow
-import java.net.DatagramSocket
+import kotlinx.coroutines.flow.flowOn
 
 data class DiagnosticItem(
     val name: String,
@@ -44,7 +43,7 @@ object SystemDiagnostics {
             emit(DiagnosticItem("Permissions Secure", DiagnosticStatus.Success))
         }
 
-        // 2. BACKGROUND SURVIVAL (Critical for PTT)
+        // 2. BACKGROUND SURVIVAL
         emit(DiagnosticItem("Background Process", DiagnosticStatus.Running))
         delay(200)
         val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -58,7 +57,7 @@ object SystemDiagnostics {
             emit(DiagnosticItem("Battery Optimization", DiagnosticStatus.Warning, "App may sleep. Tap to fix."))
         }
 
-        // 3. AUDIO HARDWARE (AEC Check)
+        // 3. AUDIO HARDWARE
         emit(DiagnosticItem("Audio Engine", DiagnosticStatus.Running))
         delay(200)
         val hasAec = AcousticEchoCanceler.isAvailable()
@@ -70,29 +69,17 @@ object SystemDiagnostics {
             emit(DiagnosticItem("Audio Hardware", DiagnosticStatus.Warning, "Software Mode (Echo Risk)"))
         }
 
-        // 4. UDP PORT BINDING (PTT & Calls)
+        // 4. UDP PORT BINDING
         emit(DiagnosticItem("Radio Transport", DiagnosticStatus.Running))
         delay(200)
-
-        // Check PTT Port 50005 (Managed by Service)
         val bindStatus = service?.voiceServiceState?.value?.networkStatus ?: "Disconnected"
-
-        // Check Call Port 50006 (Managed by CallEngine)
-        var port50006Free = false
-        try {
-            // If we can bind it, it's free. If it throws, it's in use (which is good if we are calling, bad if idle)
-            val s = DatagramSocket(50006)
-            s.close()
-            port50006Free = true
-        } catch (e: Exception) { port50006Free = false }
-
-        if (bindStatus != "Error: UDP Bind Failed") {
-            emit(DiagnosticItem("UDP Transport", DiagnosticStatus.Success, "Port 50005 Bound"))
+        if (bindStatus != "Error: UDP Bind Failed" && bindStatus != "Disconnected") {
+            emit(DiagnosticItem("UDP Transport", DiagnosticStatus.Success, "Port 50005 Bound (Multiplexed)"))
         } else {
             emit(DiagnosticItem("Radio Transport", DiagnosticStatus.Failure, "Port 50005 Failed"))
         }
 
-        // 5. HARDWARE SENSORS (Impact Shield)
+        // 5. HARDWARE SENSORS
         emit(DiagnosticItem("Safety Sensors", DiagnosticStatus.Running))
         delay(200)
         val sm = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -108,7 +95,6 @@ object SystemDiagnostics {
         delay(300)
         val prefs = context.getSharedPreferences("WalkiePrefs", Context.MODE_PRIVATE)
         val token = prefs.getString("my_fcm_token", "")
-
         val googleApi = com.google.android.gms.common.GoogleApiAvailability.getInstance()
         val resultCode = googleApi.isGooglePlayServicesAvailable(context)
 
@@ -120,26 +106,33 @@ object SystemDiagnostics {
             emit(DiagnosticItem("Cloud Wake", DiagnosticStatus.Success, "Active"))
         }
 
-        // 7. SERVER HEARTBEAT
-        emit(DiagnosticItem("Signal Server", DiagnosticStatus.Running))
+        // 7. MOTHERSHIP AUTH & RELAY
+        emit(DiagnosticItem("Mothership Uplink", DiagnosticStatus.Running))
         delay(300)
         val jwt = prefs.getString("jwt_token", "")
         if (jwt.isNullOrEmpty() || jwt == "OFFLINE_TOKEN") {
-            emit(DiagnosticItem("Signal Server", DiagnosticStatus.Warning, "Offline Login"))
+            emit(DiagnosticItem("Mothership Uplink", DiagnosticStatus.Warning, "Offline Mode Active"))
         } else {
+            // [FIXED] Removed withContext(Dispatchers.IO).
+            // The whole flow is now shifted to IO using .flowOn() at the bottom.
             try {
-                val response = RetrofitClient.api.checkSignals("Bearer $jwt")
-                if (response.signals != null) {
-                    emit(DiagnosticItem("Signal Server", DiagnosticStatus.Success, "Synced (Low Latency)"))
+                val signalResponse = RetrofitClient.api.checkSignals("Bearer $jwt")
+                val credsResponse = RetrofitClient.api.getSignalCreds("Bearer $jwt")
+                val hasRelay = credsResponse.status == "success" && !credsResponse.iceServers.isNullOrEmpty()
+
+                if (signalResponse.signals != null && hasRelay) {
+                    emit(DiagnosticItem("Mothership Uplink", DiagnosticStatus.Success, "Synced + TURN Relay Ready"))
+                } else if (signalResponse.signals != null) {
+                    emit(DiagnosticItem("Mothership Uplink", DiagnosticStatus.Warning, "Synced (No Relay Credentials)"))
                 } else {
-                    emit(DiagnosticItem("Signal Server", DiagnosticStatus.Warning, "Connected (No Data)"))
+                    emit(DiagnosticItem("Mothership Uplink", DiagnosticStatus.Warning, "Connected (No Data)"))
                 }
             } catch (e: Exception) {
-                emit(DiagnosticItem("Signal Server", DiagnosticStatus.Failure, "Unreachable"))
+                emit(DiagnosticItem("Mothership Uplink", DiagnosticStatus.Failure, "Unreachable"))
             }
         }
 
         delay(100)
         emit(DiagnosticItem("DIAGNOSTIC COMPLETE", DiagnosticStatus.Success))
-    }
+    }.flowOn(Dispatchers.IO) // [CRITICAL] This is the correct way to handle IO in a Flow
 }

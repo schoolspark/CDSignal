@@ -19,7 +19,7 @@ class LocalLinkManager(
     private var registrationListener: NsdManager.RegistrationListener? = null
     private var discoveryListener: NsdManager.DiscoveryListener? = null
 
-    // [FIX] Resolution Queue to prevent "FAILURE_ALREADY_ACTIVE"
+    // Serialize resolutions to prevent "FAILURE_ALREADY_ACTIVE"
     private val resolveQueue = ConcurrentLinkedQueue<NsdServiceInfo>()
     @Volatile private var isResolving = false
 
@@ -28,6 +28,7 @@ class LocalLinkManager(
 
     fun startAdvertising(name: String, port: Int) {
         val cleanName = name.replace(Regex("[^A-Za-z0-9]"), "")
+        // Prevent redundant registrations
         if (currentRegisteredName == cleanName && registrationListener != null) return
         stopAdvertising()
 
@@ -79,8 +80,9 @@ class LocalLinkManager(
             }
 
             override fun onServiceFound(service: NsdServiceInfo) {
-                if (service.serviceType.contains("cdsignal")) {
-                    // [CRITICAL] Queue the service, don't resolve immediately
+                // [UPGRADE] Proactive Filtering: Don't resolve our own service
+                val myName = currentRegisteredName ?: "SKIP_CHECK"
+                if (service.serviceType.contains("cdsignal") && !service.serviceName.contains(myName)) {
                     resolveQueue.add(service)
                     processResolveQueue()
                 }
@@ -104,7 +106,6 @@ class LocalLinkManager(
         }
     }
 
-    // [FIX] Serialize Resolutions
     private fun processResolveQueue() {
         if (isResolving || resolveQueue.isEmpty()) return
         val service = resolveQueue.peek() ?: return
@@ -113,23 +114,24 @@ class LocalLinkManager(
         try {
             nsdManager.resolveService(service, object : NsdManager.ResolveListener {
                 override fun onResolveFailed(info: NsdServiceInfo, err: Int) {
-                    resolveQueue.poll() // Remove failed
+                    resolveQueue.poll()
                     isResolving = false
-                    processResolveQueue() // Next
+                    // Process next in queue after a tiny delay to let the system breathe
+                    processResolveQueue()
                 }
 
                 override fun onServiceResolved(info: NsdServiceInfo) {
-                    resolveQueue.poll() // Remove success
+                    resolveQueue.poll()
                     isResolving = false
 
-                    if (!info.serviceName.contains(currentRegisteredName ?: "SKIP_CHECK")) {
-                        val host = info.host
-                        val port = info.port
-                        val cleanName = info.serviceName.removePrefix("CD-")
-                        // Trigger Callback with LAN IP
-                        onServiceFound(cleanName, host, port)
-                    }
-                    processResolveQueue() // Next
+                    val host = info.host
+                    val port = info.port
+                    val cleanName = info.serviceName.removePrefix("CD-")
+
+                    // Trigger Callback with LAN IP
+                    onServiceFound(cleanName, host, port)
+
+                    processResolveQueue()
                 }
             })
         } catch (e: Exception) {
@@ -139,7 +141,9 @@ class LocalLinkManager(
 
     fun stopDiscovery() {
         discoveryListener?.let {
-            if (isDiscoveryStarted) try { nsdManager.stopServiceDiscovery(it) } catch (e: Exception) {}
+            if (isDiscoveryStarted) {
+                try { nsdManager.stopServiceDiscovery(it) } catch (e: Exception) {}
+            }
         }
         discoveryListener = null
         isDiscoveryStarted = false

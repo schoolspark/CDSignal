@@ -123,8 +123,8 @@ fun HistoryTab(
                                                 text = { Text("Voice Call") },
                                                 onClick = {
                                                     if (contactIp != null) {
-                                                        // Calls the secure engine without passing Context (Fixed)
-                                                        CallSignaling.startOutgoingCall(contactIp)
+                                                        // Updated to pass both IP and the name from the log
+                                                        CallSignaling.startOutgoingCall(contactIp, log.callerName)
                                                     } else {
                                                         Toast.makeText(context, "User Offline / IP Unknown", Toast.LENGTH_SHORT).show()
                                                     }

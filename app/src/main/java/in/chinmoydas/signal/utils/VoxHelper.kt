@@ -17,14 +17,13 @@ class VoxHelper(
     private val HOLD_TIME = 1200L
 
     fun process(buffer: ByteArray) {
+        // [FIX] Guard against division by zero on tiny buffers
+        if (buffer.size < 2) return
+
         val amplitude = calculateRMS(buffer)
 
         if (amplitude > sensitivity) {
-            silenceStart = 0
-            if (!isTalking) {
-                isTalking = true
-                onSpeechStart()
-            }
+            keepAlive()
         } else if (isTalking) {
             if (silenceStart == 0L) silenceStart = System.currentTimeMillis()
 
@@ -32,6 +31,18 @@ class VoxHelper(
                 isTalking = false
                 onSilence()
             }
+        }
+    }
+
+    /**
+     * [NEW] Allows VoiceService to keep VOX open without processing RMS math.
+     * Used when AudioEngine has already verified speech via its own Noise Gate.
+     */
+    fun keepAlive() {
+        silenceStart = 0
+        if (!isTalking) {
+            isTalking = true
+            onSpeechStart()
         }
     }
 
@@ -44,7 +55,7 @@ class VoxHelper(
             // Convert to 16-bit signed integer
             val sample = (buffer[i].toInt() and 0xFF) or (buffer[i+1].toInt() shl 8)
 
-            // [CRITICAL FIX] Convert to Double BEFORE squaring to prevent Int Overflow
+            // Convert to Double BEFORE squaring to prevent Int Overflow
             val sampleVal = sample.toDouble()
             sum += sampleVal * sampleVal
         }

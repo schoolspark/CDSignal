@@ -9,20 +9,36 @@ import java.util.concurrent.TimeUnit
 import com.google.gson.annotations.SerializedName
 import retrofit2.Response
 
-// --- DATA MODELS (Fully Restored) ---
-
-data class WakeResponse(
-    @SerializedName("status") val status: String,
-    @SerializedName("message") val message: String?,
-    @SerializedName("error") val error: String?
-)
+// --- UPGRADED DATA MODELS ---
 
 data class LoginResponse(
     @SerializedName("status") val status: String,
     @SerializedName("token") val token: String,
     @SerializedName("username") val username: String,
     @SerializedName("error") val error: String?,
-    @SerializedName("code") val code: String
+    @SerializedName("code") val code: String,
+    @SerializedName("is_premium") val isPremium: Boolean?,
+    @SerializedName("reflector_ip") val reflectorIp: String?,
+    @SerializedName("reflector_port") val reflectorPort: Int?
+)
+
+// [NEW] Model for enterprise-grade CoTURN credentials
+data class IceServer(
+    @SerializedName("urls") val urls: List<String>,
+    @SerializedName("username") val username: String?,
+    @SerializedName("credential") val credential: String?
+)
+
+data class SignalCredsResponse(
+    @SerializedName("status") val status: String,
+    @SerializedName("iceServers") val iceServers: List<IceServer>?,
+    @SerializedName("ttl") val ttl: Int?
+)
+
+data class WakeResponse(
+    @SerializedName("status") val status: String,
+    @SerializedName("message") val message: String?,
+    @SerializedName("error") val error: String?
 )
 
 data class PeerResponse(
@@ -66,28 +82,34 @@ data class SignalResponse(
     @SerializedName("signals") val signals: List<IncomingSignal>?
 )
 
-// --- API INTERFACE ---
+// --- UPGRADED API INTERFACE ---
 
 interface ApiService {
 
     @FormUrlEncoded
-    @POST("api/auth.php")
+    @POST("auth.php")
     suspend fun login(
         @Field("username") user: String,
         @Field("password") pass: String,
-        @Field("code") code: String
+        @Field("access_code") accessCode: String // For SaaS licensing
     ): LoginResponse
 
     @FormUrlEncoded
-    @POST("api/find.php")
+    @POST("find.php")
     suspend fun findPeer(
         @Header("Authorization") token: String,
         @Field("target_user") target: String,
         @Field("code") code: String
     ): PeerResponse
 
+    // [NEW] Get CoTURN credentials for premium relaying
+    @GET("get_signal_creds.php")
+    suspend fun getSignalCreds(
+        @Header("Authorization") token: String
+    ): SignalCredsResponse
+
     @FormUrlEncoded
-    @POST("api/channel.php")
+    @POST("channel.php")
     suspend fun findChannel(
         @Header("Authorization") token: String,
         @Field("channel_name") channel: String,
@@ -95,7 +117,7 @@ interface ApiService {
     ): ChannelResponse
 
     @FormUrlEncoded
-    @POST("api/heartbeat.php")
+    @POST("heartbeat.php")
     suspend fun sendHeartbeat(
         @Header("Authorization") token: String,
         @Field("port") port: Int,
@@ -103,28 +125,28 @@ interface ApiService {
         @Field("channel") channel: String?,
         @Field("channel_key") key: String?,
         @Field("status") status: String = "online"
-    ): Response<Unit>
+    ): GenericResponse // Use GenericResponse instead of Response<Unit>
 
-    @POST("api/reset_code.php")
+    @POST("reset_code.php")
     suspend fun resetCode(
         @Header("Authorization") token: String
     ): ResetResponse
 
     @FormUrlEncoded
-    @POST("api/signal.php")
+    @POST("signal.php")
     suspend fun sendSignal(
         @Header("Authorization") token: String,
         @Field("action") action: String,
         @Field("target") target: String?
     ): Response<Unit>
 
-    @GET("api/signal.php?action=check_signals")
+    @GET("signal.php?action=check_signals")
     suspend fun checkSignals(
         @Header("Authorization") token: String
     ): SignalResponse
 
     @FormUrlEncoded
-    @POST("api/fcm_wake.php")
+    @POST("fcm_wake.php")
     suspend fun sendWakeSignal(
         @Header("Authorization") authHeader: String,
         @Field("target_token") token: String,
@@ -132,14 +154,14 @@ interface ApiService {
     ): Response<WakeResponse>
 
     @FormUrlEncoded
-    @POST("api/reset_auth.php")
+    @POST("reset_auth.php")
     suspend fun requestOtp(
         @Field("action") action: String = "request_otp",
         @Field("username") username: String
     ): GenericResponse
 
     @FormUrlEncoded
-    @POST("api/reset_auth.php")
+    @POST("reset_auth.php")
     suspend fun resetPassword(
         @Field("action") action: String = "reset_pass",
         @Field("username") username: String,
@@ -148,47 +170,59 @@ interface ApiService {
     ): GenericResponse
 
     @FormUrlEncoded
-    @POST("api/update_fcm.php")
+    @POST("update_fcm.php")
     suspend fun updateFcmToken(
         @Header("Authorization") token: String,
         @Field("fcm_token") fcmToken: String
     ): Response<Unit>
 
     @FormUrlEncoded
-    @POST("api/update_email.php")
+    @POST("update_email.php")
     suspend fun updateRecoveryEmail(
         @Header("Authorization") authHeader: String,
         @Field("email") email: String
     ): Response<GenericResponse>
 }
 
-// --- RETROFIT CLIENT ---
+// --- UPGRADED RETROFIT CLIENT ---
 
 object RetrofitClient {
-    private const val BASE_URL = "https://signal.chinmoydas.in/"
+    // Mothership Location
+    private const val BASE_URL = "https://cdsignal.schoolspark.in/"
+
+    // [MOTHERSHIP SECURITY] Shared Secret between Kotlin and PHP
+    private const val API_KEY = "588fbb57d393cf97fd0759d1911dfe95ffbb969cfd33cfd3bc74b75b6040326f"
 
     private val logging = HttpLoggingInterceptor().apply {
         level = HttpLoggingInterceptor.Level.BODY
     }
 
-    // 1. Standard Client (Login, Large Syncs) - 30s Timeout
-    // Used for heavy operations where waiting is acceptable.
+    // Custom Interceptor to secure all Mothership requests
+    private val securityInterceptor = okhttp3.Interceptor { chain ->
+        val original = chain.request()
+        val request = original.newBuilder()
+            .header("X-API-KEY", API_KEY)
+            .method(original.method, original.body)
+            .build()
+        chain.proceed(request)
+    }
+
     private val okHttpClient = OkHttpClient.Builder()
         .addInterceptor(logging)
+        .addInterceptor(securityInterceptor)
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
 
-    // 2. Fast Client (PTT Signaling, Peer Discovery) - 5s Timeout [MISSION CRITICAL]
-    // Fails fast so the UI can switch to "Offline" mode instantly instead of hanging the user.
     private val fastHttpClient = OkHttpClient.Builder()
         .addInterceptor(logging)
+        .addInterceptor(securityInterceptor)
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(5, TimeUnit.SECONDS)
         .writeTimeout(5, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(false) // Don't retry blindly on real-time actions
+        .retryOnConnectionFailure(false)
         .build()
 
     val api: ApiService by lazy {
@@ -200,7 +234,6 @@ object RetrofitClient {
             .create(ApiService::class.java)
     }
 
-    // Use this for PTT/Signal calls to ensure responsiveness
     val fastApi: ApiService by lazy {
         Retrofit.Builder()
             .baseUrl(BASE_URL)

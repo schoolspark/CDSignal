@@ -23,6 +23,8 @@ import `in`.chinmoydas.signal.data.PagerEntry
 import `in`.chinmoydas.signal.utils.LocalLinkManager
 import `in`.chinmoydas.signal.utils.CallSignaling
 import `in`.chinmoydas.signal.utils.CallStatus
+import `in`.chinmoydas.signal.utils.SafetySignaling
+import `in`.chinmoydas.signal.utils.SystemDiagnostics
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
@@ -111,9 +113,9 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
     fun togglePriority(name: String) {
         val contact = savedContacts.find { it.name == name } ?: return
-        viewModelScope.launch(Dispatchers.IO) { // [FIX] Move DB write to IO
+        viewModelScope.launch(Dispatchers.IO) {
             repository.setContactPriority(name, !contact.isPriority)
-            loadData() // loadData handles switching back to Main
+            loadData()
         }
     }
 
@@ -144,8 +146,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
     fun loadData() {
         viewModelScope.launch {
-            // [CRITICAL FIX] Heavy Lifting (DB Fetch + Mapping) moved to IO Thread
-            // This prevents the 100+ frames skipped error during startup/refresh
             val (saved, blocked, logs) = withContext(Dispatchers.IO) {
                 val s = repository.getAllContacts().map {
                     Contact(it.name, it.ip, true, it.savedCode, it.isPriority, it.fcmToken)
@@ -157,7 +157,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                 Triple(s, b, l)
             }
 
-            // Apply changes on Main Thread
             savedContacts.clear()
             savedContacts.addAll(saved)
             blockedContacts.clear()
@@ -178,15 +177,20 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
     fun sendTextPayload(service: VoiceService?, text: String) {
         if (text.isBlank()) return
+
+        // Grab the IP (for Local Mode)
         val ip = getCurrentTargetIp()
 
+        // The Username is just the current targetUser
+        val username = targetUser
+
         if (ip != null && ip != "SERVER_LINK") {
-            // UDP Send is fast/non-blocking, fine on Main or IO
-            service?.sendTextMessage(ip, text)
+            // [UPDATED] Pass both IP and Username to VoiceService
+            service?.sendTextMessage(ip, username, text)
 
             if (text.startsWith("CMD:") || text.startsWith("LOC:")) return
 
-            viewModelScope.launch(Dispatchers.IO) { // [FIX] DB Insert on IO
+            viewModelScope.launch(Dispatchers.IO) {
                 repository.insertPagerEntry(
                     PagerEntry(sender = "Me", type = "TEXT", content = text, isRead = true)
                 )
@@ -198,8 +202,11 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
     fun triggerCurrentSos(service: VoiceService?) {
         val ip = getCurrentTargetIp()
+        val username = targetUser
+
         if (ip != null && ip != "SERVER_LINK") {
-            service?.sendTextMessage(ip, "CMD:SOS")
+            // [UPDATED] Pass both IP and Username
+            service?.sendTextMessage(ip, username, "CMD:SOS")
         } else {
             service?.sendPanicAlert()
         }
@@ -238,15 +245,15 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     }
 
     fun addContact(name: String, ip: String, code: String) {
-        viewModelScope.launch(Dispatchers.IO) { // [FIX] DB Write on IO
+        viewModelScope.launch(Dispatchers.IO) {
             repository.saveContact(name, ip, code)
-            loadData() // loadData manages its own context switching
+            loadData()
             withContext(Dispatchers.Main) { setTarget(name) }
         }
     }
 
     fun blockContact(name: String) {
-        viewModelScope.launch(Dispatchers.IO) { // [FIX] DB Write on IO
+        viewModelScope.launch(Dispatchers.IO) {
             repository.setBlockedStatus(name, true)
             loadData()
             withContext(Dispatchers.Main) {
@@ -256,14 +263,14 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     }
 
     fun unblockContact(name: String) {
-        viewModelScope.launch(Dispatchers.IO) { // [FIX] DB Write on IO
+        viewModelScope.launch(Dispatchers.IO) {
             repository.setBlockedStatus(name, false)
             loadData()
         }
     }
 
     fun deleteContact(name: String) {
-        viewModelScope.launch(Dispatchers.IO) { // [FIX] DB Write on IO
+        viewModelScope.launch(Dispatchers.IO) {
             repository.deleteContact(name)
             loadData()
             withContext(Dispatchers.Main) {
@@ -301,7 +308,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     fun saveInternetContact(name: String, code: String, onSuccess: () -> Unit, onError: () -> Unit) {
         _uiState.value = UiState.Error("Verifying...")
 
-        viewModelScope.launch(Dispatchers.IO) { // [FIX] Network Verification on IO
+        viewModelScope.launch(Dispatchers.IO) {
             val token = repository.getToken() ?: ""
             if (token.isBlank() || token == "OFFLINE_TOKEN") {
                 withContext(Dispatchers.Main) { _uiState.value = UiState.Error("Need Internet"); onError() }
@@ -343,7 +350,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         }
     }
 
-    // [FIX] Updated signature: onUpdateIps now accepts 'Int' for the Port
     fun startTransmission(onIpsFound: (List<String>, Int) -> Unit, onUpdateIps: (List<String>, Int) -> Unit) {
         if (_uiState.value is UiState.Transmitting || _uiState.value is UiState.Receiving) return
         _uiState.value = UiState.Transmitting("Connecting...", false)
@@ -371,7 +377,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
         val token = repository.getToken() ?: ""
         if (token.isBlank() || token == "OFFLINE_TOKEN") { _uiState.value = UiState.Error("Offline"); return }
 
-        // 2. Speculative Start (Starts fast on default port 50005)
+        // 2. Speculative Start
         var speculated = false
         if (contact != null && contact.ip.isNotEmpty() && contact.ip != "SERVER_LINK") {
             _uiState.value = UiState.Transmitting("On Air", false)
@@ -379,7 +385,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
             speculated = true
         }
 
-        // 3. Server Refresh (Fixes NAT Port issues)
+        // 3. Server Refresh
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 if (targetUser.startsWith("group:", true)) {
@@ -390,7 +396,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                     withContext(Dispatchers.Main) {
                         if (!finalIps.isNullOrEmpty()) {
                             _uiState.value = UiState.Transmitting("On Air", false)
-                            // Groups typically use the default port, but this supports updates if needed
                             if (speculated) onUpdateIps(finalIps.toList(), 50005)
                             else onIpsFound(finalIps.toList(), 50005)
                         } else if (!speculated) {
@@ -402,8 +407,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                     if (_uiState.value !is UiState.Transmitting) return@launch
 
                     val ipList = listOfNotNull(response.ip, response.local_ip).distinct()
-
-                    // [CRITICAL FIX] Capture the actual Port from Server (e.g. 59443)
                     val targetPort = response.port ?: 50005
 
                     withContext(Dispatchers.Main) {
@@ -412,7 +415,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                                 _uiState.value = UiState.Transmitting("On Air", false)
                                 onIpsFound(ipList, targetPort)
                             } else {
-                                // [CRITICAL FIX] Update the running stream with the CORRECT Port
                                 onUpdateIps(ipList, targetPort)
                             }
                         } else if (!speculated) {
@@ -420,7 +422,6 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                         }
                     }
 
-                    // Save new IP/Port info for next time
                     if (response.ip != contact.ip) {
                         repository.saveContact(
                             name = contact.name,
@@ -445,35 +446,29 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     }
 
     fun hangUp(service: VoiceService?) {
-        // 1. Reset PTT UI to default
         _uiState.value = if (targetUser.isNotEmpty()) UiState.Connected(targetUser) else UiState.Ready
 
-        // 2. Handle VoIP (Priority)
-        // Check if we are in the middle of a Phone Call
-        val callState = `in`.chinmoydas.signal.utils.CallSignaling.callStatus.value
-        if (callState != `in`.chinmoydas.signal.utils.CallStatus.Idle) {
+        // [CLEANED] Removed package prefix to avoid compilation syntax errors
+        val callState = CallSignaling.callStatus.value
+        if (callState != CallStatus.Idle) {
             viewModelScope.launch {
-                if (callState == `in`.chinmoydas.signal.utils.CallStatus.Ringing) {
-                    `in`.chinmoydas.signal.utils.CallSignaling.declineCall()
+                if (callState == CallStatus.Ringing) {
+                    CallSignaling.declineCall()
                 } else {
-                    `in`.chinmoydas.signal.utils.CallSignaling.endCall()
+                    CallSignaling.endCall()
                 }
             }
         }
 
-        // 3. Handle PTT (Walkie Talkie)
-        // If we were transmitting or receiving a PTT burst, kill that too.
         if (service != null) {
             val state = service.voiceServiceState.value
 
             if (state.isTransmitting) {
                 service.stopTalk()
             } else {
-                // Stop listening to PTT audio
                 service.stopReceiving()
 
-                // Legacy support: If you still use the old "sendRemoteHangup" for something else
-                if (state.incomingCall != null && callState == `in`.chinmoydas.signal.utils.CallStatus.Idle) {
+                if (state.incomingCall != null && callState == CallStatus.Idle) {
                     service.sendRemoteHangup()
                 }
             }
@@ -483,7 +478,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     fun onReceptionStarted(from: String, ip: String) {
         if (_uiState.value !is UiState.Transmitting) _uiState.value = UiState.Receiving(from)
         if (ip.isNotEmpty() && !from.startsWith("group:", true)) {
-            viewModelScope.launch(Dispatchers.IO) { // [FIX] Silent DB update on IO
+            viewModelScope.launch(Dispatchers.IO) {
                 val saved = savedContacts.find { it.name == from }
                 if (saved != null && saved.ip != ip) {
                     repository.updateContactIp(from, ip)
@@ -534,7 +529,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     }
 
     fun resetPairingCode(myName: String) {
-        viewModelScope.launch(Dispatchers.IO) { // [FIX] Network call on IO
+        viewModelScope.launch(Dispatchers.IO) {
             val token = repository.getToken() ?: ""
             if (token.isBlank() || token == "OFFLINE_TOKEN") return@launch
             try {
@@ -552,19 +547,20 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     }
 
     fun handleIncomingPacket(text: String, ip: String): Boolean {
+        // [CLEANED] Removed package prefixes here as well
         if (text.startsWith("CMD:CALL")) {
             viewModelScope.launch {
-                `in`.chinmoydas.signal.utils.CallSignaling.handleSignal(text, ip)
+                CallSignaling.handleSignal(text, ip)
             }
             return true
         }
         if (text.startsWith("CMD:SOS") || text.startsWith("CMD:PANIC")) {
-            `in`.chinmoydas.signal.utils.SafetySignaling.triggerSOS(ip)
+            SafetySignaling.triggerSOS(ip)
             return false
         }
         if (text.startsWith("LOC:")) {
             val coords = text.removePrefix("LOC:")
-            `in`.chinmoydas.signal.utils.SafetySignaling.triggerLocation(ip, coords)
+            SafetySignaling.triggerLocation(ip, coords)
             return false
         }
         return false
@@ -585,7 +581,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
     }
 
     fun performHealthCheck(context: Context, service: VoiceService?) =
-        `in`.chinmoydas.signal.utils.SystemDiagnostics.runChecks(context, service)
+        SystemDiagnostics.runChecks(context, service)
 
     fun sendCloudWakeUp(context: Context, contact: Contact) {
         if (contact.fcmToken.isBlank()) {
@@ -593,7 +589,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
             return
         }
 
-        viewModelScope.launch(Dispatchers.IO) { // [FIX] Guaranteed IO Thread
+        viewModelScope.launch(Dispatchers.IO) {
             try {
                 val jwt = repository.getToken()
                 val myName = repository.myUsername.value
@@ -639,7 +635,7 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
             return
         }
 
-        viewModelScope.launch(Dispatchers.IO) { // [FIX] Guaranteed IO Thread
+        viewModelScope.launch(Dispatchers.IO) {
             try {
                 val token = repository.getToken() ?: ""
                 val response = RetrofitClient.api.updateRecoveryEmail("Bearer $token", email)
@@ -673,18 +669,16 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
 
     fun clearTarget() {
         viewModelScope.launch(Dispatchers.IO) {
-            // Use 'setTargetUser' as defined in your MainRepository
             repository.setTargetUser("")
         }
     }
 
-    // [FIX] Safe Call Starter (Prevents UI crash/vanish)
+    // [FIXED] Fully refactored to use standard class names without backticks
     fun startCall(context: Context) {
         if (targetUser.isEmpty()) return
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // 1. Validate IP before touching UI
                 val ip = getCurrentTargetIp()
 
                 if (ip.isNullOrEmpty()) {
@@ -694,9 +688,8 @@ class WalkieViewModel(private val repository: MainRepository) : ViewModel() {
                     return@launch
                 }
 
-                // 2. Trigger Signaling Safely on Main Thread
                 withContext(Dispatchers.Main) {
-                    `in`.chinmoydas.signal.utils.CallSignaling.startOutgoingCall(ip)
+                    CallSignaling.startOutgoingCall(ip, targetUser)
                 }
 
             } catch (e: Exception) {

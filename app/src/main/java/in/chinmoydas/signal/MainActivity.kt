@@ -50,6 +50,7 @@ import `in`.chinmoydas.signal.utils.CallStatus
 import `in`.chinmoydas.signal.viewmodel.ViewModelFactory
 import `in`.chinmoydas.signal.viewmodel.WalkieViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -69,6 +70,9 @@ class MainActivity : ComponentActivity() {
     private val UPDATE_REQUEST_CODE = 123
     private val OVERLAY_REQUEST_CODE = 101
     private val serviceBoundState = mutableStateOf<VoiceService?>(null)
+
+    // [FIX 1] Job reference to prevent coroutine leaks when service reconnects
+    private var serviceStateJob: Job? = null
 
     private val exitReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -102,10 +106,10 @@ class MainActivity : ComponentActivity() {
 
         CallSignaling.initialize(applicationContext)
 
-        // [FIX] 1. Check Overlay Permission first (Critical for Lock Screen visibility)
+        // 1. Check Overlay Permission first (Critical for Lock Screen visibility)
         checkOverlayPermission()
 
-        // [FIX] 2. Apply Wake Up Logic
+        // 2. Apply Wake Up Logic
         wakeUpScreen()
 
         appUpdateManager = AppUpdateManagerFactory.create(this)
@@ -174,7 +178,7 @@ class MainActivity : ComponentActivity() {
 
                         val currentName by repository.myUsername.collectAsState()
 
-                        // [CRITICAL] Handle intents that might have launched the app
+                        // Handle intents that might have launched the app
                         LaunchedEffect(intent) { handleIntent(intent) }
 
                         NavHost(navController = navController, startDestination = startDest!!) {
@@ -213,7 +217,8 @@ class MainActivity : ComponentActivity() {
                                     onSpeakerToggle = { currentService?.toggleSpeaker(!serviceState.isSpeakerOn) },
                                     isSpeakerOn = serviceState.isSpeakerOn,
                                     onHangup = { walkieViewModel.hangUp(currentService) },
-                                    onAccept = { lifecycleScope.launch { `in`.chinmoydas.signal.utils.CallSignaling.acceptCall() } },
+                                    // [FIX 2] Removed backticks and coroutine scope. Much cleaner and safer.
+                                    onAccept = { CallSignaling.acceptCall() },
                                     onMinimize = { isCallMinimized = true }
                                 )
                             } else {
@@ -248,6 +253,7 @@ class MainActivity : ComponentActivity() {
                         Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                         Uri.parse("package:$packageName")
                     )
+                    @Suppress("DEPRECATION")
                     startActivityForResult(intent, OVERLAY_REQUEST_CODE)
                 } catch (e: Exception) {
                     Log.e("MainActivity", "Failed to open Overlay Settings", e)
@@ -268,7 +274,7 @@ class MainActivity : ComponentActivity() {
                 if (appUpdateInfo.updateAvailability() == UpdateAvailability.UPDATE_AVAILABLE &&
                     appUpdateInfo.isUpdateTypeAllowed(AppUpdateType.FLEXIBLE)
                 ) {
-                    runOnUiThread {
+                    lifecycleScope.launch(Dispatchers.Main) {
                         try {
                             appUpdateManager.startUpdateFlowForResult(appUpdateInfo, AppUpdateType.FLEXIBLE, this@MainActivity, UPDATE_REQUEST_CODE)
                         } catch (e: Exception) { Log.e("Update", "Failed to start update flow: ${e.message}") }
@@ -287,6 +293,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == UPDATE_REQUEST_CODE) {
@@ -302,7 +309,10 @@ class MainActivity : ComponentActivity() {
     private fun linkServiceLogic(service: VoiceService) {
         if (!::walkieViewModel.isInitialized) return
         service.packetInterceptor = { text, ip -> walkieViewModel.handleIncomingPacket(text, ip) }
-        lifecycleScope.launch {
+
+        // [FIX 1] Cancel old job before starting a new one to prevent duplication
+        serviceStateJob?.cancel()
+        serviceStateJob = lifecycleScope.launch {
             service.voiceServiceState.collectLatest { state ->
                 if (state.incomingCall != null && state.incomingIp != null) {
                     walkieViewModel.onReceptionStarted(state.incomingCall, state.incomingIp)
@@ -313,7 +323,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // [FIX] Consolidate Wake Up Logic
     private fun wakeUpScreen() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
@@ -345,10 +354,9 @@ class MainActivity : ComponentActivity() {
                 walkieViewModel.setTarget(autoChannel)
             }
 
-            // [FIX] If this intent is for a call, FORCE screen wake up now
             if (isCall) {
-                wakeUpScreen() // Handles lock screen bypass
-                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) // Keeps it on
+                wakeUpScreen()
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             }
 
             intent?.removeExtra("auto_connect_channel")
@@ -399,7 +407,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        // [CRITICAL] Update the intent so Compose LaunchedEffects react to it
+        // Update the intent so Compose LaunchedEffects react to it
         setIntent(intent)
         handleIntent(intent)
     }

@@ -19,7 +19,7 @@ data class ContactEntity(
     val ip: String,
     val savedCode: String = "",
     val isBlocked: Boolean = false,
-    val isPriority: Boolean = false, // [NEW] Priority Flag
+    val isPriority: Boolean = false,
     val fcmToken: String = ""
 )
 
@@ -50,20 +50,30 @@ interface CallLogDao {
 
 @Dao
 interface ContactDao {
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insert(contact: ContactEntity)
 
+    // [FIX 2] Changed from REPLACE to IGNORE.
+    // This prevents accidental wiping of the isBlocked/isPriority flags if an existing contact is re-inserted.
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insert(contact: ContactEntity): Long
+
+    // Explicit Full Update for existing contacts
+    @Update
+    suspend fun update(contact: ContactEntity)
+
+    // Renamed for clarity so it isn't confused with getAbsolutelyAllContacts
     @Query("SELECT * FROM contacts WHERE isBlocked = 0")
-    suspend fun getAllContacts(): List<ContactEntity>
+    suspend fun getActiveContacts(): List<ContactEntity>
 
     @Query("SELECT * FROM contacts WHERE isBlocked = 1")
     suspend fun getBlockedContacts(): List<ContactEntity>
 
-    // [MOVED HERE] Get VIPs
     @Query("SELECT * FROM contacts WHERE isPriority = 1")
     suspend fun getPrincipalContacts(): List<ContactEntity>
 
-    // Helper to preserve blocked status when re-saving a contact
+    // [FIX 3] A true "Get Everything" query for the background engines to check existence
+    @Query("SELECT * FROM contacts")
+    suspend fun getAbsolutelyAllContacts(): List<ContactEntity>
+
     @Query("SELECT EXISTS(SELECT 1 FROM contacts WHERE name = :name AND isBlocked = 1)")
     suspend fun isBlocked(name: String): Boolean
 
@@ -73,11 +83,9 @@ interface ContactDao {
     @Query("UPDATE contacts SET isBlocked = :blocked WHERE name = :name")
     suspend fun setBlockedStatus(name: String, blocked: Boolean)
 
-    // [MOVED HERE] Set Priority
     @Query("UPDATE contacts SET isPriority = :isPriority WHERE name = :name")
     suspend fun setPriority(name: String, isPriority: Boolean)
 
-    // Silent IP Update helper
     @Query("UPDATE contacts SET ip = :newIp WHERE name = :name")
     suspend fun updateIp(name: String, newIp: String): Int // Returns row count
 
@@ -85,13 +93,11 @@ interface ContactDao {
     suspend fun updateContactToken(name: String, token: String)
 }
 
-// DAO for Pager Logic
 @Dao
 interface PagerDao {
     @Insert
     suspend fun insert(entry: PagerEntry)
 
-    // Returns a Flow so the UI updates instantly when a new message arrives
     @Query("SELECT * FROM pager_entries ORDER BY timestamp DESC")
     fun getAllEntries(): Flow<List<PagerEntry>>
 
@@ -112,6 +118,7 @@ abstract class AppDatabase : RoomDatabase() {
 
     companion object {
         @Volatile private var instance: AppDatabase? = null
+
         fun getDatabase(context: android.content.Context): AppDatabase {
             return instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
@@ -119,7 +126,8 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "cd_signal_db"
                 )
-                    .fallbackToDestructiveMigration()
+                    // [FIX 1] Removed .fallbackToDestructiveMigration()
+                    // The database is now protected from accidental deletion on Play Store updates.
                     .build().also { instance = it }
             }
         }

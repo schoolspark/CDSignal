@@ -36,9 +36,10 @@ fun CallScreen(
     onMinimize: () -> Unit
 ) {
     val callStatus by CallSignaling.callStatus.collectAsState()
-    val remoteIp = CallSignaling.currentCallerIp
-    val displayName = remember(remoteIp) {
-        if (remoteIp != null) nameResolver(remoteIp) else "Unknown"
+    val session by CallSignaling.currentSession.collectAsState()
+
+    val displayName = remember(session) {
+        session?.let { nameResolver(it.peerIp) } ?: "Unknown"
     }
 
     // [FEATURE] Keep screen on during call (Vital for VoIP)

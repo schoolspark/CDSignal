@@ -1,20 +1,21 @@
 package `in`.chinmoydas.signal.utils
 
 import java.net.InetAddress
-import java.nio.ByteBuffer
-import java.util.Random
+import java.security.SecureRandom
 
 object StunClient {
 
     data class StunResult(val ip: String, val port: Int)
 
     fun isStunResponse(data: ByteArray): Boolean {
-        // RFC 5389: First byte 0, 1st bit 0. Magic Cookie 0x2112A442 at offset 4
-        // 0x0101 is Binding Response
-        return data.size >= 20 && data[0] == 0x01.toByte() && data[1] == 0x01.toByte()
+        // RFC 5389: Binding Response is 0x0101. Magic Cookie at offset 4.
+        if (data.size < 20) return false
+        val isResponse = data[0] == 0x01.toByte() && data[1] == 0x01.toByte()
+        val hasMagicCookie = data[4] == 0x21.toByte() && data[5] == 0x12.toByte() &&
+                data[6] == 0xA4.toByte() && data[7] == 0x42.toByte()
+        return isResponse && hasMagicCookie
     }
 
-    // [FIX] Returns ByteArray (not DatagramPacket) to work with ConnectionManager
     fun buildRequest(): ByteArray {
         val request = ByteArray(20)
         // Message Type: Binding Request (0x0001)
@@ -28,11 +29,13 @@ object StunClient {
         request[5] = 0x12
         request[6] = 0xA4.toByte()
         request[7] = 0x42
-        // Transaction ID (12 bytes random)
-        val random = Random()
-        for (i in 8 until 20) {
-            request[i] = random.nextInt(256).toByte()
-        }
+
+        // [FIXED] Faster, cryptographically secure 12-byte Transaction ID
+        val random = SecureRandom()
+        val txId = ByteArray(12)
+        random.nextBytes(txId)
+        System.arraycopy(txId, 0, request, 8, 12)
+
         return request
     }
 
@@ -40,7 +43,6 @@ object StunClient {
         try {
             if (!isStunResponse(data)) return null
 
-            // Skip Header (20 bytes)
             var pos = 20
             val len = data.size
 
@@ -54,15 +56,15 @@ object StunClient {
 
                 // 0x0020: XOR-MAPPED-ADDRESS (Preferred)
                 if (type == 0x0020) {
-                    // Skip 1 byte (0x00) + 1 byte (Family 0x01 for IPv4)
                     val portRaw = ((data[pos + 2].toInt() and 0xFF) shl 8) or (data[pos + 3].toInt() and 0xFF)
-                    val port = portRaw xor 0x2112 // XOR with Magic Cookie
+                    val port = portRaw xor 0x2112
 
                     val ipBytes = ByteArray(4)
-                    ipBytes[0] = (data[pos + 4].toInt() xor 0x21).toByte()
-                    ipBytes[1] = (data[pos + 5].toInt() xor 0x12).toByte()
-                    ipBytes[2] = (data[pos + 6].toInt() xor 0xA4).toByte()
-                    ipBytes[3] = (data[pos + 7].toInt() xor 0x42).toByte()
+                    // [CRITICAL FIX] Stripping the Kotlin sign-extension with 'and 0xFF' before XOR
+                    ipBytes[0] = ((data[pos + 4].toInt() and 0xFF) xor 0x21).toByte()
+                    ipBytes[1] = ((data[pos + 5].toInt() and 0xFF) xor 0x12).toByte()
+                    ipBytes[2] = ((data[pos + 6].toInt() and 0xFF) xor 0xA4).toByte()
+                    ipBytes[3] = ((data[pos + 7].toInt() and 0xFF) xor 0x42).toByte()
 
                     val ip = InetAddress.getByAddress(ipBytes).hostAddress ?: return null
                     return StunResult(ip, port)
@@ -71,15 +73,20 @@ object StunClient {
                 else if (type == 0x0001) {
                     val port = ((data[pos + 2].toInt() and 0xFF) shl 8) or (data[pos + 3].toInt() and 0xFF)
                     val ipBytes = ByteArray(4)
+                    // System.arraycopy is safe from the sign-extension bug
                     System.arraycopy(data, pos + 4, ipBytes, 0, 4)
 
                     val ip = InetAddress.getByAddress(ipBytes).hostAddress ?: return null
                     return StunResult(ip, port)
                 }
 
-                pos += attrLen
+                // Skip attributes we don't care about (e.g., SOFTWARE, FINGERPRINT)
+                val padding = (4 - (attrLen % 4)) % 4
+                pos += attrLen + padding
             }
-        } catch (e: Exception) { e.printStackTrace() }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
         return null
     }
 }

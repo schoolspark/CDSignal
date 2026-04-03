@@ -63,9 +63,18 @@ class SignalFirebaseService : FirebaseMessagingService() {
             // Acquire temporary lock to ensure processing finishes
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
             val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Signal:CloudWakeLock")
+
+            // Acquire with a 5-second safety timeout
             wakeLock.acquire(5 * 1000L)
 
-            startVoiceServiceForPunchBack(sender, senderIp, senderPort)
+            try {
+                startVoiceServiceForPunchBack(sender, senderIp, senderPort)
+            } finally {
+                // [OPTIMIZATION] Release lock immediately after processing to save battery
+                if (wakeLock.isHeld) {
+                    wakeLock.release()
+                }
+            }
         }
     }
 
@@ -80,13 +89,13 @@ class SignalFirebaseService : FirebaseMessagingService() {
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                // This might throw exception on Android 12+ if app is in background
+                // This will throw ForegroundServiceStartNotAllowedException on Android 12+ if in background
                 startForegroundService(intent)
             } else {
                 startService(intent)
             }
         } catch (e: Exception) {
-            Log.e(tag, "Background Service Start Blocked: ${e.message}. Using High-Priority Notification.")
+            Log.w(tag, "Background Service Start Blocked. Using High-Priority Fallback.")
             postFallbackNotification(sender)
         }
     }
@@ -96,21 +105,24 @@ class SignalFirebaseService : FirebaseMessagingService() {
         val manager = getSystemService(NotificationManager::class.java)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, "Wake Alerts", NotificationManager.IMPORTANCE_HIGH).apply {
-                description = "Incoming PTT Wake Signals"
-                enableVibration(true)
-                lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
-                setBypassDnd(true) // Ensure it rings even in DND
+            // [OPTIMIZATION] Ensure channel exists without recreating it unnecessarily
+            if (manager.getNotificationChannel(channelId) == null) {
+                val channel = NotificationChannel(channelId, "Wake Alerts", NotificationManager.IMPORTANCE_HIGH).apply {
+                    description = "Incoming PTT Wake Signals"
+                    enableVibration(true)
+                    lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
+                    setBypassDnd(true) // Ensure it rings even in DND
 
-                // Use a loud sound or default notification sound
-                val soundUri = android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION)
-                val audioAttributes = android.media.AudioAttributes.Builder()
-                    .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_INSTANT)
-                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .build()
-                setSound(soundUri, audioAttributes)
+                    // Use a loud sound or default notification sound
+                    val soundUri = android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION)
+                    val audioAttributes = android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_INSTANT)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                    setSound(soundUri, audioAttributes)
+                }
+                manager.createNotificationChannel(channel)
             }
-            manager.createNotificationChannel(channel)
         }
 
         val intent = Intent(this, MainActivity::class.java).apply {
@@ -122,7 +134,7 @@ class SignalFirebaseService : FirebaseMessagingService() {
 
         val pendingIntent = PendingIntent.getActivity(
             this,
-            0,
+            (System.currentTimeMillis() % 10000).toInt(), // Make request code unique
             intent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )

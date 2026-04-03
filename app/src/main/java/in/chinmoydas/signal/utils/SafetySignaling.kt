@@ -36,7 +36,7 @@ object SafetySignaling {
     private var walkIntervalMs = 0L
     private var lastCheckIn = 0L
 
-    // [CRITICAL FIX] We must remember the duration to restart the timer after a timeout
+    // We must remember the duration to restart the timer after a timeout
     private var currentDurationMinutes: Int = 15
 
     // [CALLBACK] VoiceService listens to this to send the network packet
@@ -69,9 +69,8 @@ object SafetySignaling {
                     // 2. Notify Network Layer (VoiceService)
                     onSafeWalkTimeout?.invoke()
 
-                    // 3. Stop the timer (Alarm is now active)
-                    // We DO NOT set value to null here, so the UI keeps showing the Red Alarm Card
-                    cancel()
+                    // 3. Stop the timer gracefully (Do not use cancel() as it throws an Exception)
+                    break
                 } else {
                     _safeWalkTimeRemaining.value = remaining
                     delay(1000) // Update UI every second
@@ -80,7 +79,6 @@ object SafetySignaling {
         }
     }
 
-    // [THE FIX IS HERE]
     fun checkIn() {
         // If timer is running, just extend it.
         if (safeWalkJob?.isActive == true) {

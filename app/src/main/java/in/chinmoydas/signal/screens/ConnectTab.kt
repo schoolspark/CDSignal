@@ -83,7 +83,6 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
     LaunchedEffect(Unit) { viewModel.startLocalDiscovery(context) }
     DisposableEffect(Unit) { onDispose { viewModel.stopLocalDiscovery() } }
 
-    // [FIX] IME Padding prevents keyboard from hiding input fields
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
@@ -95,8 +94,6 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
         item {
             val safeWalkRemaining by SafetySignaling.safeWalkTimeRemaining.collectAsState()
             var selectedDuration by remember { mutableIntStateOf(15) }
-
-            // [FIX] Safe Unwrapping
             val currentTime = safeWalkRemaining
 
             Card(
@@ -107,7 +104,6 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    // Header
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
                             imageVector = if (currentTime != null) Icons.Default.Timer else Icons.Default.DirectionsWalk,
@@ -126,7 +122,6 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                     Spacer(Modifier.height(12.dp))
 
                     if (currentTime != null) {
-                        // --- ACTIVE STATE ---
                         val totalSecs = currentTime / 1000
                         val minutes = totalSecs / 60
                         val seconds = totalSecs % 60
@@ -154,25 +149,18 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                                 onClick = { SafetySignaling.checkIn() },
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
                                 modifier = Modifier.weight(1f)
-                            ) {
-                                Text("I'M OK (RESET)")
-                            }
+                            ) { Text("I'M OK (RESET)") }
                             Spacer(Modifier.width(8.dp))
                             OutlinedButton(
                                 onClick = { SafetySignaling.stopSafeWalk() },
                                 modifier = Modifier.weight(1f),
                                 border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFBF360C)),
                                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFBF360C))
-                            ) {
-                                Text("STOP")
-                            }
+                            ) { Text("STOP") }
                         }
-
                     } else {
-                        // --- IDLE STATE ---
                         Text("Dead Man's Switch: Auto-SOS if you don't check in.", style = MaterialTheme.typography.bodySmall)
                         Spacer(Modifier.height(12.dp))
-
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                             listOf(15, 30, 60).forEach { mins ->
                                 FilterChip(
@@ -185,15 +173,12 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                                 )
                             }
                         }
-
                         Spacer(Modifier.height(12.dp))
                         Button(
                             onClick = { SafetySignaling.startSafeWalk(selectedDuration) },
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                        ) {
-                            Text("START MONITORING")
-                        }
+                        ) { Text("START MONITORING") }
                     }
                 }
             }
@@ -241,27 +226,12 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                                     horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
                                     Box(Modifier.fillMaxWidth()) {
-                                        IconButton(
-                                            onClick = { showMenu = true },
-                                            modifier = Modifier.size(20.dp).align(Alignment.TopEnd)
-                                        ) {
+                                        IconButton(onClick = { showMenu = true }, modifier = Modifier.size(20.dp).align(Alignment.TopEnd)) {
                                             Icon(Icons.Default.MoreVert, "Menu", modifier = Modifier.size(16.dp))
                                         }
-
-                                        Icon(
-                                            if (isGroup) Icons.Default.Groups else Icons.Default.Person,
-                                            null,
-                                            modifier = Modifier.size(32.dp).align(Alignment.Center),
-                                            tint = if (isOnline) Color(0xFF43A047) else MaterialTheme.colorScheme.primary
-                                        )
-
+                                        Icon(if (isGroup) Icons.Default.Groups else Icons.Default.Person, null, modifier = Modifier.size(32.dp).align(Alignment.Center), tint = if (isOnline) Color(0xFF43A047) else MaterialTheme.colorScheme.primary)
                                         if (contact.isPriority) {
-                                            Icon(
-                                                imageVector = Icons.Default.Star,
-                                                contentDescription = "Principal",
-                                                tint = Color(0xFFFFD700), // Gold
-                                                modifier = Modifier.size(14.dp).align(Alignment.TopStart)
-                                            )
+                                            Icon(Icons.Default.Star, "Principal", tint = Color(0xFFFFD700), modifier = Modifier.size(14.dp).align(Alignment.TopStart))
                                         }
                                     }
                                     Spacer(Modifier.height(8.dp))
@@ -270,7 +240,8 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                                     DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
                                         DropdownMenuItem(
                                             text = { Text("Voice Call", fontWeight = FontWeight.Bold) },
-                                            onClick = { CallSignaling.startOutgoingCall(contact.ip); showMenu = false },
+                                            // [MOTHERSHIP UPGRADE] Passing IP and Name
+                                            onClick = { CallSignaling.startOutgoingCall(contact.ip, contact.name); showMenu = false },
                                             leadingIcon = { Icon(Icons.Default.Call, null, tint = if(isOnline) Color(0xFF43A047) else Color.Gray) },
                                             enabled = isOnline
                                         )
@@ -279,11 +250,7 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                                         if (isGroup) {
                                             DropdownMenuItem(text = { Text("Share QR") }, onClick = { viewModel.generateChannelQr(contact.name, contact.savedCode); showChannelQrDialog = true; showMenu = false }, leadingIcon = { Icon(Icons.Default.QrCode, null) })
                                         } else {
-                                            DropdownMenuItem(
-                                                text = { Text(if(contact.isPriority) "Unset Principal" else "Set as Principal") },
-                                                onClick = { viewModel.togglePriority(contact.name); showMenu = false },
-                                                leadingIcon = { Icon(Icons.Default.Star, null, tint = if(contact.isPriority) Color(0xFFFFD700) else Color.Gray) }
-                                            )
+                                            DropdownMenuItem(text = { Text(if(contact.isPriority) "Unset Principal" else "Set as Principal") }, onClick = { viewModel.togglePriority(contact.name); showMenu = false }, leadingIcon = { Icon(Icons.Default.Star, null, tint = if(contact.isPriority) Color(0xFFFFD700) else Color.Gray) })
                                             DropdownMenuItem(text = { Text("Block") }, onClick = { viewModel.blockContact(contact.name); showMenu = false }, leadingIcon = { Icon(Icons.Default.Block, null, tint = Color.Red) })
                                         }
                                     }
@@ -308,16 +275,14 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                             SegmentedButton(selected = isGroupMode, onClick = { isGroupMode = true }, shape = RoundedCornerShape(topEnd = 12.dp, bottomEnd = 12.dp), icon = { Icon(Icons.Default.Groups, null) }) { Text("Channel") }
                         }
                         Spacer(Modifier.height(12.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            OutlinedTextField(
-                                value = inputName,
-                                onValueChange = { inputName = it },
-                                label = { Text(if (isGroupMode) "Channel Name" else "Username") },
-                                modifier = Modifier.weight(1f),
-                                singleLine = true,
-                                trailingIcon = { IconButton(onClick = { scanLauncher.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE)) }) { Icon(Icons.Default.QrCodeScanner, "Scan", tint = MaterialTheme.colorScheme.primary) } }
-                            )
-                        }
+                        OutlinedTextField(
+                            value = inputName,
+                            onValueChange = { inputName = it },
+                            label = { Text(if (isGroupMode) "Channel Name" else "Username") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            trailingIcon = { IconButton(onClick = { scanLauncher.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE)) }) { Icon(Icons.Default.QrCodeScanner, null, tint = MaterialTheme.colorScheme.primary) } }
+                        )
                         Spacer(Modifier.height(8.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             OutlinedTextField(value = codeInput, onValueChange = { if (it.length <= 8) codeInput = it }, label = { Text(if (isGroupMode) "Passkey" else "User PIN") }, modifier = Modifier.weight(1f), singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = if (isGroupMode) KeyboardType.Text else KeyboardType.Number))
@@ -326,9 +291,7 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                                 enabled = inputName.isNotBlank() && codeInput.isNotBlank(),
                                 onClick = {
                                     val finalName = if (isGroupMode) "group:$inputName" else inputName
-                                    if (finalName.isNotBlank() && codeInput.isNotBlank()) {
-                                        viewModel.saveInternetContact(finalName, codeInput, { Toast.makeText(context, "Saved!", Toast.LENGTH_SHORT).show(); inputName = ""; codeInput = "" }, { Toast.makeText(context, "Connection Failed", Toast.LENGTH_SHORT).show() })
-                                    }
+                                    viewModel.saveInternetContact(finalName, codeInput, { inputName = ""; codeInput = "" }, {})
                                 },
                                 shape = RoundedCornerShape(12.dp),
                                 modifier = Modifier.height(56.dp)
@@ -340,7 +303,7 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
             Spacer(Modifier.height(24.dp))
         }
 
-        // --- 5. NEARBY (LOCAL LINK) ---
+        // --- 5. NEARBY (LAN) ---
         item {
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 16.dp)) {
                 Icon(Icons.Default.WifiTethering, null, tint = MaterialTheme.colorScheme.secondary, modifier = Modifier.size(20.dp))
@@ -358,10 +321,10 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                         ip = user.ip,
                         status = "Local Network",
                         isOnline = true,
-                        // Clicking radio on a local user automatically adds them temporarily
                         onRadioClick = { viewModel.addContact(user.name, user.ip, ""); viewModel.setTarget(user.name); onConnected() },
-                        onCallClick = { CallSignaling.startOutgoingCall(user.ip) },
-                        onWakeClick = {} // Wake logic not needed for local peers
+                        // [MOTHERSHIP UPGRADE] Passing IP and Name
+                        onCallClick = { CallSignaling.startOutgoingCall(user.ip, user.name) },
+                        onWakeClick = {}
                     )
                 }
             }
@@ -394,7 +357,8 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
                         status = if (contact.isPriority) "Guardian" else "Saved",
                         isOnline = isOnline,
                         onRadioClick = { viewModel.setTarget(contact.name); onConnected() },
-                        onCallClick = { CallSignaling.startOutgoingCall(contact.ip) },
+                        // [MOTHERSHIP UPGRADE] Passing IP and Name
+                        onCallClick = { CallSignaling.startOutgoingCall(contact.ip, contact.name) },
                         onWakeClick = { viewModel.sendCloudWakeUp(context, contact) }
                     )
                 }
@@ -415,13 +379,8 @@ fun ConnectTab(modifier: Modifier = Modifier, viewModel: WalkieViewModel, onConn
 // --- TACTICAL ROW COMPONENT ---
 @Composable
 fun TacticalUserRow(
-    name: String,
-    ip: String,
-    status: String,
-    isOnline: Boolean,
-    onRadioClick: () -> Unit,
-    onCallClick: () -> Unit,
-    onWakeClick: () -> Unit
+    name: String, ip: String, status: String, isOnline: Boolean,
+    onRadioClick: () -> Unit, onCallClick: () -> Unit, onWakeClick: () -> Unit
 ) {
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -441,43 +400,20 @@ fun TacticalUserRow(
             Column(modifier = Modifier.weight(1f)) {
                 Text(name, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyLarge)
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        if(isOnline) Icons.Default.Wifi else Icons.Default.WifiOff,
-                        null,
-                        modifier = Modifier.size(10.dp),
-                        tint = if(isOnline) Color(0xFF43A047) else Color.Gray
-                    )
+                    Icon(if(isOnline) Icons.Default.Wifi else Icons.Default.WifiOff, null, modifier = Modifier.size(10.dp), tint = if(isOnline) Color(0xFF43A047) else Color.Gray)
                     Spacer(Modifier.width(4.dp))
                     Text(ip, style = MaterialTheme.typography.labelSmall, color = Color.Gray)
                 }
             }
             Row {
-                // Wake Button (Cloud Bolt)
-                FilledTonalIconButton(
-                    onClick = onWakeClick,
-                    modifier = Modifier.size(40.dp),
-                    colors = IconButtonDefaults.filledTonalIconButtonColors(
-                        containerColor = Color(0xFFFFF8E1),
-                        contentColor = Color(0xFFFFA000)
-                    )
-                ) {
+                FilledTonalIconButton(onClick = onWakeClick, modifier = Modifier.size(40.dp), colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = Color(0xFFFFF8E1), contentColor = Color(0xFFFFA000))) {
                     Icon(Icons.Default.Bolt, "Wake")
                 }
-
                 Spacer(Modifier.width(8.dp))
-
-                // Radio Set Target
-                FilledTonalIconButton(
-                    onClick = onRadioClick,
-                    modifier = Modifier.size(40.dp),
-                    colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-                ) {
+                FilledTonalIconButton(onClick = onRadioClick, modifier = Modifier.size(40.dp), colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
                     Icon(Icons.Default.GraphicEq, "Radio", tint = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-
                 Spacer(Modifier.width(8.dp))
-
-                // Voice Call
                 FilledTonalIconButton(
                     onClick = onCallClick,
                     enabled = isOnline,
@@ -487,9 +423,7 @@ fun TacticalUserRow(
                         contentColor = Color.White,
                         disabledContainerColor = Color.LightGray.copy(alpha=0.5f)
                     )
-                ) {
-                    Icon(Icons.Default.Call, "Call")
-                }
+                ) { Icon(Icons.Default.Call, "Call") }
             }
         }
     }

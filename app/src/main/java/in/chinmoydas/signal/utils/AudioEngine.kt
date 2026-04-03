@@ -40,11 +40,13 @@ class AudioEngine(context: Context) {
         override fun compareTo(other: AudioPacket) = this.seq - other.seq
     }
     private val jitterBuffer = PriorityBlockingQueue<AudioPacket>(100)
-    private var lastPlayedSeq = -1
+
+    // [FIX] Atomic tracking for thread safety between playPcmChunk and playbackThread
+    @Volatile private var lastPlayedSeq = -1
 
     private val FRAME_SIZE = 640
 
-    // [RESTORED] Settings from Stable Core
+    // Settings from Stable Core
     private val NOISE_GATE_THRESHOLD = 150
     private val GAIN_LIMIT_THRESHOLD = 30000
 
@@ -75,11 +77,19 @@ class AudioEngine(context: Context) {
             while (isPlaying.get()) {
                 val packet = jitterBuffer.poll()
                 if (packet != null) {
-                    // Resync logic
-                    if (lastPlayedSeq != -1 && (packet.seq < lastPlayedSeq || packet.seq > lastPlayedSeq + 500)) {
+                    // [CRITICAL FIX] If a new stream starts (sequence resets to low numbers), reset the tracker
+                    if (lastPlayedSeq != -1 && packet.seq < lastPlayedSeq && (lastPlayedSeq - packet.seq > 100)) {
+                        Log.d(tag, "Stream reset detected. Resyncing sequence.")
+                        lastPlayedSeq = -1
+                    }
+
+                    // Resync logic for massive packet drops within a stream
+                    if (lastPlayedSeq != -1 && packet.seq > lastPlayedSeq + 100) {
+                        Log.w(tag, "Massive packet drop. Resyncing.")
                         lastPlayedSeq = packet.seq - 1
                     }
-                    if (packet.seq > lastPlayedSeq) {
+
+                    if (packet.seq > lastPlayedSeq || lastPlayedSeq == -1) {
                         audioTrack?.write(packet.data, 0, packet.data.size)
                         lastPlayedSeq = packet.seq
                     }
@@ -92,12 +102,17 @@ class AudioEngine(context: Context) {
 
     fun playPcmChunk(data: ByteArray, seq: Int) {
         if (!isPlaying.get()) startPlayback()
-        // Auto-detect G711 vs PCM
+
         val pcmData = if (data.size < 1000) {
             try { G711.decode(data, FRAME_SIZE) } catch (e: Exception) { return }
         } else { data }
 
-        if (jitterBuffer.size > 50) jitterBuffer.clear()
+        // [CRITICAL FIX] When clearing the buffer due to overflow, we MUST reset the sequence tracker
+        // otherwise it will block the new incoming packets if their sequence is lower.
+        if (jitterBuffer.size > 50) {
+            jitterBuffer.clear()
+            // We do not reset lastPlayedSeq here, because this is just a buffer overflow, not a new stream.
+        }
         jitterBuffer.offer(AudioPacket(seq, pcmData))
     }
 
@@ -152,7 +167,6 @@ class AudioEngine(context: Context) {
                         }
                     }
 
-                    // [RESTORED] Gate 150 - Filters room noise
                     if (maxAmplitude >= NOISE_GATE_THRESHOLD) {
                         val finalData = if (isCompressionEnabled) G711.encode(pcmBuffer, readSize) else ShortToByte(pcmBuffer, readSize)
                         onDataReady(finalData)
